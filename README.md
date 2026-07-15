@@ -271,3 +271,4 @@ A green local build is not the complete production gate. Before promotion, valid
 - Run `npm run verify` before every admin setup, build, and deployment; it includes `admin/validate-qaira-schema.sh`.
 - Full new-site, existing-site, rollback, and production instructions are in [docs/SETUP.md](docs/SETUP.md).
 # qaira-jira-plugin
+# qaira-jira-plugin

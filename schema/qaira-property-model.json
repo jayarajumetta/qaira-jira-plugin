@@ -1,0 +1,553 @@
+{
+  "schema": "qaira.propertyModel.v1",
+  "version": "1.1.0",
+  "sourceSchema": "schema.sql",
+  "storagePolicy": "jira-only-no-external-db-no-forge-db",
+  "registryKey": "qaira.registry.v1",
+  "limits": {
+    "propertyKeyBytes": 255,
+    "propertyValueBytes": 32768
+  },
+  "issueProperties": {
+    "testCase": "qaira.testCaseSpec.v1",
+    "testCaseVersion": "qaira.testCaseVersion.v1",
+    "suite": "qaira.suiteDefinition.v1",
+    "plan": "qaira.planScope.v1",
+    "run": "qaira.runExecution.v1",
+    "automationAsset": "qaira.automationAsset.v1",
+    "objectRepositoryItem": "qaira.objectRepositoryItem.v1",
+    "testDataSet": "qaira.testDataSet.v1",
+    "qualityGate": "qaira.qualityGate.v1",
+    "moduleAssignment": "qaira.module.v1"
+  },
+  "projectProperties": [
+    {
+      "name": "appTypes",
+      "key": "qaira.data.app-types.v1",
+      "initializer": "default-app-types"
+    },
+    {
+      "name": "requirementIterations",
+      "key": "qaira.data.requirement-iterations.v1",
+      "initialValue": { "items": [] }
+    },
+    {
+      "name": "modules",
+      "key": "qaira.data.test-case-modules.v1",
+      "initialValue": { "items": [] }
+    },
+    {
+      "name": "sharedStepGroups",
+      "key": "qaira.data.shared-step-groups.v1",
+      "initialValue": { "items": [] }
+    },
+    {
+      "name": "testEnvironments",
+      "key": "qaira.data.test-environments.v1",
+      "initialValue": { "items": [] }
+    },
+    {
+      "name": "testConfigurations",
+      "key": "qaira.data.test-configurations.v1",
+      "initialValue": { "items": [] }
+    },
+    {
+      "name": "testDataSets",
+      "key": "qaira.data.test-data-sets.v1",
+      "initialValue": { "items": [] }
+    },
+    {
+      "name": "executionSchedules",
+      "key": "qaira.data.execution-schedules.v1",
+      "initialValue": { "items": [] }
+    },
+    {
+      "name": "agenticWorkflows",
+      "key": "qaira.data.agentic-workflows.v1",
+      "initialValue": { "items": [] }
+    },
+    {
+      "name": "agenticWorkflowRuns",
+      "key": "qaira.data.agentic-workflow-runs.v1",
+      "initialValue": { "items": [] }
+    },
+    {
+      "name": "aiPromptTemplates",
+      "key": "qaira.data.ai-prompt-templates.v1",
+      "initialValue": { "items": [] }
+    },
+    {
+      "name": "qualityDashboards",
+      "key": "qaira.data.quality-dashboards.v1",
+      "initialValue": { "items": [] }
+    },
+    {
+      "name": "integrations",
+      "key": "qaira.data.integrations.v1",
+      "initializer": "default-integrations"
+    },
+    {
+      "name": "knowledge",
+      "key": "qaira.data.knowledge.v1",
+      "initialValue": { "items": [] }
+    },
+    {
+      "name": "generationJobs",
+      "key": "qaira.data.generation-jobs.v1",
+      "initialValue": { "items": [] }
+    },
+    {
+      "name": "workspaceTransactions",
+      "key": "qaira.data.workspace-transactions.v1",
+      "initialValue": { "items": [] }
+    },
+    {
+      "name": "notifications",
+      "key": "qaira.data.notifications.v1",
+      "initialValue": { "items": [] }
+    },
+    {
+      "name": "projectMembers",
+      "key": "qaira.data.project-members.v1",
+      "initialValue": { "items": [] }
+    },
+    {
+      "name": "roles",
+      "key": "qaira.data.roles.v1",
+      "initialValue": {
+        "items": [
+          { "id": "jira-admin", "name": "Jira administrator" },
+          { "id": "qa-lead", "name": "QA lead" },
+          { "id": "qa-member", "name": "QA member" },
+          { "id": "viewer", "name": "Viewer" }
+        ]
+      }
+    },
+    {
+      "name": "permissions",
+      "key": "qaira.data.permissions.v1",
+      "initialValue": { "items": [] }
+    },
+    {
+      "name": "rolePermissions",
+      "key": "qaira.data.role-permissions.v1",
+      "initialValue": { "items": [] }
+    },
+    {
+      "name": "featureFlags",
+      "key": "qaira.data.feature-flags.v1",
+      "initialValue": {
+        "flags": {
+      "qaira.manual.requirements": true,
+      "qaira.manual.test_cases": true,
+      "qaira.manual.suites": true,
+      "qaira.manual.runs": true,
+      "qaira.manual.plans": true,
+      "qaira.manual.quality_gates": true,
+      "qaira.automation.workspace": true,
+      "qaira.automation.assets": true,
+      "qaira.automation.builder": true,
+      "qaira.automation.step_code": true,
+      "qaira.automation.step_recording": true,
+      "qaira.automation.local_execution": true,
+      "qaira.automation.remote_execution": true,
+      "qaira.automation.object_repository": true,
+      "qaira.ai.requirement_design": true,
+      "qaira.ai.test_authoring": true,
+      "qaira.ai.bug_triage": true,
+      "qaira.ai.automation": true,
+      "qaira.ai.execution_analysis": true,
+      "qaira.ai.quality_insights": true,
+      "qaira.ai.agentic_workflows": true,
+          "qaira.automation.batch_process": true,
+          "qaira.ops.telemetry": true,
+          "qaira.ai.knowledge": true,
+          "qaira.ops.admin": true,
+          "qaira.api.integrations": true,
+          "qaira.ops.notifications": true,
+          "qaira.mobile.appium": true
+        },
+        "provider": { "type": "local", "configured": true }
+      }
+    },
+    {
+      "name": "workspacePreferences",
+      "key": "qaira.data.workspace-preferences.v1",
+      "initialValue": {
+        "preferences": {},
+        "localization": { "strings": {} }
+      }
+    }
+  ],
+  "tables": [
+    {
+      "table": "roles",
+      "sourceOccurrences": 1,
+      "storage": "project-property",
+      "canonicalKey": "qaira.data.roles.v1",
+      "runtimeStatus": "compatibility",
+      "rationale": "Project-scoped Qaira role metadata; Jira permissions remain authoritative."
+    },
+    {
+      "table": "users",
+      "sourceOccurrences": 1,
+      "storage": "native",
+      "canonicalKey": "jira:user",
+      "runtimeStatus": "active",
+      "rationale": "Atlassian accounts replace standalone Qaira identities."
+    },
+    {
+      "table": "password_reset_tokens",
+      "sourceOccurrences": 1,
+      "storage": "unsupported",
+      "canonicalKey": "atlassian:identity",
+      "runtimeStatus": "unsupported",
+      "rationale": "Passwords and recovery are managed by Atlassian identity."
+    },
+    {
+      "table": "projects",
+      "sourceOccurrences": 1,
+      "storage": "native",
+      "canonicalKey": "jira:project",
+      "runtimeStatus": "active",
+      "rationale": "Jira projects are the workspace boundary."
+    },
+    {
+      "table": "project_members",
+      "sourceOccurrences": 1,
+      "storage": "project-property",
+      "canonicalKey": "qaira.data.project-members.v1",
+      "runtimeStatus": "compatibility",
+      "rationale": "Optional Qaira membership metadata supplements Jira project access."
+    },
+    {
+      "table": "permissions",
+      "sourceOccurrences": 1,
+      "storage": "project-property",
+      "canonicalKey": "qaira.data.permissions.v1",
+      "runtimeStatus": "compatibility",
+      "rationale": "Qaira permission catalog metadata; enforcement must use Jira permissions."
+    },
+    {
+      "table": "role_permissions",
+      "sourceOccurrences": 1,
+      "storage": "project-property",
+      "canonicalKey": "qaira.data.role-permissions.v1",
+      "runtimeStatus": "compatibility",
+      "rationale": "Project role-to-capability preferences without replacing Jira authorization."
+    },
+    {
+      "table": "app_types",
+      "sourceOccurrences": 1,
+      "storage": "project-property",
+      "canonicalKey": "qaira.data.app-types.v1",
+      "runtimeStatus": "active",
+      "rationale": "Compact project-scoped application design boundaries."
+    },
+    {
+      "table": "ai_knowledge_repo",
+      "sourceOccurrences": 1,
+      "storage": "project-property",
+      "canonicalKey": "qaira.data.knowledge.v1",
+      "runtimeStatus": "active",
+      "rationale": "Knowledge metadata is project scoped; large content belongs in attachments."
+    },
+    {
+      "table": "requirements",
+      "sourceOccurrences": 1,
+      "storage": "native",
+      "canonicalKey": "jira:configured-requirement-issue",
+      "runtimeStatus": "active",
+      "rationale": "Requirements reuse configured Jira Story or custom native issue types."
+    },
+    {
+      "table": "feedback",
+      "sourceOccurrences": 1,
+      "storage": "native",
+      "canonicalKey": "jira:configured-defect-issue",
+      "runtimeStatus": "active",
+      "rationale": "Feedback and defects reuse configured Jira Bug or custom native issue types."
+    },
+    {
+      "table": "requirement_defects",
+      "sourceOccurrences": 2,
+      "storage": "link",
+      "canonicalKey": "qaira_impacts_qa",
+      "runtimeStatus": "active",
+      "rationale": "Requirement-to-defect traceability is represented by Qaira Impacts QA links."
+    },
+    {
+      "table": "integrations",
+      "sourceOccurrences": 1,
+      "storage": "project-property",
+      "canonicalKey": "qaira.data.integrations.v1",
+      "runtimeStatus": "active",
+      "rationale": "Non-secret integration metadata only; credentials must not be stored in properties."
+    },
+    {
+      "table": "auth_verification_codes",
+      "sourceOccurrences": 1,
+      "storage": "unsupported",
+      "canonicalKey": "atlassian:identity",
+      "runtimeStatus": "unsupported",
+      "rationale": "Account verification is managed by Atlassian identity."
+    },
+    {
+      "table": "test_suites",
+      "sourceOccurrences": 1,
+      "storage": "issue",
+      "canonicalKey": "Qaira Test Suite",
+      "runtimeStatus": "active",
+      "rationale": "Durable suite headers are Jira issues with compact suite details in an issue property."
+    },
+    {
+      "table": "test_cases",
+      "sourceOccurrences": 1,
+      "storage": "issue",
+      "canonicalKey": "Qaira Test Case",
+      "runtimeStatus": "active",
+      "rationale": "Durable test case headers and searchable rollups are Jira issues and fields."
+    },
+    {
+      "table": "requirement_test_cases",
+      "sourceOccurrences": 1,
+      "storage": "link",
+      "canonicalKey": "qaira_tests",
+      "runtimeStatus": "active",
+      "rationale": "Requirement coverage is represented by Qaira Tests issue links."
+    },
+    {
+      "table": "suite_test_cases",
+      "sourceOccurrences": 1,
+      "storage": "link",
+      "canonicalKey": "qaira_contains",
+      "runtimeStatus": "active",
+      "rationale": "Suite membership uses Qaira Contains links; ordering is retained in the suite property."
+    },
+    {
+      "table": "test_case_modules",
+      "sourceOccurrences": 1,
+      "storage": "project-property",
+      "canonicalKey": "qaira.data.test-case-modules.v1",
+      "runtimeStatus": "active",
+      "rationale": "Modules are compact project-scoped catalog metadata."
+    },
+    {
+      "table": "test_case_module_cases",
+      "sourceOccurrences": 1,
+      "storage": "issue-property",
+      "canonicalKey": "qaira.module.v1",
+      "runtimeStatus": "active",
+      "rationale": "Each test case stores its module assignment as an issue property."
+    },
+    {
+      "table": "test_case_defects",
+      "sourceOccurrences": 1,
+      "storage": "link",
+      "canonicalKey": "qaira_impacts_qa",
+      "runtimeStatus": "active",
+      "rationale": "Test-to-defect traceability is represented by Qaira Impacts QA links."
+    },
+    {
+      "table": "test_steps",
+      "sourceOccurrences": 1,
+      "storage": "issue-property",
+      "canonicalKey": "qaira.testCaseSpec.v1",
+      "runtimeStatus": "active",
+      "rationale": "Ordered structured steps are embedded in the owning test case property."
+    },
+    {
+      "table": "shared_step_groups",
+      "sourceOccurrences": 1,
+      "storage": "project-property",
+      "canonicalKey": "qaira.data.shared-step-groups.v1",
+      "runtimeStatus": "active",
+      "rationale": "Reusable step groups are compact project-scoped definitions."
+    },
+    {
+      "table": "test_environments",
+      "sourceOccurrences": 1,
+      "storage": "project-property",
+      "canonicalKey": "qaira.data.test-environments.v1",
+      "runtimeStatus": "active",
+      "rationale": "Environment metadata is a project-scoped runtime collection."
+    },
+    {
+      "table": "test_configurations",
+      "sourceOccurrences": 1,
+      "storage": "project-property",
+      "canonicalKey": "qaira.data.test-configurations.v1",
+      "runtimeStatus": "active",
+      "rationale": "Configuration metadata is a project-scoped runtime collection."
+    },
+    {
+      "table": "test_data_sets",
+      "sourceOccurrences": 1,
+      "storage": "project-property",
+      "canonicalKey": "qaira.data.test-data-sets.v1",
+      "runtimeStatus": "active",
+      "rationale": "Current runtime stores compact test data metadata in a project collection."
+    },
+    {
+      "table": "executions",
+      "sourceOccurrences": 1,
+      "storage": "issue",
+      "canonicalKey": "Qaira Test Run",
+      "runtimeStatus": "active",
+      "rationale": "Execution headers and searchable rollups are Jira Test Run issues."
+    },
+    {
+      "table": "execution_suites",
+      "sourceOccurrences": 1,
+      "storage": "issue-property",
+      "canonicalKey": "qaira.runExecution.v1",
+      "runtimeStatus": "active",
+      "rationale": "Run suite scope is embedded in the owning Test Run property."
+    },
+    {
+      "table": "execution_case_snapshots",
+      "sourceOccurrences": 1,
+      "storage": "issue-property",
+      "canonicalKey": "qaira.runExecution.v1",
+      "runtimeStatus": "active",
+      "rationale": "Compact case snapshots are embedded in the Test Run property."
+    },
+    {
+      "table": "execution_step_snapshots",
+      "sourceOccurrences": 1,
+      "storage": "issue-property",
+      "canonicalKey": "qaira.runExecution.v1",
+      "runtimeStatus": "active",
+      "rationale": "Compact step snapshots are embedded in the Test Run property."
+    },
+    {
+      "table": "execution_results",
+      "sourceOccurrences": 1,
+      "storage": "issue-property",
+      "canonicalKey": "qaira.runExecution.v1",
+      "runtimeStatus": "active",
+      "rationale": "Small result summaries are embedded; large result payloads must overflow to attachments."
+    },
+    {
+      "table": "suite_runs",
+      "sourceOccurrences": 1,
+      "storage": "issue-property",
+      "canonicalKey": "qaira.runExecution.v1",
+      "runtimeStatus": "compatibility",
+      "rationale": "Suite-level execution state is folded into the Test Run property."
+    },
+    {
+      "table": "test_case_runs",
+      "sourceOccurrences": 1,
+      "storage": "issue-property",
+      "canonicalKey": "qaira.runExecution.v1",
+      "runtimeStatus": "compatibility",
+      "rationale": "Case-level execution state is folded into the Test Run property."
+    },
+    {
+      "table": "step_runs",
+      "sourceOccurrences": 1,
+      "storage": "issue-property",
+      "canonicalKey": "qaira.runExecution.v1",
+      "runtimeStatus": "compatibility",
+      "rationale": "Step-level execution state is folded into the Test Run property."
+    },
+    {
+      "table": "execution_capacity",
+      "sourceOccurrences": 1,
+      "storage": "unsupported",
+      "canonicalKey": "external-runner:capacity",
+      "runtimeStatus": "unsupported",
+      "rationale": "Forge is not an execution scheduler; capacity belongs to an approved external runner."
+    },
+    {
+      "table": "worker_heartbeat",
+      "sourceOccurrences": 1,
+      "storage": "unsupported",
+      "canonicalKey": "external-runner:heartbeat",
+      "runtimeStatus": "unsupported",
+      "rationale": "Worker liveness belongs to an approved external runner."
+    },
+    {
+      "table": "notifications",
+      "sourceOccurrences": 1,
+      "storage": "project-property",
+      "canonicalKey": "qaira.data.notifications.v1",
+      "runtimeStatus": "active",
+      "rationale": "Current runtime stores compact project notification metadata."
+    },
+    {
+      "table": "workspace_transactions",
+      "sourceOccurrences": 1,
+      "storage": "project-property",
+      "canonicalKey": "qaira.data.workspace-transactions.v1",
+      "runtimeStatus": "active",
+      "rationale": "Compatibility transaction summaries are kept as project metadata."
+    },
+    {
+      "table": "app_settings",
+      "sourceOccurrences": 1,
+      "storage": "project-property",
+      "canonicalKey": "qaira.data.workspace-preferences.v1",
+      "supplementalKeys": ["qaira.data.feature-flags.v1"],
+      "runtimeStatus": "compatibility",
+      "rationale": "Project preferences and feature availability replace global standalone settings."
+    },
+    {
+      "table": "execution_schedules",
+      "sourceOccurrences": 1,
+      "storage": "project-property",
+      "canonicalKey": "qaira.data.execution-schedules.v1",
+      "runtimeStatus": "active",
+      "rationale": "Schedule definitions are project metadata; execution still requires an external trigger or manual run."
+    },
+    {
+      "table": "test_engine_jobs",
+      "sourceOccurrences": 1,
+      "storage": "unsupported",
+      "canonicalKey": "external-runner:jobs",
+      "runtimeStatus": "unsupported",
+      "rationale": "Engine leasing and execution jobs belong to an approved external runner."
+    },
+    {
+      "table": "ai_test_case_generation_jobs",
+      "sourceOccurrences": 1,
+      "storage": "project-property",
+      "canonicalKey": "qaira.data.generation-jobs.v1",
+      "runtimeStatus": "active",
+      "rationale": "Bounded generation job summaries are project-scoped metadata."
+    },
+    {
+      "table": "automation_learning_cache",
+      "sourceOccurrences": 1,
+      "storage": "issue",
+      "canonicalKey": "Qaira Object Repository Item",
+      "runtimeStatus": "active",
+      "rationale": "Searchable locator intelligence is stored as Object Repository Jira issues."
+    },
+    {
+      "table": "batch_process_jobs",
+      "sourceOccurrences": 1,
+      "storage": "unsupported",
+      "canonicalKey": "external-runner:batch-jobs",
+      "runtimeStatus": "unsupported",
+      "rationale": "Durable leasing and retry queues require a remote execution service."
+    },
+    {
+      "table": "workspace_transaction_events",
+      "sourceOccurrences": 1,
+      "storage": "project-property",
+      "canonicalKey": "qaira.data.workspace-transactions.v1",
+      "runtimeStatus": "compatibility",
+      "rationale": "Current runtime folds a compact latest event into each transaction summary."
+    },
+    {
+      "table": "workspace_transaction_artifacts",
+      "sourceOccurrences": 1,
+      "storage": "attachment",
+      "canonicalKey": "jira:issue-attachment",
+      "runtimeStatus": "planned",
+      "rationale": "Generated files and large evidence must be Jira attachments, never project-property blobs."
+    }
+  ]
+}

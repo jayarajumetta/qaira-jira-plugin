@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64" role="img" aria-label="Qaira">
+  <defs>
+    <linearGradient id="qairaGradient" x1="8" y1="6" x2="56" y2="58" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#0C66E4"/>
+      <stop offset="1" stop-color="#36B37E"/>
+    </linearGradient>
+  </defs>
+  <rect x="4" y="4" width="56" height="56" rx="16" fill="url(#qairaGradient)"/>
+  <path d="M19 31.2C19 22.7 24.8 17 32.7 17C40.6 17 46 22.8 46 30.8C46 36 43.8 40.2 40 42.7L46.5 49H37.8L34.4 45.5C33.8 45.6 33.2 45.6 32.6 45.6C24.7 45.6 19 39.8 19 31.2ZM26.1 31.2C26.1 36.3 28.6 39.2 32.7 39.2C36.7 39.2 39 36.3 39 30.9C39 25.9 36.6 23.4 32.7 23.4C28.6 23.4 26.1 26 26.1 31.2Z" fill="#fff"/>
+</svg>

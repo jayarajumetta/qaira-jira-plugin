@@ -1,0 +1,30 @@
+{
+  "name": "qaira-for-jira",
+  "version": "3.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Qaira exact frontend converted to a Jira Cloud Forge addon with Jira-native persistence and no external or Forge business database.",
+  "scripts": {
+    "setup": "npm ci --ignore-scripts && npm --prefix static/qaira-ui ci --ignore-scripts",
+    "setup:feature-flags": "bash admin/setup-qaira-feature-flags.sh",
+    "build": "npm --prefix static/qaira-ui run build",
+    "test": "node --test test/*.test.js",
+    "verify:backend": "node --check src/index.js && node --check src/qairaAccess.js && node --check src/qairaApi.js && node --check src/qairaSchema.js && bash admin/validate-qaira-schema.sh && npm test",
+    "verify:frontend": "npm --prefix static/qaira-ui run typecheck",
+    "verify": "npm run verify:backend && npm run verify:frontend",
+    "lint:manifest": "forge lint",
+    "deploy:development": "npm run verify && npm run build && forge deploy -e development"
+  },
+  "dependencies": {
+    "@forge/api": "8.0.1",
+    "@forge/events": "3.0.1",
+    "@forge/llm": "1.0.1",
+    "@forge/resolver": "2.0.0"
+  },
+  "devDependencies": {
+    "@forge/cli": "13.1.0"
+  },
+  "engines": {
+    "node": ">=22.0.0 <22.23.1 || >22.23.1 <24.17.0 || >24.17.0"
+  }
+}

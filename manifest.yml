@@ -1,0 +1,236 @@
+modules:
+  jira:globalPage:
+    - key: qaira-global-workspace
+      resource: qaira-ui
+      resolver:
+        function: resolver
+      layout: blank
+      title: "\u200B"
+      icon: resource:qaira-ui;assets/icon.svg
+  jira:projectPage:
+    - key: qaira-project-workspace
+      resource: qaira-ui
+      resolver:
+        function: resolver
+      layout: blank
+      title: "\u200B"
+      icon: resource:qaira-ui;assets/icon.svg
+  jira:issuePanel:
+    - key: qaira-issue-panel
+      resource: qaira-ui
+      resolver:
+        function: resolver
+      title: Qaira Coverage & AI
+      icon: resource:qaira-ui;assets/icon.svg
+  jira:issueAction:
+    - key: qaira-issue-action
+      resource: qaira-ui
+      resolver:
+        function: resolver
+      title: Qaira AI Actions
+  jira:entityProperty:
+    - key: qaira-test-spec-index
+      entityType: issue
+      propertyKey: qaira.testCaseSpec.v1
+      values:
+        - path: app_type_id
+          type: string
+          searchAlias: qairaTestAppType
+        - path: review_status
+          type: string
+          searchAlias: qairaReviewStatus
+        - path: automated
+          type: string
+          searchAlias: qairaAutomated
+    - key: qaira-run-index
+      entityType: issue
+      propertyKey: qaira.runExecution.v1
+      values:
+        - path: app_type_id
+          type: string
+          searchAlias: qairaRunAppType
+        - path: status
+          type: string
+          searchAlias: qairaRunStatus
+        - path: trigger
+          type: string
+          searchAlias: qairaRunTrigger
+  rovo:agent:
+    - key: qaira-qa-agent
+      name: Qaira QA Agent
+      description: Requirement coverage, test design, planning, run triage, automation and release-risk assistant.
+      icon: resource:qaira-ui;assets/icon.svg
+      prompt: resource:qaira-agent-resource;prompts/qa-agent.txt
+      conversationStarters:
+        - What is blocking this release?
+        - Generate tests for the current requirement.
+        - Find uncovered critical requirements.
+        - Summarize failed automation runs.
+      actions:
+        - qaira-read-qa-context
+        - qaira-draft-test-cases
+        - qaira-calculate-release-risk
+        - qaira-draft-automation
+        - qaira-suggest-locators
+        - qaira-export-report
+  action:
+    - key: qaira-read-qa-context
+      name: Read Qaira QA context
+      function: rovoAction
+      actionVerb: GET
+      description: Read Jira-native Qaira project, requirement, coverage, run, defect, and release context.
+      inputs:
+        projectKey:
+          title: Project key
+          type: string
+          required: false
+          description: Jira project key to analyze.
+        issueKey:
+          title: Issue key
+          type: string
+          required: false
+          description: Jira issue key to analyze.
+        releaseName:
+          title: Release name
+          type: string
+          required: false
+          description: Jira Fix Version / release name.
+    - key: qaira-draft-test-cases
+      name: Draft Qaira test cases
+      function: rovoAction
+      actionVerb: CREATE
+      description: Draft Jira-native Qaira Test Cases from a requirement, with human approval expected before use.
+      inputs:
+        projectKey:
+          title: Project key
+          type: string
+          required: true
+          description: Jira project key where tests should be drafted.
+        requirementKey:
+          title: Requirement key
+          type: string
+          required: true
+          description: Jira story/requirement issue key to test.
+        count:
+          title: Count
+          type: integer
+          required: false
+          description: Number of draft test cases to propose.
+    - key: qaira-calculate-release-risk
+      name: Calculate release risk
+      function: rovoAction
+      actionVerb: GET
+      description: Calculate Release Confidence Index and explain go/no-go risks from Jira-native Qaira rollups.
+      inputs:
+        projectKey:
+          title: Project key
+          type: string
+          required: true
+          description: Jira project key.
+        releaseName:
+          title: Release name
+          type: string
+          required: false
+          description: Jira Fix Version / release name.
+    - key: qaira-draft-automation
+      name: Draft automation skeleton
+      function: rovoAction
+      actionVerb: CREATE
+      description: Draft Playwright/Cypress/Selenium/API automation skeletons from Qaira Test Cases with human review.
+      inputs:
+        projectKey:
+          title: Project key
+          type: string
+          required: true
+          description: Jira project key.
+        testCaseKey:
+          title: Test case key
+          type: string
+          required: false
+          description: Qaira Test Case issue key.
+        framework:
+          title: Framework
+          type: string
+          required: false
+          description: Playwright, Cypress, Selenium, Appium, REST Assured, Postman, Karate, Pytest, JUnit, TestNG, NUnit, Robot Framework.
+    - key: qaira-suggest-locators
+      name: Suggest robust locators
+      function: rovoAction
+      actionVerb: CREATE
+      description: Suggest Object Repository locators and self-healing candidates for UI/API automation.
+      inputs:
+        projectKey:
+          title: Project key
+          type: string
+          required: true
+          description: Jira project key.
+        objectKey:
+          title: Object key
+          type: string
+          required: false
+          description: Qaira Object Repository key.
+        label:
+          title: Visible label
+          type: string
+          required: false
+          description: Human-visible label or accessible name.
+    - key: qaira-export-report
+      name: Export Qaira report
+      function: rovoAction
+      actionVerb: GET
+      description: Export Qaira metrics, traceability, runs, automation and release readiness reports from Jira-native rollups.
+      inputs:
+        projectKey:
+          title: Project key
+          type: string
+          required: true
+          description: Jira project key.
+        reportType:
+          title: Report type
+          type: string
+          required: false
+          description: business-metrics, requirements, runs, automation.
+  function:
+    - key: resolver
+      handler: index.handler
+    - key: rovoAction
+      handler: index.rovoAction
+    - key: agenticWorkflowConsumer
+      handler: index.agenticWorkflowConsumer
+      timeoutSeconds: 900
+  consumer:
+    - key: qaira-agentic-workflow-consumer
+      queue: qaira-agentic-workflow
+      function: agenticWorkflowConsumer
+  llm:
+    - key: qaira-agentic-llm
+      model:
+        - claude
+resources:
+  - key: qaira-ui
+    path: static/qaira-ui/dist
+  - key: qaira-agent-resource
+    path: resource/agent
+permissions:
+  scopes:
+    - read:jira-work
+    - write:jira-work
+    - read:jira-user
+    - manage:jira-configuration
+    - manage:jira-project
+    - read:field:jira
+    - write:field:jira
+    - read:project:jira
+    - read:issue:jira
+    - write:issue:jira
+    - read:issue-details:jira
+    - read:attachment:jira
+    - write:attachment:jira
+    - read:chat:rovo
+  content:
+    styles:
+      - unsafe-inline
+app:
+  id: ari:cloud:ecosystem::app/f32417bc-9d7c-430f-8f04-7f3ad0f9bc44
+  runtime:
+    name: nodejs22.x

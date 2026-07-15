@@ -1,0 +1,1 @@
+import{j as a}from"./query-vendor-BUUiaIgG.js";const e=s=>s.replace(/^RC([_-]?)/i,"Req$1");function r({value:s}){return a.jsx("span",{className:"display-id-badge",children:a.jsx("code",{children:e(s)})})}export{r as D};

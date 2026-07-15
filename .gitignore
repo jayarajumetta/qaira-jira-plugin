@@ -1,0 +1,5 @@
+node_modules/
+static/qaira-ui/node_modules/
+.qaira-setup-state/
+*.log
+.DS_Store

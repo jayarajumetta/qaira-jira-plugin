@@ -1,0 +1,1 @@
+const e="qaira.default_catalog_view_mode",i="(max-width: 720px)";function o(){return typeof window<"u"&&window.matchMedia(i).matches}function n(){return typeof window>"u"||o()?"tile":window.localStorage.getItem(e)==="list"?"list":"tile"}function a(t){typeof window>"u"||window.localStorage.setItem(e,t)}export{i as M,o as i,n as r,a as w};

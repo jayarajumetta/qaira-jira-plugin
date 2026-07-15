@@ -1,0 +1,27 @@
+{
+  "schema": "qaira.projectMap.v1",
+  "description": "Project-specific mapping for Qaira. Requirements and defects are Jira-native issue types; Qaira never creates Requirement or Defect types. Override per project when your Jira uses custom names.",
+  "defaults": {
+    "requirementIssueTypeNames": ["Story"],
+    "defectIssueTypeNames": ["Bug"],
+    "releaseSource": "fixVersions",
+    "sprintSource": "Jira Sprint field",
+    "componentSource": "Jira Components",
+    "requirementRollupFieldsOn": ["Story"],
+    "defectRollupFieldsOn": [],
+    "enableRequirementRollupFields": true,
+    "enableDefectRollupFields": false,
+    "includeEpicsAsRequirements": false,
+    "includeTasksAsRequirements": false,
+    "notes": "Default Qaira enterprise model: Requirement = Story, Defect = Bug, Release = fixVersion. Add project overrides below for custom Jira configurations."
+  },
+  "projects": {
+    "QAIRA": {
+      "requirementIssueTypeNames": ["Story"],
+      "defectIssueTypeNames": ["Bug"],
+      "releaseSource": "fixVersions",
+      "requirementRollupFieldsOn": ["Story"],
+      "defectRollupFieldsOn": []
+    }
+  }
+}

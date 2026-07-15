@@ -1,0 +1,1 @@
+import{r as o}from"./userDisplay-ClgvlLDX.js";const m=new Intl.DateTimeFormat(void 0,{month:"short",day:"numeric",year:"numeric",hour:"numeric",minute:"2-digit"});function a(r,t="Not recorded"){if(!r)return t;const e=new Date(r);return Number.isNaN(e.getTime())?r:m.format(e)}function s(r,t,e="System"){if(!r)return e;const i=t[r];return i?o(i):r}export{a as f,s as r};

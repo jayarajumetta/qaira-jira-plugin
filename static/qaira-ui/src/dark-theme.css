@@ -1,0 +1,477 @@
+/* Dark theme authority layer.
+   This file is imported after styles.css so legacy light fallbacks cannot win. */
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --background: #07111f;
+  --bg: #07111f;
+  --card-bg: #0e1a2b;
+  --surface: rgba(12, 24, 40, 0.92);
+  --surface-strong: #111f33;
+  --surface-elevated: #16243a;
+  --surface-muted: rgba(15, 23, 42, 0.74);
+  --panel: rgba(12, 24, 40, 0.92);
+  --panel-strong: #111f33;
+  --shell-panel: rgba(15, 23, 42, 0.86);
+  --workspace-master-surface: rgba(8, 16, 29, 0.88);
+  --workspace-master-border: rgba(148, 163, 184, 0.22);
+  --glass-surface: rgba(15, 23, 42, 0.78);
+  --glass-surface-strong: rgba(17, 31, 51, 0.96);
+  --glass-border: rgba(148, 163, 184, 0.24);
+  --glass-highlight: rgba(255, 255, 255, 0.08);
+  --border: rgba(148, 163, 184, 0.22);
+  --line: rgba(148, 163, 184, 0.2);
+  --text: #e5edf8;
+  --text-primary: #f3f7ff;
+  --text-secondary: #a9b8cc;
+  --muted: #9fb0c6;
+  --ink-900: #f3f7ff;
+  --ink-700: #cbd5e1;
+  --ink-500: #a9b8cc;
+  --primary: #60a5fa;
+  --primary-hover: #3b82f6;
+  --primary-strong: #93c5fd;
+  --accent: #60a5fa;
+  --accent-strong: #bfdbfe;
+  --success: #5ee0a4;
+  --warning: #fbbf24;
+  --danger: #fb7185;
+  --error: #fb7185;
+  --shadow-soft: 0 24px 70px rgba(0, 0, 0, 0.35);
+}
+
+:root[data-theme="dark"],
+:root[data-theme="dark"] body,
+:root[data-theme="dark"] #root {
+  background:
+    radial-gradient(circle at 8% 0%, rgba(37, 99, 235, 0.2), transparent 34%),
+    radial-gradient(circle at 95% 12%, rgba(14, 165, 233, 0.14), transparent 30%),
+    linear-gradient(180deg, #07111f 0%, #050a13 100%) !important;
+  color: var(--text-primary) !important;
+}
+
+:root[data-theme="dark"] .workspace-layout,
+:root[data-theme="dark"] .workspace-main,
+:root[data-theme="dark"] .workspace-content,
+:root[data-theme="dark"] .main-content,
+:root[data-theme="dark"] .app-shell,
+:root[data-theme="dark"] .page,
+:root[data-theme="dark"] .page-content,
+:root[data-theme="dark"] .page-content--knowledge,
+:root[data-theme="dark"] .page-content--library-full,
+:root[data-theme="dark"] .page-content--testops,
+:root[data-theme="dark"] .page-content--automation,
+:root[data-theme="dark"] .page-content--test-data,
+:root[data-theme="dark"] .admin-space-page,
+:root[data-theme="dark"] .auth-page {
+  background:
+    radial-gradient(circle at top left, rgba(37, 99, 235, 0.16), transparent 32%),
+    linear-gradient(180deg, rgba(7, 17, 31, 0.98), rgba(5, 10, 19, 1)) !important;
+  color: var(--text-primary) !important;
+}
+
+:root[data-theme="dark"] .page-header,
+:root[data-theme="dark"] .panel,
+:root[data-theme="dark"] .card,
+:root[data-theme="dark"] .record-card,
+:root[data-theme="dark"] .tile-card,
+:root[data-theme="dark"] .catalog-card,
+:root[data-theme="dark"] .virtual-card,
+:root[data-theme="dark"] .stat-card,
+:root[data-theme="dark"] .mini-card,
+:root[data-theme="dark"] .stack-item,
+:root[data-theme="dark"] .segment,
+:root[data-theme="dark"] .detail-summary,
+:root[data-theme="dark"] .metric-card,
+:root[data-theme="dark"] .metric-strip,
+:root[data-theme="dark"] .settings-section,
+:root[data-theme="dark"] .workspace-master-detail-panel,
+:root[data-theme="dark"] .workspace-master-list,
+:root[data-theme="dark"] .workspace-master-detail,
+:root[data-theme="dark"] .agent-education-panel,
+:root[data-theme="dark"] .agent-context-cockpit,
+:root[data-theme="dark"] .agent-education-card,
+:root[data-theme="dark"] .permission-designer,
+:root[data-theme="dark"] .permission-designer-summary,
+:root[data-theme="dark"] .permission-option,
+:root[data-theme="dark"] .permission-option-list,
+:root[data-theme="dark"] .role-permission-editor,
+:root[data-theme="dark"] .automation-detail-panel,
+:root[data-theme="dark"] .automation-response-shell,
+:root[data-theme="dark"] .automation-assertion-shell,
+:root[data-theme="dark"] .execution-step-table,
+:root[data-theme="dark"] .execution-step-card-block,
+:root[data-theme="dark"] .admin-space-card,
+:root[data-theme="dark"] .auth-card,
+:root[data-theme="dark"] .auth-panel,
+:root[data-theme="dark"] .auth-story-card,
+:root[data-theme="dark"] .requirements-health-card {
+  background:
+    linear-gradient(145deg, rgba(255, 255, 255, 0.055), rgba(255, 255, 255, 0.018)),
+    var(--panel-strong) !important;
+  border-color: var(--glass-border) !important;
+  box-shadow: var(--shadow-soft) !important;
+  color: var(--text-primary) !important;
+}
+
+:root[data-theme="dark"] .page-header-title,
+:root[data-theme="dark"] .section-title,
+:root[data-theme="dark"] .card-title,
+:root[data-theme="dark"] .panel-title,
+:root[data-theme="dark"] .record-title,
+:root[data-theme="dark"] .tile-card-title,
+:root[data-theme="dark"] .catalog-card-title,
+:root[data-theme="dark"] .modal-title,
+:root[data-theme="dark"] h1,
+:root[data-theme="dark"] h2,
+:root[data-theme="dark"] h3,
+:root[data-theme="dark"] h4,
+:root[data-theme="dark"] strong {
+  color: var(--text-primary) !important;
+}
+
+:root[data-theme="dark"] .page-description,
+:root[data-theme="dark"] .section-description,
+:root[data-theme="dark"] .card-description,
+:root[data-theme="dark"] .panel-description,
+:root[data-theme="dark"] .record-subtitle,
+:root[data-theme="dark"] .record-meta,
+:root[data-theme="dark"] .tile-card-subtitle,
+:root[data-theme="dark"] .catalog-card-meta,
+:root[data-theme="dark"] .muted,
+:root[data-theme="dark"] small,
+:root[data-theme="dark"] p {
+  color: var(--text-secondary) !important;
+}
+
+:root[data-theme="dark"] input,
+:root[data-theme="dark"] textarea,
+:root[data-theme="dark"] select,
+:root[data-theme="dark"] .input,
+:root[data-theme="dark"] .search-input,
+:root[data-theme="dark"] .form-control,
+:root[data-theme="dark"] .select-control,
+:root[data-theme="dark"] .rich-text-editor,
+:root[data-theme="dark"] .rich-text-content,
+:root[data-theme="dark"] .ProseMirror {
+  background: rgba(2, 6, 23, 0.78) !important;
+  border-color: rgba(148, 163, 184, 0.28) !important;
+  color: var(--text-primary) !important;
+}
+
+:root[data-theme="dark"] input::placeholder,
+:root[data-theme="dark"] textarea::placeholder {
+  color: rgba(203, 213, 225, 0.62) !important;
+}
+
+:root[data-theme="dark"] .modal-backdrop,
+:root[data-theme="dark"] .dialog-backdrop,
+:root[data-theme="dark"] .overlay {
+  background: rgba(2, 6, 23, 0.78) !important;
+  backdrop-filter: blur(14px) saturate(1.08);
+}
+
+:root[data-theme="dark"] .modal-card,
+:root[data-theme="dark"] .dialog-card,
+:root[data-theme="dark"] .modal-content,
+:root[data-theme="dark"] .resource-modal,
+:root[data-theme="dark"] .requirement-create-modal,
+:root[data-theme="dark"] .suite-create-modal,
+:root[data-theme="dark"] .suite-test-case-editor-modal,
+:root[data-theme="dark"] .step-parameter-dialog,
+:root[data-theme="dark"] .hook-picker-dialog,
+:root[data-theme="dark"] .object-repository-usage-dialog,
+:root[data-theme="dark"] .modal-case-picker,
+:root[data-theme="dark"] .knowledge-item-modal {
+  background:
+    linear-gradient(145deg, rgba(255, 255, 255, 0.06), rgba(255, 255, 255, 0.02)),
+    #0d1829 !important;
+  border-color: rgba(148, 163, 184, 0.28) !important;
+  color: var(--text-primary) !important;
+  box-shadow: 0 28px 90px rgba(0, 0, 0, 0.48) !important;
+}
+
+:root[data-theme="dark"] .modal-header,
+:root[data-theme="dark"] .dialog-header,
+:root[data-theme="dark"] .resource-modal-header,
+:root[data-theme="dark"] .modal-card-header,
+:root[data-theme="dark"] .modal-footer,
+:root[data-theme="dark"] .dialog-footer {
+  background: rgba(15, 23, 42, 0.86) !important;
+  border-color: rgba(148, 163, 184, 0.22) !important;
+  color: var(--text-primary) !important;
+}
+
+:root[data-theme="dark"] .toolbar,
+:root[data-theme="dark"] .catalog-toolbar,
+:root[data-theme="dark"] .design-list-toolbar,
+:root[data-theme="dark"] .test-case-catalog-toolbar,
+:root[data-theme="dark"] .requirement-catalog-toolbar,
+:root[data-theme="dark"] .resource-catalog-toolbar,
+:root[data-theme="dark"] .issue-catalog-toolbar,
+:root[data-theme="dark"] .catalog-search-filter,
+:root[data-theme="dark"] .catalog-filter-popover,
+:root[data-theme="dark"] .catalog-action-menu-panel,
+:root[data-theme="dark"] .run-action-dropdown,
+:root[data-theme="dark"] .test-case-run-menu-panel,
+:root[data-theme="dark"] .project-dropdown-menu,
+:root[data-theme="dark"] .app-type-dropdown-menu,
+:root[data-theme="dark"] .step-card-menu-panel,
+:root[data-theme="dark"] .step-type-menu,
+:root[data-theme="dark"] .data-table-config-panel,
+:root[data-theme="dark"] .recorder-more-menu-popover,
+:root[data-theme="dark"] .resource-column-utility-popover {
+  background: rgba(15, 23, 42, 0.96) !important;
+  border-color: rgba(148, 163, 184, 0.24) !important;
+  color: var(--text-primary) !important;
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.36) !important;
+}
+
+:root[data-theme="dark"] .subnav-tabs,
+:root[data-theme="dark"] .section-switch-bar.subnav-tabs {
+  background: rgba(2, 6, 23, 0.5) !important;
+  border-color: rgba(148, 163, 184, 0.2) !important;
+}
+
+:root[data-theme="dark"] .subnav-tab,
+:root[data-theme="dark"] .section-switch-bar .subnav-tab,
+:root[data-theme="dark"] .catalog-view-button,
+:root[data-theme="dark"] .ghost-button,
+:root[data-theme="dark"] .icon-button,
+:root[data-theme="dark"] .sidebar-icon-button,
+:root[data-theme="dark"] .step-action-button,
+:root[data-theme="dark"] .rich-text-tool-button,
+:root[data-theme="dark"] .data-table-config-trigger,
+:root[data-theme="dark"] .data-table-visible-column-chip {
+  background: rgba(15, 23, 42, 0.68) !important;
+  border-color: rgba(148, 163, 184, 0.24) !important;
+  color: var(--text-secondary) !important;
+}
+
+:root[data-theme="dark"] .subnav-tab:hover,
+:root[data-theme="dark"] .catalog-view-button:hover:not(:disabled),
+:root[data-theme="dark"] .ghost-button:hover:not(:disabled),
+:root[data-theme="dark"] .icon-button:hover:not(:disabled),
+:root[data-theme="dark"] .rich-text-tool-button:hover:not(:disabled) {
+  background: rgba(37, 99, 235, 0.2) !important;
+  border-color: rgba(96, 165, 250, 0.38) !important;
+  color: #ffffff !important;
+}
+
+:root[data-theme="dark"] .subnav-tab.is-active,
+:root[data-theme="dark"] .catalog-view-button.is-active {
+  background: linear-gradient(135deg, rgba(37, 99, 235, 0.42), rgba(14, 165, 233, 0.28)) !important;
+  border-color: rgba(147, 197, 253, 0.56) !important;
+  color: #ffffff !important;
+}
+
+:root[data-theme="dark"] .table-wrap,
+:root[data-theme="dark"] .catalog-table-wrap,
+:root[data-theme="dark"] .import-preview-table,
+:root[data-theme="dark"] .data-table,
+:root[data-theme="dark"] .catalog-data-table {
+  background: rgba(8, 16, 29, 0.88) !important;
+  border-color: rgba(148, 163, 184, 0.2) !important;
+  color: var(--text-primary) !important;
+}
+
+:root[data-theme="dark"] .data-table thead,
+:root[data-theme="dark"] .catalog-data-table thead,
+:root[data-theme="dark"] .data-table th,
+:root[data-theme="dark"] .catalog-data-table th {
+  background: rgba(15, 23, 42, 0.94) !important;
+  border-color: rgba(148, 163, 184, 0.2) !important;
+  color: #dbeafe !important;
+}
+
+:root[data-theme="dark"] .data-table td,
+:root[data-theme="dark"] .catalog-data-table td,
+:root[data-theme="dark"] .data-table tbody tr,
+:root[data-theme="dark"] .catalog-data-table tbody tr {
+  background: transparent !important;
+  border-color: rgba(148, 163, 184, 0.14) !important;
+  color: var(--text-primary) !important;
+}
+
+:root[data-theme="dark"] .data-table tbody tr:hover,
+:root[data-theme="dark"] .catalog-data-table tbody tr:hover {
+  background: rgba(37, 99, 235, 0.12) !important;
+}
+
+:root[data-theme="dark"] .status-badge,
+:root[data-theme="dark"] .status-pill,
+:root[data-theme="dark"] .count-pill,
+:root[data-theme="dark"] .display-id-badge,
+:root[data-theme="dark"] .tile-card-status,
+:root[data-theme="dark"] .step-kind-badge,
+:root[data-theme="dark"] .automation-type-pill,
+:root[data-theme="dark"] .settings-api-scope-pill,
+:root[data-theme="dark"] .project-health-badge {
+  background: rgba(15, 23, 42, 0.82) !important;
+  border-color: rgba(148, 163, 184, 0.24) !important;
+  color: var(--text-primary) !important;
+}
+
+:root[data-theme="dark"] .status-badge.pending,
+:root[data-theme="dark"] .status-pill.danger,
+:root[data-theme="dark"] .project-health-badge.danger,
+:root[data-theme="dark"] .ghost-button.danger,
+:root[data-theme="dark"] button.danger {
+  background: rgba(127, 29, 29, 0.3) !important;
+  border-color: rgba(248, 113, 113, 0.45) !important;
+  color: #fecaca !important;
+}
+
+:root[data-theme="dark"] .status-badge.active,
+:root[data-theme="dark"] .status-badge.ready,
+:root[data-theme="dark"] .status-badge.automated,
+:root[data-theme="dark"] .status-pill.success,
+:root[data-theme="dark"] .count-pill.success {
+  background: rgba(6, 78, 59, 0.34) !important;
+  border-color: rgba(94, 234, 212, 0.34) !important;
+  color: #a7f3d0 !important;
+}
+
+:root[data-theme="dark"] .status-badge.draft,
+:root[data-theme="dark"] .status-pill.warning {
+  background: rgba(120, 53, 15, 0.32) !important;
+  border-color: rgba(251, 191, 36, 0.36) !important;
+  color: #fde68a !important;
+}
+
+:root[data-theme="dark"] code,
+:root[data-theme="dark"] pre,
+:root[data-theme="dark"] .code-block,
+:root[data-theme="dark"] .settings-api-key-reveal code,
+:root[data-theme="dark"] .settings-api-key-card code,
+:root[data-theme="dark"] .automation-validation-preview,
+:root[data-theme="dark"] .api-response-tree,
+:root[data-theme="dark"] .api-response-tree-panel {
+  background: rgba(2, 6, 23, 0.86) !important;
+  border-color: rgba(148, 163, 184, 0.22) !important;
+  color: #dbeafe !important;
+}
+
+:root[data-theme="dark"] hr,
+:root[data-theme="dark"] .divider,
+:root[data-theme="dark"] .separator {
+  border-color: rgba(148, 163, 184, 0.18) !important;
+}
+
+:root[data-theme="dark"] ::selection {
+  background: rgba(96, 165, 250, 0.42);
+  color: #ffffff;
+}
+
+/* Page-specific parity: keep legacy authoring, analytics, repository, and
+   execution surfaces on the same Jira-derived dark palette. */
+:root[data-theme="dark"] .ai-studio-main,
+:root[data-theme="dark"] .ai-studio-sidebar,
+:root[data-theme="dark"] .ai-case-authoring-main,
+:root[data-theme="dark"] .ai-case-authoring-sidebar,
+:root[data-theme="dark"] .ai-prompt-context-panel,
+:root[data-theme="dark"] .custom-dashboard-modal-body,
+:root[data-theme="dark"] .custom-dashboard-view,
+:root[data-theme="dark"] .custom-dashboard-modal .panel,
+:root[data-theme="dark"] .step-parameter-utility-panel,
+:root[data-theme="dark"] .object-repository-screen-field,
+:root[data-theme="dark"] .object-repository-login-surface,
+:root[data-theme="dark"] .automation-request-details-body,
+:root[data-theme="dark"] .automation-response-meta,
+:root[data-theme="dark"] .automation-response-selection,
+:root[data-theme="dark"] .execution-context-summary-head,
+:root[data-theme="dark"] .execution-operation-event,
+:root[data-theme="dark"] .jira-attachment-card,
+:root[data-theme="dark"] .projects-view-toggle,
+:root[data-theme="dark"] .test-case-card-stats > span,
+:root[data-theme="dark"] .test-case-requirement-block,
+:root[data-theme="dark"] .test-case-readiness-grid,
+:root[data-theme="dark"] .quality-table-wrap {
+  background: rgba(9, 18, 32, 0.94) !important;
+  border-color: rgba(148, 163, 184, 0.24) !important;
+  color: var(--text-primary) !important;
+}
+
+:root[data-theme="dark"] .ai-smart-context-card,
+:root[data-theme="dark"] .ai-reference-image-card,
+:root[data-theme="dark"] .ai-case-authoring-panel,
+:root[data-theme="dark"] .ai-case-authoring-source-step,
+:root[data-theme="dark"] .ai-case-authoring-step-card,
+:root[data-theme="dark"] .dashboard-audience-card,
+:root[data-theme="dark"] .dashboard-design-assurance > span,
+:root[data-theme="dark"] .quality-gadget,
+:root[data-theme="dark"] .quality-gadget-shell,
+:root[data-theme="dark"] .hierarchy-metric,
+:root[data-theme="dark"] .hierarchy-record-count {
+  background-color: rgba(17, 31, 51, 0.94) !important;
+  border-color: rgba(148, 163, 184, 0.24) !important;
+  color: var(--text-primary) !important;
+}
+
+:root[data-theme="dark"] .detail-section-tabs {
+  background: rgba(8, 16, 29, 0.86) !important;
+  border-color: rgba(148, 163, 184, 0.22) !important;
+}
+
+:root[data-theme="dark"] .detail-section-tab {
+  background: transparent !important;
+  border-color: transparent !important;
+  color: var(--text-secondary) !important;
+}
+
+:root[data-theme="dark"] .detail-section-tab:hover {
+  background: rgba(30, 64, 110, 0.42) !important;
+  color: var(--text-primary) !important;
+}
+
+:root[data-theme="dark"] .detail-section-tab.is-active {
+  background: rgba(37, 99, 235, 0.28) !important;
+  border-color: rgba(96, 165, 250, 0.42) !important;
+  color: #bfdbfe !important;
+}
+
+:root[data-theme="dark"] .sidebar,
+:root[data-theme="dark"] .sidebar-top,
+:root[data-theme="dark"] .sidebar-footer,
+:root[data-theme="dark"] .sidebar-scope-trigger,
+:root[data-theme="dark"] .nav-branch,
+:root[data-theme="dark"] .nav-branch-link,
+:root[data-theme="dark"] .nav-sublink {
+  border-color: rgba(148, 163, 184, 0.2) !important;
+  color: var(--text-secondary) !important;
+}
+
+:root[data-theme="dark"] .sidebar,
+:root[data-theme="dark"] .sidebar-top,
+:root[data-theme="dark"] .sidebar-footer {
+  background: #0b1524 !important;
+}
+
+:root[data-theme="dark"] .nav-branch-link:hover,
+:root[data-theme="dark"] .nav-sublink:hover,
+:root[data-theme="dark"] .nav-branch-link.is-active,
+:root[data-theme="dark"] .nav-sublink.is-active {
+  background: rgba(37, 99, 235, 0.24) !important;
+  color: #dbeafe !important;
+}
+
+:root[data-theme="dark"] .step-parameter-utility-delete,
+:root[data-theme="dark"] .test-case-catalog-card .step-card-menu-trigger,
+:root[data-theme="dark"] .project-portfolio-card .step-card-menu-trigger,
+:root[data-theme="dark"] .quality-gadget-actions button {
+  background: rgba(15, 23, 42, 0.88) !important;
+  border-color: rgba(148, 163, 184, 0.26) !important;
+  color: var(--text-secondary) !important;
+}
+
+:root[data-theme="dark"] .quality-donut::after {
+  background: #111f33 !important;
+}
+
+:root[data-theme="dark"] .quality-line-chart svg path {
+  stroke: rgba(148, 163, 184, 0.38) !important;
+}
+
+:root[data-theme="dark"] .quality-line-chart svg polyline {
+  stroke: #60a5fa !important;
+}

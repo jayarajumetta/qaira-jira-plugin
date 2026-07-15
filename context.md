@@ -21,7 +21,7 @@ The subsequent evidence and analytics increment added one shared Jira attachment
 
 The 15 July dashboard and hierarchy maturity increment added one-line, derived iteration/module decision signals; Executive, Product, Quality Engineering, and Automation dashboard templates; six gadget visualizations; twelve metric functions; fifteen grouping dimensions; batch JQL evaluation with partial-failure isolation; assisted preview-only dashboard design; selected-only section-tab indicators; collapsed-sidebar submenu expansion; and Jira-owned user administration. Dashboard Create/Edit now lives in a focus-contained modal, Delete is explicit and confirmed, the AI designer exists only inside Create, and the saved dashboard owns the analysis canvas. Do not reintroduce per-gadget frontend queries, an always-visible editor, or standalone Qaira user mutation flows.
 
-The same increment made Qaira project roles a mandatory membership contract. Jira project/global administration is derived live and `jira-admin` cannot be persisted as a Qaira membership. Project creation provisions the creator as QA lead, provisions each additional selected Jira user with an explicit default role, and reports partial property provisioning failures without pretending the already-created Jira project was rolled back. QA lead and custom roles cannot receive Jira-administrative permission codes. Requirement creation/improvement and test-case completion reuse the complete prompt-context pack and let the user collapse the context rail to maximize the review canvas.
+The same increment made Qaira project roles a mandatory membership contract. Jira project/global administration remains derived from live permissions, while a system-managed `jira-admin` membership is persisted for project visibility and never used without the live Jira check. A verified global administrator uses Jira's permission search to discover the active global-admin set, which is synchronized asynchronously across visible projects and provisioned immediately on new projects; project administrators are reconciled on project access. Atlassian permission search considers only the first 1,000 directory users. Qaira detects a larger or unverifiable directory as partial, never revokes from a partial result, and includes any live-verified current administrator in their own all-project sync. If discovery is unavailable, it safely falls back to that current administrator. Non-admin project creators receive QA lead, and every additional selected Jira user has an explicit role.
 
 The 15 July agentic/API/evidence increment added safe schema-discovered table columns and Jira-backed authoring properties; Forge Async Events + Forge LLM workflow execution; validated DAGs and named hand-offs; project RAG, redaction, retry/timeout/budget guardrails, and trace provenance; mature API request/auth/assertion/capture contracts; lazy test-step retrieval; multi-format Jira execution evidence; step-level bug links; and feature-gated AI bug drafting with deterministic fallback and mandatory normal-form review. These capabilities use Atlassian-hosted Forge LLM models, not stored provider keys.
 
@@ -174,18 +174,21 @@ Authorization layers are cumulative:
 6. For mutations, require the applicable Jira create/edit/delete capability; Jira REST performs the final endpoint-specific check.
 7. Require every registered feature for the route/action to be enabled.
 
-The system roles are Jira administrator, QA lead, QA member, and Viewer. A Jira project/global administrator receives the administrator profile dynamically; it is never an assignable membership. An explicitly assigned membership selects QA lead, QA member, Viewer, or a non-administrative custom role. New-project membership is mandatory for every selected user, defaults additional users to QA member, and assigns the creator QA lead. A non-admin with Jira project access but no Qaira membership receives Viewer permissions, not QA Member write access. Frontend hiding is for usability only; the resolver is the security boundary.
+The system roles are Jira administrator, QA lead, QA member, and Viewer. A Jira project/global administrator receives the administrator profile only after a live Jira permission check. Qaira persists that result as a system-managed membership for project administration screens, but membership CRUD cannot assign or remove it and a stale record never grants administrator access. When Jira administration is revoked, Qaira restores the saved fallback role. Other memberships select QA lead, QA member, Viewer, or a non-administrative custom role.
 
 The feature snapshot is project scoped in `qaira.data.feature-flags.v1`. Defaults and valid stored boolean overrides are merged. Unknown keys fail closed in the frontend and are rejected on update. A feature flag controls rollout; it never grants a permission.
 
 Registered feature groups include:
 
-- manual: requirements, test cases, suites/shared steps, runs, plans, and quality gates;
+- manual: requirements, test cases, suites/shared steps, runs, bugs, plans, quality gates, environments, and test data;
+- analytics: quality analytics and custom dashboards;
 - automation: workspace, assets, builder, step code, recorder hand-off, local/remote runner hand-off, object repository, batch process, and mobile metadata;
-- AI: requirement design, test authoring, bug triage, automation assistance, execution analysis, quality insights, agentic workflows, and knowledge;
-- operations: access administration, integrations, notifications, and telemetry.
+- AI: requirement design, test authoring, bug triage, automation assistance, execution analysis, quality insights, agentic workflows, knowledge, and prompt templates;
+- operations: projects, access administration, settings, integrations, notifications, and telemetry.
 
-There are 28 registered flags. `qaira.ai.quality_insights` gates portfolio quality insights and quality-gate assessments; `qaira.ai.bug_triage` gates the AI bug split action and preview endpoint. The portfolio endpoint requires `quality_insight.view`; a quality-gate assessment requires `quality_gate.ai` and remains subject to `qaira.manual.quality_gates`; AI bug drafting requires `feedback.manage`. Feature requirements are cumulative. Impact and failure-cluster previews continue to use their manual domain feature plus the domain-specific `requirement.ai`, `testcase.ai`, or `run.ai` permission and AI feature.
+There are 35 registered flags. Every permission returned by `/permissions` includes its read/write/manage level and the feature definitions that make it available in the active project. Bugs, environments, test data, dashboards, projects, settings, and prompt templates are independently controlled. AI routes remain cumulative with their manual/analytics domain feature and dedicated permission.
+
+`qaira.mobile.appium` is a supplementary field/action flag. Web/API environments and configurations remain available when it is disabled; mobile metadata and mutation controls additionally require `mobile.view` or `mobile.manage`, and mobile payloads fail closed in the resolver.
 
 Reconciliation is also cumulative: the `qaira.ops.admin` feature must be enabled; dry-run `GET` requires `ops.view`; confirmed `POST` requires `ops.manage`, which is an administrative permission and therefore also requires Jira project/global administration.
 
@@ -314,7 +317,7 @@ npm run build
 forge lint
 ```
 
-`npm run verify` checks backend syntax and contract tests, frontend types, all 46 SQL/Jira mappings, runtime/admin schema parity, parity for all 28 registered feature flags, property keys/limits, and shell scripts. `forge lint`, deploy, and installation require an authenticated Forge account that owns or contributes to the app ID in `manifest.yml`.
+`npm run verify` checks backend syntax and contract tests, frontend types, all 46 SQL/Jira mappings, runtime/admin schema parity, parity for all 35 registered feature flags, property keys/limits, and shell scripts. `forge lint`, deploy, and installation require an authenticated Forge account that owns or contributes to the app ID in `manifest.yml`.
 
 For a new project, configure `admin/qaira-project-map.json`, diagnose credentials, run a project-targeted dry run, review `.qaira-setup-state`, and only then apply. Never begin with an unreviewed site-wide apply. `PROJECT_KEYS=ALL` requires `CONFIRM_ALL_PROJECTS=true` for a real run. Do not rerun admin provisioning merely to deploy code to an already configured site.
 

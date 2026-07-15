@@ -29,7 +29,7 @@ npm run verify
 npm run build
 ```
 
-`npm run setup` performs lockfile-based clean installs for both the Forge backend and `static/qaira-ui`. Validation checks JavaScript syntax/tests, frontend types, shell syntax, JSON parity, all 46 SQL-table mappings, runtime collection coverage, all 28 registered feature flags through schema/runtime parity, canonical issue-property keys, and Jira property key/value sizes. The build creates the hosted Custom UI files under `static/qaira-ui/dist`.
+`npm run setup` performs lockfile-based clean installs for both the Forge backend and `static/qaira-ui`. Validation checks JavaScript syntax/tests, frontend types, shell syntax, JSON parity, all 46 SQL-table mappings, runtime collection coverage, all 35 registered feature flags through schema/runtime parity, canonical issue-property keys, and Jira property key/value sizes. The build creates the hosted Custom UI files under `static/qaira-ui/dist`.
 
 ## 2. Configure the project map
 

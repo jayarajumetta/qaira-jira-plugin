@@ -55,6 +55,7 @@ export function RecorderStartControls({
   localLabel = "Local Playwright",
   remoteLabel = "Remote browser",
   mobileRemoteEnabled = false,
+  mobileAppiumEnabled = false,
   primaryAction,
   moreActions
 }: {
@@ -65,6 +66,7 @@ export function RecorderStartControls({
   localLabel?: string;
   remoteLabel?: string;
   mobileRemoteEnabled?: boolean;
+  mobileAppiumEnabled?: boolean;
   primaryAction?: ReactNode;
   moreActions?: ReactNode;
 }) {
@@ -276,20 +278,22 @@ export function RecorderStartControls({
                 </button>
               </>
             ) : null}
-            <button
-              className="ghost-button"
-              disabled={disabled || isStarting || hasSession}
-              onClick={() => {
-                setIsMoreOpen(false);
-                onStart({ recorder_mode: "local", recorder_target: "mobile", engine_base_url: "http://mobile-engine:4312", recorder_public_base_url: "http://localhost:4312" });
-              }}
-              role="menuitem"
-              type="button"
-            >
-              <MousePointerIcon size={16} />
-              <span>{isStarting ? "Starting..." : "Mobile Appium"}</span>
-            </button>
-            {mobileRemoteEnabled ? (
+            {mobileAppiumEnabled ? (
+              <button
+                className="ghost-button"
+                disabled={disabled || isStarting || hasSession}
+                onClick={() => {
+                  setIsMoreOpen(false);
+                  onStart({ recorder_mode: "local", recorder_target: "mobile", engine_base_url: "http://mobile-engine:4312", recorder_public_base_url: "http://localhost:4312" });
+                }}
+                role="menuitem"
+                type="button"
+              >
+                <MousePointerIcon size={16} />
+                <span>{isStarting ? "Starting..." : "Mobile Appium"}</span>
+              </button>
+            ) : null}
+            {mobileAppiumEnabled && mobileRemoteEnabled ? (
               <button
                 className="ghost-button"
                 disabled={disabled || isStarting || hasSession}

@@ -10,9 +10,11 @@ import {
   DEFAULT_ROLES,
   FEATURE_GROUPS,
   PERMISSION_GROUPS,
+  featureAvailabilityForPermission,
   isAdministrativePermission,
   normalizedPermissionCodes,
   permissionForRequest,
+  permissionPolicyCatalog,
   roleById
 } from './qairaAccess.js';
 import {
@@ -57,6 +59,7 @@ const REQUIREMENT_PROP = 'qaira.requirement.v1';
 const DEFECT_PROP = 'qaira.defect.v1';
 const COLLECTION_PREFIX = 'qaira.data';
 const FEATURE_FLAGS_PROP = 'qaira.data.feature-flags.v1';
+const ADMIN_MEMBERSHIP_SYNC_PROP = 'qaira.admin-membership-sync.v1';
 const WORKSPACE_PREFERENCES_PROP = 'qaira.data.workspace-preferences.v1';
 const RUN_RESULT_PROP_PREFIX = 'qaira.runResult.v1';
 const PROPERTY_VALUE_MAX_BYTES = 32768;
@@ -68,7 +71,9 @@ const APP_VERSION = '3.0.0';
 const REQUEST_CACHE = new AsyncLocalStorage();
 const CACHE_MISS = Symbol('qaira-cache-miss');
 const AGENTIC_WORKFLOW_QUEUE = 'qaira-agentic-workflow';
+const ADMIN_MEMBERSHIP_QUEUE = 'qaira-admin-membership-sync';
 const agenticWorkflowQueue = new Queue({ key: AGENTIC_WORKFLOW_QUEUE });
+const administratorMembershipQueue = new Queue({ key: ADMIN_MEMBERSHIP_QUEUE });
 let activeLlmModelCache = null;
 
 async function requestCached(key, loader) {
@@ -488,6 +493,34 @@ async function listJiraUsers() {
     return users;
   } catch {
     return [await currentUser()];
+  }
+}
+
+async function listGlobalJiraAdministrators() {
+  try {
+    const users = await jiraRequest(route`/rest/api/3/user/permission/search?permissions=${'ADMINISTER'}&startAt=${0}&maxResults=${1000}`);
+    let complete = false;
+    try {
+      const overflowUsers = await jiraRequest(route`/rest/api/3/users/search?startAt=${1000}&maxResults=${1}`);
+      complete = asArray(overflowUsers).length === 0;
+      if (!complete) console.warn('Qaira Jira administrator discovery is partial because the Jira permission-search window is limited to the first 1,000 users.');
+    } catch (error) {
+      console.warn('Qaira could not confirm whether Jira administrator discovery covered the full user directory.', {
+        status: error?.statusCode || null,
+        code: error?.code || null
+      });
+    }
+    return {
+      users: asArray(users).filter((user) => user?.accountId && user.active !== false),
+      complete
+    };
+  } catch (error) {
+    console.warn('Qaira could not enumerate global Jira administrators; synchronizing the verified current administrator only.', {
+      status: error?.statusCode || null,
+      code: error?.code || null,
+      message: String(error?.message || error)
+    });
+    return { users: [await currentUser()], complete: false };
   }
 }
 
@@ -1227,6 +1260,80 @@ async function getMyJiraPermissions(project, permissionKeys = []) {
   return Object.fromEntries(keys.map((key) => [key, Boolean(data.permissions?.[key]?.havePermission)]));
 }
 
+function administratorMembershipState(project, user, existing = null, scope = 'project') {
+  const fallbackRoleId = existing?.role_id && existing.role_id !== 'jira-admin'
+    ? String(existing.role_id)
+    : String(existing?.fallback_role_id || 'viewer');
+  return {
+    ...(existing || {}),
+    id: existing?.id || `${project.id}:${user.accountId}`,
+    project_id: String(project.id),
+    user_id: String(user.accountId),
+    role_id: 'jira-admin',
+    fallback_role_id: fallbackRoleId === 'jira-admin' ? 'viewer' : fallbackRoleId,
+    assignment_source: 'jira-permission',
+    jira_admin_scope: scope === 'global' ? 'global' : 'project',
+    system_managed: true,
+    jira_admin_verified_at: nowIso()
+  };
+}
+
+function restoredAdministratorMembershipState(existing) {
+  const fallbackRoleId = existing?.fallback_role_id && existing.fallback_role_id !== 'jira-admin'
+    ? String(existing.fallback_role_id)
+    : 'viewer';
+  const {
+    assignment_source: _assignmentSource,
+    fallback_role_id: _fallbackRoleId,
+    jira_admin_scope: _administratorScope,
+    jira_admin_verified_at: _verifiedAt,
+    system_managed: _systemManaged,
+    ...restoredMembership
+  } = existing;
+  return {
+    ...restoredMembership,
+    role_id: fallbackRoleId,
+    restored_from_jira_admin_at: nowIso()
+  };
+}
+
+async function reconcileCurrentAdministratorMembership(project, user, jiraPermissions, members) {
+  if (!project || !user?.accountId) return members;
+  const isAdministrator = Boolean(jiraPermissions?.ADMINISTER || jiraPermissions?.ADMINISTER_PROJECTS);
+  const administratorScope = jiraPermissions?.ADMINISTER ? 'global' : 'project';
+  const existing = members.find((member) => String(member.user_id) === String(user.accountId));
+
+  if (isAdministrator) {
+    if (existing?.role_id === 'jira-admin'
+      && existing?.assignment_source === 'jira-permission'
+      && existing?.system_managed === true
+      && existing?.jira_admin_scope === administratorScope) {
+      return members;
+    }
+    const saved = await upsertCollectionItem(
+      project.key,
+      COLLECTIONS.projectMembers,
+      administratorMembershipState(project, user, existing, administratorScope),
+      'member'
+    );
+    return existing
+      ? members.map((member) => String(member.id) === String(existing.id) ? saved : member)
+      : [...members, saved];
+  }
+
+  if (existing?.role_id === 'jira-admin' && existing?.assignment_source === 'jira-permission') {
+    const saved = await upsertCollectionItem(
+      project.key,
+      COLLECTIONS.projectMembers,
+      restoredAdministratorMembershipState(existing),
+      'member'
+    );
+    return members.map((member) => String(member.id) === String(existing.id) ? saved : member);
+  }
+
+  return members;
+}
+
 async function accessProfile(project, user = null) {
   const current = user || await currentUser();
   const jiraPermissions = await getMyJiraPermissions(project, ['ADMINISTER', 'ADMINISTER_PROJECTS', 'CREATE_ISSUES', 'EDIT_ISSUES', 'DELETE_ISSUES', 'LINK_ISSUES', 'CREATE_ATTACHMENTS', 'DELETE_OWN_ATTACHMENTS', 'DELETE_ALL_ATTACHMENTS']);
@@ -1238,12 +1345,13 @@ async function accessProfile(project, user = null) {
       loadRoles(project),
       getCollection(project.key, COLLECTIONS.projectMembers, [])
     ]);
+    members = await reconcileCurrentAdministratorMembership(project, current, jiraPermissions, members);
   }
   const membership = members.find((member) =>
     String(member.user_id) === String(current.accountId)
     && (!member.project_id || [String(project?.id), String(project?.key)].includes(String(member.project_id)))
   );
-  const assignedRoleId = membership?.role_id === 'jira-admin' ? 'viewer' : membership?.role_id || 'viewer';
+  const assignedRoleId = isAdmin ? 'jira-admin' : (membership?.role_id === 'jira-admin' ? membership?.fallback_role_id || 'viewer' : membership?.role_id || 'viewer');
   const role = isAdmin
     ? roleById(roles, 'jira-admin') || DEFAULT_ROLES[0]
     : roleById(roles, assignedRoleId) || roleById(DEFAULT_ROLES, 'viewer');
@@ -1633,7 +1741,11 @@ function mapBugSummary(issue, registry = null, sprintFieldId = null) {
     jira_bug_key: issue.key,
     linked_test_run_id: linkedIssueIdsForTypeKeys(issue, registry, ['testRun'])[0] || null,
     status: issue.fields?.status?.name || null,
+    severity: issue.fields?.priority?.name || null,
     priority: issue.fields?.priority?.name || null,
+    assignee_id: issue.fields?.assignee?.accountId || null,
+    assignee_name: issue.fields?.assignee?.displayName || null,
+    assignee_email: issue.fields?.assignee?.emailAddress || null,
     created_at: issue.fields?.created,
     updated_at: issue.fields?.updated
   };
@@ -2279,21 +2391,27 @@ async function syncRolePermissionRows(project, roleId, permissionCodes) {
   }
 }
 
-function permissionGroups() {
+function permissionGroups(featureFlags = null) {
   return PERMISSION_GROUPS.map((group) => ({
     key: group.key,
     label: group.label,
     permissions: group.permissions.map((permission) => ({
       id: permission.code,
       code: permission.code,
-      description: permission.description
+      description: permission.description,
+      level: permission.level,
+      features: featureAvailabilityForPermission(permission.code).map((feature) => ({
+        ...feature,
+        enabled: featureFlags ? featureFlags[feature.key] === true : null
+      }))
     }))
   }));
 }
 
 async function domainMetadata(project = null) {
   const option = (value, label = titleCase(value), description = '') => ({ value, label, description });
-  const permissionGroupList = permissionGroups();
+  const featureFlags = project ? (await featureFlagSnapshot(project)).flags : null;
+  const permissionGroupList = permissionGroups(featureFlags);
   const jira = await jiraProjectDeliveryMetadata(project);
   const isSystemManagedSchemaField = (field) => ['entityId', 'artifactVersion'].includes(field.key)
     || /^(last|total|passed|failed|blocked|notRun|executed|openDefect|criticalDefect|flakyTests|staleTests)/.test(field.key)
@@ -2333,7 +2451,7 @@ async function domainMetadata(project = null) {
       default_permissions: permissionGroupList.flatMap((group) => group.permissions.map((permission) => permission.code)),
       permission_groups: permissionGroupList,
       pages: {
-        '/': ['workspace.view'],
+        '/': ['dashboard.view'],
         '/projects': ['project.view'],
         '/admin-space': ['user.view', 'role.view', 'integration.view', 'settings.manage'],
         '/people': ['user.view', 'role.view'],
@@ -2342,7 +2460,10 @@ async function domainMetadata(project = null) {
         '/test-cases': ['testcase.view'],
         '/shared-steps': ['shared_step.view'],
         '/design': ['suite.view'],
+        '/test-plans': ['plan.view'],
+        '/quality-gates': ['quality_gate.view'],
         '/automation': ['automation.view'],
+        '/automation-assets': ['automation.view'],
         '/object-repository': ['automation.view'],
         '/agentic-workflows': ['agentic_workflow.view'],
         '/executions': ['run.view'],
@@ -2353,11 +2474,13 @@ async function domainMetadata(project = null) {
         '/test-configurations': ['configuration.view'],
         '/test-data': ['data.view'],
         '/knowledge-repo': ['knowledge.view'],
+        '/ai/quality-insights': ['quality_insight.view'],
         '/issues': ['feedback.view'],
+        '/feedback': ['feedback.view'],
         '/settings': ['settings.view'],
         '/notifications': ['notification.view']
       },
-      route_permissions: []
+      route_permissions: permissionPolicyCatalog()
     },
     feature_flags: {
       groups: FEATURE_GROUPS
@@ -2396,21 +2519,54 @@ const FEATURE_ROUTE_PREFIXES = [
   ['qaira.manual.test_cases', ['/test-cases', '/test-steps', '/test-case-modules', '/test-case-defects']],
   ['qaira.manual.suites', ['/test-suites', '/suite-test-cases', '/shared-step-groups']],
   ['qaira.manual.runs', ['/executions', '/execution-results', '/execution-schedules']],
+  ['qaira.manual.bugs', ['/feedback']],
   ['qaira.manual.plans', ['/test-plans']],
   ['qaira.manual.quality_gates', ['/quality-gates']],
+  ['qaira.manual.environments', ['/test-environments', '/test-configurations']],
+  ['qaira.manual.test_data', ['/test-data-sets']],
+  ['qaira.analytics.dashboards', ['/quality-dashboards', '/analytics/jql', '/analytics/jql-batch']],
   ['qaira.automation.workspace', ['/local-agent']],
   ['qaira.automation.assets', ['/automation-assets']],
   ['qaira.automation.object_repository', ['/test-cases/automation/learning-cache']],
   ['qaira.ai.agentic_workflows', ['/agentic-workflows', '/agentic-workflow-runs']],
+  ['qaira.ai.prompt_templates', ['/ai-prompt-templates']],
   ['qaira.ai.quality_insights', ['/ai/quality-insights']],
   ['qaira.automation.batch_process', ['/workspace-transactions']],
   ['qaira.ops.telemetry', ['/ops-telemetry']],
   ['qaira.ai.knowledge', ['/projects/knowledge']],
   ['qaira.ops.admin', ['/users', '/roles', '/permissions', '/project-members', '/admin/health', '/admin/reconcile']],
+  ['qaira.ops.projects', ['/projects', '/app-types']],
+  ['qaira.ops.settings', ['/settings']],
   ['qaira.api.integrations', ['/integrations']],
-  ['qaira.ops.notifications', ['/notifications']],
-  ['qaira.mobile.appium', ['/test-environments', '/test-configurations']]
+  ['qaira.ops.notifications', ['/notifications']]
 ];
+
+function usesMobileAppiumCapability(pathname, method, body) {
+  if (method === 'GET' || !body || typeof body !== 'object') return false;
+  if (pathname.startsWith('/test-configurations') && String(body.mobile_os || '').trim()) return true;
+  if (pathname.startsWith('/app-types') && ['android', 'ios', 'mobile'].includes(String(body.type || '').toLowerCase())) return true;
+  if (pathname.includes('/automation/recorder-session') && String(body.recorder_target || '').toLowerCase() === 'mobile') return true;
+  if (pathname.startsWith('/integrations')) {
+    if (pathname === '/integrations/import') {
+      return asArray(body.integrations).some((item) => usesMobileAppiumCapability('/integrations', 'POST', item));
+    }
+    const config = body.config && typeof body.config === 'object' ? body.config : body;
+    if (Object.keys(config).some((key) => key.startsWith('mobile_'))) return true;
+    if (['testengine', 'cloudrun'].includes(String(body.type || '').toLowerCase())) {
+      if (['android_app', 'device_name', 'platform_version', 'max_android_workers'].some((key) => config[key] !== undefined)) return true;
+    }
+  }
+  if (/^\/(?:test-cases|test-steps|shared-step-groups)(?:\/|$)/.test(pathname)) {
+    const stepType = String(body.step_type || '').toLowerCase();
+    if (['android', 'ios', 'mobile'].includes(stepType) || String(body.automation_code || '').toLowerCase().includes('appium')) return true;
+  }
+  const steps = asArray(body.steps);
+  return steps.some((step) => {
+    const stepType = String(step?.type || step?.step_type || '').toLowerCase();
+    const automationCode = String(step?.automation_code || '').toLowerCase();
+    return ['android', 'ios', 'mobile'].includes(stepType) || automationCode.includes('appium');
+  });
+}
 
 function featuresForRequest(pathname) {
   const features = FEATURE_ROUTE_PREFIXES
@@ -2430,7 +2586,7 @@ function featuresForRequest(pathname) {
   if (/^\/executions\/[^/]+\/cases\/[^/]+\/ai-analysis$/.test(pathname)) features.push('qaira.ai.execution_analysis');
   if (/^\/executions\/[^/]+\/ai-failure-clusters$/.test(pathname)) features.push('qaira.ai.execution_analysis');
   if (/^\/quality-gates\/[^/]+\/ai-assessment$/.test(pathname)) features.push('qaira.ai.quality_insights');
-  if (pathname === '/analytics/dashboard-design-preview') features.push('qaira.ai.quality_insights');
+  if (pathname === '/analytics/dashboard-design-preview') features.push('qaira.analytics.dashboards', 'qaira.ai.quality_insights');
   if (features.some((feature) => [
     'qaira.automation.assets',
     'qaira.automation.builder',
@@ -2512,6 +2668,16 @@ async function authorizeQairaRequest(pathname, method, query, body, context) {
     }
   }
   const featureKeys = featuresForRequest(pathname);
+  if (usesMobileAppiumCapability(pathname, method, body)) {
+    if (!access.permissions.includes('mobile.manage')) {
+      fail(403, 'QAIRA_PERMISSION_DENIED', 'Your Qaira role does not include mobile.manage.', {
+        requiredPermission: 'mobile.manage',
+        roleId: access.role?.id || null,
+        projectKey: project.key
+      });
+    }
+    featureKeys.push('qaira.mobile.appium');
+  }
   if (body?.automation_code !== undefined || asArray(body?.steps).some((step) => step?.automation_code !== undefined)) {
     featureKeys.push('qaira.automation.step_code');
   }
@@ -3344,8 +3510,141 @@ async function handleAuth(pathname, query, body, context) {
   return null;
 }
 
+function administratorProjectFingerprint(projects, accountIds) {
+  const normalizedAccountIds = asArray(accountIds).map(String).sort();
+  return createHash('sha256')
+    .update(`${normalizedAccountIds.join(',')}:${projects.map((project) => `${project.id}:${project.key}`).sort().join('|')}`)
+    .digest('hex');
+}
+
+function administratorAccountHash(accountId) {
+  return createHash('sha256').update(String(accountId)).digest('hex').slice(0, 16);
+}
+
+async function queueAdministratorMembershipSync(projects, user, access) {
+  if (!access?.jiraPermissions?.ADMINISTER || !user?.accountId || !projects.length) return null;
+  const projectRefs = projects.slice(0, 1000).map((project) => ({ id: String(project.id), key: String(project.key) }));
+  const anchor = projectRefs[0];
+  const marker = await getProjectProperty(anchor.key, ADMIN_MEMBERSHIP_SYNC_PROP, null);
+  const markerAgeMs = marker?.updated_at ? Date.now() - Date.parse(marker.updated_at) : Infinity;
+  const markerIncludesCurrentAdministrator = asArray(marker?.administrator_hashes).includes(administratorAccountHash(user.accountId));
+  const markerIsFresh = markerIncludesCurrentAdministrator && ((marker?.status === 'completed' && markerAgeMs < 24 * 60 * 60 * 1000)
+    || (marker?.status === 'completed_with_errors' && markerAgeMs < 60 * 60 * 1000)
+    || (marker?.status === 'queued' && markerAgeMs < 10 * 60 * 1000));
+  if (markerIsFresh) return { queued: false, status: marker.status, job_id: marker.job_id || null };
+
+  const discovery = await listGlobalJiraAdministrators();
+  const accountIds = [...new Set([
+    ...discovery.users.map((administrator) => String(administrator.accountId || '')).filter(Boolean),
+    String(user.accountId)
+  ])].sort();
+  const fingerprint = administratorProjectFingerprint(projectRefs, accountIds);
+
+  const queued = await administratorMembershipQueue.push({
+    body: {
+      jobType: 'sync-jira-admin-memberships',
+      accountIds,
+      completeAdminSet: discovery.complete,
+      projects: projectRefs,
+      anchorKey: anchor.key,
+      fingerprint
+    },
+    concurrency: { key: 'jira-admin-membership-global', limit: 1 }
+  });
+  await putProjectProperty(anchor.key, ADMIN_MEMBERSHIP_SYNC_PROP, {
+    schema: ADMIN_MEMBERSHIP_SYNC_PROP,
+    fingerprint,
+    status: 'queued',
+    job_id: queued.jobId,
+    project_count: projectRefs.length,
+    administrator_count: accountIds.length,
+    administrator_hashes: accountIds.map(administratorAccountHash),
+    discovery_complete: discovery.complete,
+    updated_at: nowIso()
+  });
+  return { queued: true, status: 'queued', job_id: queued.jobId };
+}
+
+export async function synchronizeJiraAdministratorMemberships({ accountId, accountIds = [], completeAdminSet = false, projects = [], anchorKey, fingerprint } = {}) {
+  const normalizedAccountIds = [...new Set(asArray(accountIds?.length ? accountIds : accountId)
+    .map((value) => requiredString(value, 'Jira administrator account ID', 255)))];
+  if (!normalizedAccountIds.length) fail(400, 'JIRA_ADMIN_REQUIRED', 'At least one verified Jira administrator account ID is required.');
+  const administratorIds = new Set(normalizedAccountIds);
+  const projectRefs = asArray(projects).slice(0, 1000).map((project, index) => ({
+    id: requiredString(project?.id, `Project ${index + 1} ID`, 255),
+    key: requiredString(project?.key, `Project ${index + 1} key`, 255)
+  }));
+  const results = await mapInBatches(projectRefs, async (project) => {
+    try {
+      const members = await getCollection(project.key, COLLECTIONS.projectMembers, []);
+      let changed = 0;
+      for (const administratorId of normalizedAccountIds) {
+        const existing = members.find((member) => String(member.user_id) === administratorId);
+        if (existing?.role_id === 'jira-admin'
+          && existing?.assignment_source === 'jira-permission'
+          && existing?.system_managed === true
+          && existing?.jira_admin_scope === 'global') {
+          continue;
+        }
+        await upsertCollectionItem(project.key, COLLECTIONS.projectMembers, administratorMembershipState(
+          project,
+          { accountId: administratorId },
+          existing,
+          'global'
+        ), 'member');
+        changed += 1;
+      }
+      if (completeAdminSet) {
+        const staleGlobalAdministrators = members.filter((member) =>
+          member?.role_id === 'jira-admin'
+          && member?.assignment_source === 'jira-permission'
+          && member?.jira_admin_scope === 'global'
+          && !administratorIds.has(String(member.user_id))
+        );
+        for (const stale of staleGlobalAdministrators) {
+          await upsertCollectionItem(
+            project.key,
+            COLLECTIONS.projectMembers,
+            restoredAdministratorMembershipState(stale),
+            'member'
+          );
+          changed += 1;
+        }
+      }
+      return { ok: true, project_key: project.key, changed };
+    } catch (error) {
+      return { ok: false, project_key: project.key, changed: 0, error: String(error?.message || error) };
+    }
+  }, 4);
+  const completed = results.filter((result) => result.ok).length;
+  const changed = results.reduce((total, result) => total + Number(result.changed || 0), 0);
+  const failures = results.filter((result) => !result.ok);
+  if (anchorKey) {
+    await putProjectProperty(String(anchorKey), ADMIN_MEMBERSHIP_SYNC_PROP, {
+      schema: ADMIN_MEMBERSHIP_SYNC_PROP,
+      fingerprint: fingerprint || administratorProjectFingerprint(projectRefs, normalizedAccountIds),
+      status: failures.length ? 'completed_with_errors' : 'completed',
+      project_count: projectRefs.length,
+      administrator_count: normalizedAccountIds.length,
+      administrator_hashes: normalizedAccountIds.map(administratorAccountHash),
+      discovery_complete: Boolean(completeAdminSet),
+      completed,
+      changed,
+      failed: failures.length,
+      errors: failures.slice(0, 20),
+      updated_at: nowIso()
+    });
+  }
+  return { completed, changed, failed: failures.length, errors: failures.slice(0, 20) };
+}
+
 async function handleProjects(pathname, method, query, body, context) {
-  if (pathname === '/projects' && method === 'GET') return (await listProjects()).map(mapProject);
+  if (pathname === '/projects' && method === 'GET') {
+    const projects = await listProjects();
+    const user = context?.qairaAuthorization?.user || await currentUser();
+    await queueAdministratorMembershipSync(projects, user, context?.qairaAuthorization?.access);
+    return projects.map(mapProject);
+  }
   if (pathname === '/projects' && method === 'POST') {
     const user = await currentUser();
     const name = requiredString(body?.name, 'Project name', 80);
@@ -3403,7 +3702,31 @@ async function handleProjects(pathname, method, query, body, context) {
     const projectId = String(created.id);
     const projectKey = String(created.key || payload.key);
     const membershipByUserId = new Map(requestedMembers.map((member) => [member.user_id, member]));
-    membershipByUserId.set(String(user.accountId), { user_id: String(user.accountId), role_id: 'qa-lead' });
+    const globalPermissions = await getMyJiraPermissions(null, ['ADMINISTER']);
+    if (globalPermissions.ADMINISTER) {
+      const discovery = await listGlobalJiraAdministrators();
+      const globalAdministratorIds = [...new Set([
+        ...discovery.users.map((administrator) => String(administrator.accountId || '')).filter(Boolean),
+        String(user.accountId)
+      ])];
+      for (const administratorId of globalAdministratorIds) {
+        const requested = membershipByUserId.get(administratorId);
+        membershipByUserId.set(administratorId, {
+          user_id: administratorId,
+          role_id: 'jira-admin',
+          fallback_role_id: requested?.role_id || (administratorId === String(user.accountId) ? 'qa-lead' : 'viewer'),
+          assignment_source: 'jira-permission',
+          jira_admin_scope: 'global',
+          system_managed: true,
+          jira_admin_verified_at: nowIso()
+        });
+      }
+    } else {
+      membershipByUserId.set(String(user.accountId), {
+        user_id: String(user.accountId),
+        role_id: 'qa-lead'
+      });
+    }
 
     const membershipResults = await mapInBatches([...membershipByUserId.values()], async (member) => {
       try {
@@ -3411,7 +3734,14 @@ async function handleProjects(pathname, method, query, body, context) {
           id: `${projectId}:${member.user_id}`,
           project_id: projectId,
           user_id: member.user_id,
-          role_id: member.role_id
+          role_id: member.role_id,
+          ...(member.role_id === 'jira-admin' ? {
+            fallback_role_id: member.fallback_role_id || 'viewer',
+            assignment_source: 'jira-permission',
+            jira_admin_scope: 'global',
+            system_managed: true,
+            jira_admin_verified_at: member.jira_admin_verified_at || nowIso()
+          } : {})
         }, 'member');
         return { ok: true, area: 'member', reference: member.user_id };
       } catch (error) {
@@ -6030,7 +6360,14 @@ async function handleIntegrations(pathname, method, query, body, context) {
   if (itemMatch) {
     const found = await findCollectionItem(COLLECTIONS.integrations, itemMatch[1], project);
     if (!found) throw new Error('Integration not found');
-    if (method === 'PUT') return { updated: Boolean(await upsertCollectionItem(found.project.key, COLLECTIONS.integrations, { ...found.item, ...body, api_key: null }, 'integration')) };
+    if (method === 'PUT') return {
+      updated: Boolean(await upsertCollectionItem(found.project.key, COLLECTIONS.integrations, {
+        ...found.item,
+        ...body,
+        config: { ...(found.item.config || {}), ...(body?.config || {}) },
+        api_key: null
+      }, 'integration'))
+    };
     if (method === 'DELETE') return removeCollectionItem(found.project.key, COLLECTIONS.integrations, itemMatch[1]);
   }
   return null;
@@ -6048,13 +6385,15 @@ async function handleUsersRoles(pathname, method, query, body, context) {
     const currentAccountId = context?.qairaAuthorization?.user?.accountId;
     return (await listJiraUsers()).filter((user) => user.active !== false).map((user) => {
       const membership = members.find((member) => String(member.user_id) === String(user.accountId));
-      const assignedRoleId = membership?.role_id === 'jira-admin' ? 'viewer' : membership?.role_id || 'viewer';
+      const assignedRoleId = membership?.role_id || 'viewer';
       const role = roleById(roles, assignedRoleId) || roleById(DEFAULT_ROLES, 'viewer');
       const isCurrentAdmin = String(user.accountId) === String(currentAccountId) && currentAccess?.isAdmin;
       return mapUser(user, {
         isAdmin: Boolean(isCurrentAdmin),
         role: isCurrentAdmin ? roleById(roles, 'jira-admin') || DEFAULT_ROLES[0] : role,
-        permissions: isCurrentAdmin ? ALL_PERMISSION_CODES : normalizedPermissionCodes(role),
+        permissions: isCurrentAdmin
+          ? ALL_PERMISSION_CODES
+          : role.id === 'jira-admin' ? [] : normalizedPermissionCodes(role),
         jiraPermissions: isCurrentAdmin ? currentAccess?.jiraPermissions : {}
       });
     });
@@ -6064,7 +6403,7 @@ async function handleUsersRoles(pathname, method, query, body, context) {
   if (/^\/users\/.+\/(password)$/.test(pathname)) fail(405, 'ATLASSIAN_MANAGED_IDENTITY', 'Passwords are managed by Atlassian account security, not by Qaira.');
   if (/^\/users\/.+$/.test(pathname) && method !== 'GET') fail(405, 'ATLASSIAN_MANAGED_IDENTITY', 'Update Jira users and product access from Atlassian Administration.');
   if (pathname === '/roles' && method === 'GET') return roles.map(({ permission_codes, ...role }) => ({ ...role, permission_count: normalizedPermissionCodes({ permission_codes }).length }));
-  if (pathname === '/permissions' && method === 'GET') return permissionGroups();
+  if (pathname === '/permissions' && method === 'GET') return permissionGroups((await featureFlagSnapshot(project)).flags);
   const rolePermissions = pathname.match(/^\/roles\/([^/]+)\/permissions$/);
   if (rolePermissions) {
     const role = roleById(roles, decodeURIComponent(rolePermissions[1]));
@@ -6141,6 +6480,9 @@ async function handleUsersRoles(pathname, method, query, body, context) {
     const memberId = decodeURIComponent(memberItem[1]);
     const member = members.find((candidate) => String(candidate.id) === String(memberId));
     if (!member) fail(404, 'MEMBERSHIP_NOT_FOUND', 'Project membership not found.');
+    if (member.role_id === 'jira-admin' && member.assignment_source === 'jira-permission') {
+      fail(409, 'JIRA_ADMIN_MEMBERSHIP_MANAGED', 'This membership is synchronized from live Jira administration. Change the user\'s Jira permission instead of editing or removing it in Qaira.');
+    }
     if (method === 'PUT') {
       const roleId = body?.role_id === undefined ? member.role_id : requiredString(body.role_id, 'Role ID', 255);
       if (!roleById(roles, roleId)) fail(400, 'ROLE_NOT_FOUND', 'Select a valid Qaira role.');

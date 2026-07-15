@@ -93,6 +93,8 @@ export const PERMISSION_GROUPS = [
       write('automation.recorder', 'Use recorder workflows.'),
       write('automation.run.local', 'Prepare local runner executions.'),
       write('automation.run.remote', 'Prepare remote runner executions.'),
+      read('mobile.view', 'View mobile and Appium configuration metadata.'),
+      write('mobile.manage', 'Manage mobile and Appium configuration and recorder workflows.'),
       read('automation.code.view', 'View generated automation code.'),
       read('automation.preview', 'Preview generated automation.'),
       read('agentic_workflow.view', 'View agentic workflows.'),
@@ -200,14 +202,91 @@ export const FEATURE_GROUPS = [
   {
     key: 'manual',
     label: 'Manual test management',
-    description: 'Requirements, cases, reusable steps, suites, runs, and test data.',
+    description: 'Requirements, cases, reusable steps, suites, runs, bugs, environments, and test data.',
     features: [
-      { key: 'qaira.manual.requirements', label: 'Requirements', routes: ['/requirements'], permissions: ['requirement.view'] },
-      { key: 'qaira.manual.test_cases', label: 'Test cases', routes: ['/test-cases'], permissions: ['testcase.view'] },
-      { key: 'qaira.manual.suites', label: 'Suites and shared steps', routes: ['/design', '/shared-steps'], permissions: ['suite.view', 'shared_step.view'] },
-      { key: 'qaira.manual.runs', label: 'Runs and evidence', routes: ['/executions'], permissions: ['run.view'] },
-      { key: 'qaira.manual.plans', label: 'Test plans', routes: ['/test-plans'], permissions: ['plan.view'] },
-      { key: 'qaira.manual.quality_gates', label: 'Quality gates', routes: ['/quality-gates'], permissions: ['quality_gate.view'] }
+      {
+        key: 'qaira.manual.requirements',
+        label: 'Requirements',
+        routes: ['/requirements'],
+        permissions: [
+          'requirement.view', 'requirement.create', 'requirement.update', 'requirement.delete',
+          'requirement.import', 'requirement.export', 'requirement_iteration.view',
+          'requirement_iteration.create', 'requirement_iteration.update', 'requirement_iteration.delete',
+          'attachment.view', 'attachment.create', 'attachment.delete'
+        ]
+      },
+      {
+        key: 'qaira.manual.test_cases',
+        label: 'Test cases',
+        routes: ['/test-cases'],
+        permissions: [
+          'testcase.view', 'testcase.create', 'testcase.update', 'testcase.delete',
+          'testcase.import', 'testcase.export', 'step.manage',
+          'attachment.view', 'attachment.create', 'attachment.delete'
+        ]
+      },
+      {
+        key: 'qaira.manual.suites',
+        label: 'Suites and shared steps',
+        routes: ['/design', '/shared-steps'],
+        permissions: [
+          'shared_step.view', 'shared_step.manage', 'suite.view', 'suite.create', 'suite.update', 'suite.delete'
+        ]
+      },
+      {
+        key: 'qaira.manual.runs',
+        label: 'Runs and evidence',
+        routes: ['/executions'],
+        permissions: [
+          'run.view', 'run.create', 'run.update', 'run.delete', 'run.execute',
+          'run.report.export', 'run.report.share', 'result.view', 'result.manage',
+          'schedule.view', 'schedule.create', 'schedule.update', 'schedule.delete', 'schedule.run',
+          'attachment.view', 'attachment.create', 'attachment.delete'
+        ]
+      },
+      {
+        key: 'qaira.manual.bugs',
+        label: 'Bugs',
+        routes: ['/issues', '/feedback'],
+        permissions: ['feedback.view', 'feedback.manage', 'attachment.view', 'attachment.create', 'attachment.delete']
+      },
+      {
+        key: 'qaira.manual.plans',
+        label: 'Test plans',
+        routes: ['/test-plans'],
+        permissions: ['plan.view', 'plan.create', 'plan.update', 'plan.delete']
+      },
+      {
+        key: 'qaira.manual.quality_gates',
+        label: 'Quality gates',
+        routes: ['/quality-gates'],
+        permissions: ['quality_gate.view', 'quality_gate.create', 'quality_gate.update', 'quality_gate.delete']
+      },
+      {
+        key: 'qaira.manual.environments',
+        label: 'Environments and configurations',
+        routes: ['/test-environments', '/test-configurations'],
+        permissions: ['environment.view', 'environment.manage', 'configuration.view', 'configuration.manage']
+      },
+      {
+        key: 'qaira.manual.test_data',
+        label: 'Test data',
+        routes: ['/test-data'],
+        permissions: ['data.view', 'data.manage', 'data.import', 'data.export']
+      }
+    ]
+  },
+  {
+    key: 'analytics',
+    label: 'Analytics',
+    description: 'Project-scoped quality analytics and configurable dashboards.',
+    features: [
+      {
+        key: 'qaira.analytics.dashboards',
+        label: 'Quality and custom dashboards',
+        routes: ['/'],
+        permissions: ['dashboard.view', 'dashboard.manage']
+      }
     ]
   },
   {
@@ -215,16 +294,16 @@ export const FEATURE_GROUPS = [
     label: 'Automation',
     description: 'Automation design, object repository, batch processing, and mobile metadata.',
     features: [
-      { key: 'qaira.automation.workspace', label: 'Automation workspace', routes: ['/automation'], permissions: ['automation.view'] },
-      { key: 'qaira.automation.assets', label: 'Automation assets', routes: ['/automation-assets'], permissions: ['automation.view'] },
+      { key: 'qaira.automation.workspace', label: 'Automation workspace', routes: ['/automation'], permissions: ['automation.view', 'automation.preview'] },
+      { key: 'qaira.automation.assets', label: 'Automation assets', routes: ['/automation-assets'], permissions: ['automation.view', 'automation.asset.create', 'automation.asset.update', 'automation.asset.delete'] },
       { key: 'qaira.automation.builder', label: 'Automation builder', routes: ['/automation'], permissions: ['automation.build'] },
       { key: 'qaira.automation.step_code', label: 'Step code editor', routes: ['/automation'], permissions: ['automation.code.view'] },
       { key: 'qaira.automation.step_recording', label: 'External recorder workflows', routes: ['/automation'], permissions: ['automation.recorder'] },
       { key: 'qaira.automation.local_execution', label: 'Local runner hand-off', routes: ['/automation', '/executions'], permissions: ['automation.run.local'] },
       { key: 'qaira.automation.remote_execution', label: 'Remote runner hand-off', routes: ['/automation', '/executions'], permissions: ['automation.run.remote'] },
-      { key: 'qaira.automation.object_repository', label: 'Object repository', routes: ['/object-repository'], permissions: ['automation.view'] },
-      { key: 'qaira.automation.batch_process', label: 'Batch process', routes: ['/testops'], permissions: ['transaction.view'] },
-      { key: 'qaira.mobile.appium', label: 'Mobile test metadata', routes: ['/test-environments', '/test-configurations'], permissions: ['environment.view', 'configuration.view'] }
+      { key: 'qaira.automation.object_repository', label: 'Object repository', routes: ['/object-repository'], permissions: ['automation.view', 'automation.repository.manage', 'automation.repository.import', 'automation.repository.export'] },
+      { key: 'qaira.automation.batch_process', label: 'Batch process', routes: ['/testops'], permissions: ['transaction.view', 'transaction.artifact.download'] },
+      { key: 'qaira.mobile.appium', label: 'Mobile and Appium', routes: ['/test-environments', '/test-configurations', '/automation'], permissions: ['mobile.view', 'mobile.manage'] }
     ]
   },
   {
@@ -238,8 +317,9 @@ export const FEATURE_GROUPS = [
       { key: 'qaira.ai.automation', label: 'Automation assistance', routes: ['/automation'], permissions: ['automation.ai'] },
       { key: 'qaira.ai.execution_analysis', label: 'Execution analysis', routes: ['/executions'], permissions: ['run.ai'] },
       { key: 'qaira.ai.quality_insights', label: 'Quality insights', routes: ['/ai/quality-insights', '/quality-gates', '/analytics/dashboard-design-preview'], permissions: ['quality_insight.view', 'quality_gate.ai', 'dashboard.view'] },
-      { key: 'qaira.ai.agentic_workflows', label: 'Agentic workflows', routes: ['/agentic-workflows'], permissions: ['agentic_workflow.view'] },
-      { key: 'qaira.ai.knowledge', label: 'Knowledge repository', routes: ['/knowledge-repo'], permissions: ['knowledge.view'] }
+      { key: 'qaira.ai.agentic_workflows', label: 'Agentic workflows', routes: ['/agentic-workflows'], permissions: ['agentic_workflow.view', 'agentic_workflow.manage', 'agentic_workflow.run'] },
+      { key: 'qaira.ai.knowledge', label: 'Knowledge repository', routes: ['/knowledge-repo'], permissions: ['knowledge.view', 'knowledge.manage'] },
+      { key: 'qaira.ai.prompt_templates', label: 'Prompt templates', routes: ['/agentic-workflows'], permissions: ['prompt_template.view', 'prompt_template.manage'] }
     ]
   },
   {
@@ -247,10 +327,12 @@ export const FEATURE_GROUPS = [
     label: 'Administration and operations',
     description: 'Access controls, integrations, notifications, and operational telemetry.',
     features: [
-      { key: 'qaira.ops.admin', label: 'Access administration', routes: ['/people'], permissions: ['user.view', 'role.view'] },
-      { key: 'qaira.api.integrations', label: 'Integrations', routes: ['/integrations'], permissions: ['integration.view'] },
-      { key: 'qaira.ops.notifications', label: 'Notifications', routes: ['/notifications'], permissions: ['notification.view'] },
-      { key: 'qaira.ops.telemetry', label: 'Operational telemetry', routes: ['/ops-telemetry', '/traces'], permissions: ['ops.view'] }
+      { key: 'qaira.ops.projects', label: 'Projects and application types', routes: ['/projects'], permissions: ['project.view', 'project.manage', 'project.delete', 'project.sync'] },
+      { key: 'qaira.ops.admin', label: 'Access administration', routes: ['/people'], permissions: ['user.view', 'role.view', 'role.manage', 'project_member.view', 'project_member.manage'] },
+      { key: 'qaira.ops.settings', label: 'Workspace settings', routes: ['/settings'], permissions: ['settings.view', 'settings.manage', 'feature_flag.manage'] },
+      { key: 'qaira.api.integrations', label: 'Integrations', routes: ['/integrations'], permissions: ['integration.view', 'integration.manage'] },
+      { key: 'qaira.ops.notifications', label: 'Notifications', routes: ['/notifications'], permissions: ['notification.view', 'notification.manage'] },
+      { key: 'qaira.ops.telemetry', label: 'Operational telemetry', routes: ['/ops-telemetry', '/traces'], permissions: ['ops.view', 'ops.manage', 'transaction.view', 'transaction.artifact.download'] }
     ]
   }
 ];
@@ -258,6 +340,20 @@ export const FEATURE_GROUPS = [
 export const DEFAULT_FEATURE_FLAGS = Object.fromEntries(
   FEATURE_GROUPS.flatMap((group) => group.features.map((feature) => [feature.key, true]))
 );
+
+const FEATURE_DEFINITIONS = FEATURE_GROUPS.flatMap((group) =>
+  group.features.map((feature) => ({
+    ...feature,
+    group: group.key,
+    group_label: group.label
+  }))
+);
+
+export function featureAvailabilityForPermission(permissionCode) {
+  return FEATURE_DEFINITIONS
+    .filter((feature) => feature.permissions.includes(permissionCode))
+    .map(({ key, label, group, group_label }) => ({ key, label, group, group_label }));
+}
 
 const ROOT_POLICIES = {
   '/projects': ['project.view', 'project.manage', 'project.manage', 'project.delete'],
@@ -309,6 +405,11 @@ export function permissionForRequest(pathname, method = 'GET') {
   if (pathname === '/requirements/export') return 'requirement.export';
   if (pathname === '/test-cases/import') return 'testcase.import';
   if (pathname === '/test-cases/export') return 'testcase.export';
+  if (pathname === '/test-cases/ai-authoring-preview' || pathname === '/test-cases/ai-step-rephrase' || pathname === '/test-cases/design-test-cases-preview') return 'testcase.ai';
+  if (pathname === '/test-cases/ai-generation-jobs') return method === 'GET' ? 'testcase.view' : 'testcase.ai';
+  if (pathname === '/test-cases/automation/learning-cache/export.csv') return 'automation.repository.export';
+  if (pathname === '/test-cases/automation/learning-cache/import') return 'automation.repository.import';
+  if (pathname === '/test-cases/automation/learning-cache/extract' || pathname === '/test-cases/automation/learning-cache/extract-fields') return 'automation.repository.manage';
   if (pathname === '/metadata/domain' || pathname.startsWith('/auth/')) return null;
   if (pathname === '/analytics/dashboard-design-preview') return 'quality_insight.view';
   if (pathname === '/analytics/jql' || pathname === '/analytics/jql-batch') return 'dashboard.view';
@@ -318,20 +419,26 @@ export function permissionForRequest(pathname, method = 'GET') {
   if (/^\/projects\/[^/]+\/knowledge(?:\/|$)/.test(pathname)) return method === 'GET' ? 'knowledge.view' : 'knowledge.manage';
   if (pathname.startsWith('/test-cases/automation/learning-cache')) return method === 'GET' ? 'automation.view' : 'automation.repository.manage';
   if (/^\/test-cases\/[^/]+\/automation\/build$/.test(pathname)) return 'automation.build';
+  if (/^\/test-cases\/[^/]+\/automation\/generator-jobs$/.test(pathname)) return 'automation.build';
   if (pathname.includes('/automation/recorder-session')) return 'automation.recorder';
+  if (/^\/test-cases\/[^/]+\/(?:accept-generated|reject-generated)$/.test(pathname)) return 'testcase.update';
   if (/^\/test-cases\/[^/]+\/review$/.test(pathname)) return 'testcase.update';
   if (/^\/test-cases\/[^/]+\/versions\/\d+\/restore$/.test(pathname)) return 'testcase.update';
   if (/^\/test-cases\/[^/]+\/versions(?:\/\d+)?$/.test(pathname)) return 'testcase.view';
   if (/^\/executions\/[^/]+\/(?:start|complete|rerun)$/.test(pathname)) return 'run.execute';
+  if (/^\/executions\/[^/]+\/cases\/[^/]+\/steps\/[^/]+\/run$/.test(pathname)) return 'run.execute';
   if (/^\/executions\/[^/]+\/cases\/[^/]+\/assignment$/.test(pathname)) return 'run.update';
   if (/^\/executions\/[^/]+\/cases\/[^/]+\/ai-analysis$/.test(pathname)) return 'run.ai';
   if (/^\/executions\/[^/]+\/ai-failure-clusters$/.test(pathname)) return 'run.ai';
   if (/^\/requirements\/[^/]+\/ai-impact-preview$/.test(pathname)) return 'requirement.ai';
+  if (/^\/requirements\/[^/]+\/(?:design-test-cases-preview|(?:ai-)?optimize-preview|generate-test-cases)$/.test(pathname)) return 'requirement.ai';
+  if (/^\/requirements\/[^/]+\/design-test-cases-accept$/.test(pathname)) return 'testcase.create';
   if (/^\/test-cases\/[^/]+\/ai-impact-preview$/.test(pathname)) return 'testcase.ai';
   if (/^\/quality-gates\/[^/]+\/ai-assessment$/.test(pathname)) return 'quality_gate.ai';
   if (/^\/executions\/[^/]+\/report\.pdf$/.test(pathname)) return 'run.report.export';
   if (/^\/executions\/[^/]+\/share-report$/.test(pathname)) return 'run.report.share';
   if (/^\/execution-schedules\/[^/]+\/run$/.test(pathname)) return 'schedule.run';
+  if (/^\/workspace-transactions\/[^/]+\/artifacts\/[^/]+\/download$/.test(pathname)) return 'transaction.artifact.download';
   if (pathname.startsWith('/requirement-test-cases')) return method === 'GET' ? 'requirement.view' : 'requirement.update';
   if (pathname.startsWith('/requirement-defects')) return method === 'GET' ? 'requirement.view' : 'requirement.update';
   if (pathname.startsWith('/test-case-defects')) return method === 'GET' ? 'testcase.view' : 'testcase.update';
@@ -341,6 +448,19 @@ export function permissionForRequest(pathname, method = 'GET') {
     .sort((left, right) => right.length - left.length)
     .find((candidate) => pathname === candidate || pathname.startsWith(`${candidate}/`));
   return root ? ROOT_POLICIES[root][methodIndex(method)] : null;
+}
+
+export function permissionPolicyCatalog() {
+  return Object.entries(ROOT_POLICIES).map(([route, permissions]) => ({
+    route,
+    methods: {
+      GET: permissions[0],
+      POST: permissions[1],
+      PUT: permissions[2],
+      PATCH: permissions[2],
+      DELETE: permissions[3]
+    }
+  }));
 }
 
 export function roleById(roles, roleId) {

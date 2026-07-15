@@ -20786,7 +20786,8 @@ textarea:focus-visible,
 
 .permission-designer .permission-option-title,
 .permission-designer .permission-option-code,
-.permission-designer .permission-option-description {
+.permission-designer .permission-option-description,
+.permission-designer .permission-option-availability {
   display: block !important;
   position: static !important;
   min-width: 0 !important;
@@ -20821,6 +20822,18 @@ textarea:focus-visible,
   font-size: 0.76rem !important;
   font-weight: 650 !important;
   line-height: 1.34 !important;
+}
+
+.permission-designer .permission-option-availability {
+  width: fit-content !important;
+  color: var(--accent-primary, #2563eb) !important;
+  background: color-mix(in srgb, var(--accent-primary, #2563eb) 8%, transparent) !important;
+  border: 1px solid color-mix(in srgb, var(--accent-primary, #2563eb) 20%, transparent) !important;
+  border-radius: 999px !important;
+  padding: 0.18rem 0.48rem !important;
+  font-size: 0.68rem !important;
+  font-weight: 750 !important;
+  line-height: 1.2 !important;
 }
 
 .people-role-modal-body {
@@ -45544,6 +45557,7 @@ body > .nested-modal-backdrop {
 :root[data-theme="dark"] .agent-education-card span,
 :root[data-theme="dark"] .permission-option-description,
 :root[data-theme="dark"] .permission-option-code,
+:root[data-theme="dark"] .permission-option-availability,
 :root[data-theme="dark"] .execution-step-card-footer-note,
 :root[data-theme="dark"] .auth-card p {
   color: var(--text-secondary) !important;

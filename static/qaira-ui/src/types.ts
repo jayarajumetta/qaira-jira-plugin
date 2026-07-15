@@ -23,6 +23,8 @@ export type Permission = {
   id: string;
   code: string;
   description: string | null;
+  level?: "read" | "write" | "manage";
+  features?: Array<{ key: string; label: string; group: string; group_label: string; enabled?: boolean | null }>;
 };
 
 export type PermissionGroup = {
@@ -209,6 +211,10 @@ export type ProjectMember = {
   project_id: string;
   user_id: string;
   role_id: string;
+  fallback_role_id?: string;
+  assignment_source?: "jira-permission" | string;
+  system_managed?: boolean;
+  jira_admin_verified_at?: string;
   created_at?: string;
 };
 

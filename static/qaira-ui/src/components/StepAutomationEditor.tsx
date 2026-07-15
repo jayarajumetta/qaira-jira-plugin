@@ -1,10 +1,14 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { PlayIcon, SparkIcon } from "./AppIcons";
+import { useAuth } from "../auth/AuthContext";
 import { FormField } from "./FormField";
 import { InfoTooltip } from "./InfoTooltip";
 import { SharedStepsIcon as SharedStepsIconGraphic } from "./SharedStepsIcon";
 import { api } from "../lib/api";
 import { useDialogFocus } from "../hooks/useDialogFocus";
+import { useFeatureFlags } from "../hooks/useFeatureFlags";
+import { areFeatureFlagsEnabled } from "../lib/featureFlags";
+import { hasPermission } from "../lib/permissions";
 import { parseStepParameterName, resolveStepParameterText, type StepParameterDefinition, type StepParameterScope } from "../lib/stepParameters";
 import {
   buildAutomationKeywordMappings,
@@ -918,10 +922,15 @@ export function StepTypePickerButton({
   onChange: (next: TestStepType) => void;
   disabled?: boolean;
 }) {
+  const { session } = useAuth();
+  const featureFlagsQuery = useFeatureFlags(Boolean(session));
+  const canUseMobileAppium = hasPermission(session, "mobile.manage")
+    && areFeatureFlagsEnabled(featureFlagsQuery.data, ["qaira.mobile.appium"]);
   const [isOpen, setIsOpen] = useState(false);
   const triggerRef = useRef<HTMLButtonElement | null>(null);
   const menuRef = useRef<HTMLDivElement | null>(null);
-  const stepType = normalizeStepType(value);
+  const requestedStepType = normalizeStepType(value);
+  const stepType = !canUseMobileAppium && ["android", "ios"].includes(requestedStepType) ? "web" : requestedStepType;
   const meta = getStepTypeMeta(stepType);
 
   useEffect(() => {
@@ -967,7 +976,7 @@ export function StepTypePickerButton({
       </button>
       {isOpen ? (
         <div className="step-type-menu" ref={menuRef} role="menu">
-          {STEP_TYPE_OPTIONS.map((option) => (
+          {STEP_TYPE_OPTIONS.filter((option) => canUseMobileAppium || !["android", "ios"].includes(option.value)).map((option) => (
             <button
               className={option.value === stepType ? "step-type-menu-item is-active" : "step-type-menu-item"}
               key={option.value}
@@ -1955,6 +1964,10 @@ export function StepAutomationDialog({
   onClose: () => void;
   onSave: (input: { step_type: TestStepType; automation_code: string; api_request: StepApiRequest | null }) => void;
 }) {
+  const { session } = useAuth();
+  const featureFlagsQuery = useFeatureFlags(Boolean(session));
+  const canUseMobileAppium = hasPermission(session, "mobile.manage")
+    && areFeatureFlagsEnabled(featureFlagsQuery.data, ["qaira.mobile.appium"]);
   const dialogRef = useDialogFocus<HTMLDivElement>({ onClose });
   const stepRevisionKey = JSON.stringify({
     id: step.id || "",
@@ -2491,7 +2504,7 @@ export function StepAutomationDialog({
         <div className="resource-form">
           <div className="resource-form-body automation-editor-body">
             <div className="automation-step-type-row">
-              {STEP_TYPE_OPTIONS.map((option) => (
+              {STEP_TYPE_OPTIONS.filter((option) => canUseMobileAppium || !["android", "ios"].includes(option.value)).map((option) => (
                 <button
                   className={option.value === stepType ? "automation-type-pill is-active" : "automation-type-pill"}
                   key={option.value}
@@ -3009,7 +3022,7 @@ export function StepAutomationDialog({
                     {webKeywordMessage ? <div className="inline-message success-message">{webKeywordMessage}</div> : null}
                   </div>
                 ) : null}
-                {stepType === "android" || stepType === "ios" ? (
+                {canUseMobileAppium && (stepType === "android" || stepType === "ios") ? (
                   <div className="automation-response-shell">
                     <div className="automation-response-header">
                       <div>

@@ -14,7 +14,7 @@ It does not execute the restored canonical `schema.sql`. Before any Jira call it
 - Company-managed issue type scheme additions
 - Company-managed screens, tabs, screen schemes, issue type screen schemes
 - Per-project registry as Jira project property `qaira.registry.v1`
-- Missing runtime collection, role, membership, permission, feature-flag (28 registered keys), and preference property envelopes
+- Missing runtime collection, role, membership, permission, feature-flag (35 registered keys), and preference property envelopes
 - Registry/property byte-size guards for Jira's 32,768-byte entity-property limit
 
 ## Required environment

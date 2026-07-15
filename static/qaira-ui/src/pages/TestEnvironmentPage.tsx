@@ -2,6 +2,7 @@ import { FormEvent, useEffect, useMemo, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useSearchParams } from "react-router-dom";
+import { useAuth } from "../auth/AuthContext";
 import { AddIcon, OpenIcon } from "../components/AppIcons";
 import { CatalogSearchFilter } from "../components/CatalogSearchFilter";
 import { CatalogSelectionControls } from "../components/CatalogSelectionControls";
@@ -21,7 +22,10 @@ import { useDeleteConfirmation } from "../components/DeleteConfirmationDialog";
 import { useCurrentAppType, useCurrentProject } from "../hooks/useCurrentProject";
 import { useDomainMetadata } from "../hooks/useDomainMetadata";
 import { useDialogFocus } from "../hooks/useDialogFocus";
+import { useFeatureFlags } from "../hooks/useFeatureFlags";
 import { api } from "../lib/api";
+import { areFeatureFlagsEnabled } from "../lib/featureFlags";
+import { hasPermission } from "../lib/permissions";
 import { parseTestDataFile, toKeyValueRows } from "../lib/testDataImport";
 import { countGeneratedTestDataFields, evaluateTestDataTemplate, hasTestDataGeneratorTemplate, materializeTestDataRows, TEST_DATA_GENERATOR_TEMPLATES } from "../lib/testDataGenerators";
 import { readDefaultCatalogViewMode } from "../lib/viewPreferences";
@@ -380,13 +384,19 @@ const draftHasInvalidDataSetChars = (draft: DataSetDraft) => {
   return draft.rows.some((row) => Object.values(row).some((value) => hasInvalidDataSetChars(value)));
 };
 
-const formatConfigurationTarget = (configuration: Pick<TestConfiguration, "browser" | "mobile_os" | "platform_version">) =>
-  [configuration.browser, configuration.mobile_os, configuration.platform_version].filter(Boolean).join(" · ");
+const formatConfigurationTarget = (
+  configuration: Pick<TestConfiguration, "browser" | "mobile_os" | "platform_version">,
+  includeMobileMetadata: boolean
+) => [configuration.browser, includeMobileMetadata ? configuration.mobile_os : "", configuration.platform_version].filter(Boolean).join(" · ");
 
 export function TestEnvironmentPage({ view }: { view: TestEnvironmentPageView }) {
   const queryClient = useQueryClient();
+  const { session } = useAuth();
   const [searchParams, setSearchParams] = useSearchParams();
   const domainMetadataQuery = useDomainMetadata();
+  const featureFlagsQuery = useFeatureFlags(Boolean(session));
+  const canUseMobileMetadata = hasPermission(session, "mobile.view")
+    && areFeatureFlagsEnabled(featureFlagsQuery.data, ["qaira.mobile.appium"]);
   const { confirmDelete, confirmationDialog } = useDeleteConfirmation();
   const [projectId] = useCurrentProject();
   const [appTypeId, setAppTypeId] = useCurrentAppType(projectId);
@@ -405,7 +415,7 @@ export function TestEnvironmentPage({ view }: { view: TestEnvironmentPageView })
   const [selectedActionConfigurationIds, setSelectedActionConfigurationIds] = useState<string[]>([]);
   const [selectedActionDataSetIds, setSelectedActionDataSetIds] = useState<string[]>([]);
   const browserOptions = domainMetadataQuery.data?.test_environments.browsers || [];
-  const mobileOsOptions = domainMetadataQuery.data?.test_environments.mobile_os || [];
+  const mobileOsOptions = canUseMobileMetadata ? domainMetadataQuery.data?.test_environments.mobile_os || [] : [];
   const dataSetModeOptions = domainMetadataQuery.data?.test_data_sets.modes || [];
   const defaultDataSetMode = (domainMetadataQuery.data?.test_data_sets.default_mode || "table") as TestDataSetMode;
   const emptyDataSetDraft = useMemo(() => buildEmptyDataSetDraft(defaultDataSetMode), [defaultDataSetMode]);
@@ -497,7 +507,7 @@ export function TestEnvironmentPage({ view }: { view: TestEnvironmentPageView })
         configuration.name,
         configuration.description,
         configuration.browser,
-        configuration.mobile_os,
+        canUseMobileMetadata ? configuration.mobile_os : "",
         configuration.platform_version,
         selectedAppTypeName
       ]
@@ -506,7 +516,7 @@ export function TestEnvironmentPage({ view }: { view: TestEnvironmentPageView })
         .toLowerCase()
         .includes(normalizedSearch)
     );
-  }, [configurationSearch, configurations, selectedAppTypeName]);
+  }, [canUseMobileMetadata, configurationSearch, configurations, selectedAppTypeName]);
   const filteredDataSets = useMemo(() => {
     const normalizedSearch = dataSetSearch.trim().toLowerCase();
 
@@ -593,7 +603,7 @@ export function TestEnvironmentPage({ view }: { view: TestEnvironmentPageView })
       render: (configuration) => (
         <div className="data-table-multiline">
           <strong>{configuration.name}</strong>
-          <span className="data-table-multiline-line">{formatConfigurationTarget(configuration) || richTextToPlainText(configuration.description) || "Draft profile"}</span>
+          <span className="data-table-multiline-line">{formatConfigurationTarget(configuration, canUseMobileMetadata) || richTextToPlainText(configuration.description) || "Draft profile"}</span>
         </div>
       )
     },
@@ -609,8 +619,8 @@ export function TestEnvironmentPage({ view }: { view: TestEnvironmentPageView })
       label: "Target",
       width: 240,
       minWidth: 160,
-      sortValue: (configuration) => formatConfigurationTarget(configuration),
-      render: (configuration) => formatConfigurationTarget(configuration) || "Draft profile"
+      sortValue: (configuration) => formatConfigurationTarget(configuration, canUseMobileMetadata),
+      render: (configuration) => formatConfigurationTarget(configuration, canUseMobileMetadata) || "Draft profile"
     },
     {
       key: "variables",
@@ -628,7 +638,7 @@ export function TestEnvironmentPage({ view }: { view: TestEnvironmentPageView })
       minWidth: 160,
       render: (configuration) => richTextToPlainText(configuration.description) || "No description"
     }
-  ], [selectedAppTypeName]);
+  ], [canUseMobileMetadata, selectedAppTypeName]);
   const dataSetListColumns = useMemo<Array<DataTableColumn<TestDataSet>>>(() => [
     {
       key: "name",
@@ -686,7 +696,9 @@ export function TestEnvironmentPage({ view }: { view: TestEnvironmentPageView })
     view === "environments"
       ? "Keep run targets, URLs, and reusable environment variables organized by project and app type."
       : view === "configurations"
-        ? "Maintain reusable browser, device, and platform combinations so runs stay consistent."
+        ? canUseMobileMetadata
+          ? "Maintain reusable browser, device, and platform combinations so runs stay consistent."
+          : "Maintain reusable browser and platform combinations so runs stay consistent."
         : "Store JSON, spreadsheet-style data, and key/value sets that can be attached to runs on demand.";
   const currentViewCount = view === "environments" ? environments.length : view === "configurations" ? configurations.length : dataSets.length;
 
@@ -972,7 +984,7 @@ export function TestEnvironmentPage({ view }: { view: TestEnvironmentPageView })
         name: createConfigurationDraft.name,
         description: createConfigurationDraft.description || undefined,
         browser: createConfigurationDraft.browser || undefined,
-        mobile_os: createConfigurationDraft.mobile_os || undefined,
+        mobile_os: canUseMobileMetadata ? createConfigurationDraft.mobile_os || undefined : undefined,
         platform_version: createConfigurationDraft.platform_version || undefined,
         variables: normalizeVariableRows(createConfigurationDraft.variables)
       });
@@ -1002,7 +1014,7 @@ export function TestEnvironmentPage({ view }: { view: TestEnvironmentPageView })
           name: configurationDraft.name,
           description: configurationDraft.description,
           browser: configurationDraft.browser,
-          mobile_os: configurationDraft.mobile_os,
+          mobile_os: canUseMobileMetadata ? configurationDraft.mobile_os : undefined,
           platform_version: configurationDraft.platform_version,
           variables: normalizeVariableRows(configurationDraft.variables)
         }
@@ -1228,14 +1240,14 @@ export function TestEnvironmentPage({ view }: { view: TestEnvironmentPageView })
       {view === "configurations" ? (
         <WorkspaceMasterDetail
           browseView={(
-            <Panel title="Configurations" titleVariant="eyebrow" subtitle="Browse reusable browser and device profiles as cards before opening one into the editor.">
+            <Panel title="Configurations" titleVariant="eyebrow" subtitle={canUseMobileMetadata ? "Browse reusable browser and device profiles as cards before opening one into the editor." : "Browse reusable browser profiles as cards before opening one into the editor."}>
               <div className="design-list-toolbar resource-catalog-toolbar">
                 <CatalogSearchFilter
                   activeFilterCount={configurationSearch.trim() ? 1 : 0}
                   ariaLabel="Search configurations"
                   onChange={setConfigurationSearch}
                   placeholder="Search configurations"
-                  subtitle="Search by name, browser, mobile OS, platform version, or app type scope."
+                  subtitle={canUseMobileMetadata ? "Search by name, browser, mobile OS, platform version, or app type scope." : "Search by name, browser, platform version, or app type scope."}
                   title="Configuration search"
                   type="search"
                   value={configurationSearch}
@@ -1296,9 +1308,9 @@ export function TestEnvironmentPage({ view }: { view: TestEnvironmentPageView })
                               <strong>{configuration.name}</strong>
                               <span className="tile-card-kicker">{selectedAppTypeName}</span>
                             </div>
-                            <TileCardStatusIndicator title={formatConfigurationTarget(configuration) ? "Target configured" : "Draft profile"} tone={formatConfigurationTarget(configuration) ? "success" : "neutral"} />
+                            <TileCardStatusIndicator title={formatConfigurationTarget(configuration, canUseMobileMetadata) ? "Target configured" : "Draft profile"} tone={formatConfigurationTarget(configuration, canUseMobileMetadata) ? "success" : "neutral"} />
                           </div>
-                          {formatConfigurationTarget(configuration) ? <p className="tile-card-description">{formatConfigurationTarget(configuration)}</p> : <RichTextContent className="tile-card-description" value={configuration.description} fallback="No browser, mobile OS, or version defined yet." />}
+                          {formatConfigurationTarget(configuration, canUseMobileMetadata) ? <p className="tile-card-description">{formatConfigurationTarget(configuration, canUseMobileMetadata)}</p> : <RichTextContent className="tile-card-description" value={configuration.description} fallback={canUseMobileMetadata ? "No browser, mobile OS, or version defined yet." : "No browser or version defined yet."} />}
                           <div className="resource-card-footer">
                             <span className="count-pill">{configuration.variables.length} variable{configuration.variables.length === 1 ? "" : "s"}</span>
                           </div>
@@ -1338,6 +1350,7 @@ export function TestEnvironmentPage({ view }: { view: TestEnvironmentPageView })
                   draft={configurationDraft}
                   isSubmitting={updateConfiguration.isPending}
                   mobileOsOptions={mobileOsOptions}
+                  showMobileMetadata={canUseMobileMetadata}
                   onChange={setConfigurationDraft}
                   onDelete={handleDeleteConfiguration}
                   onSubmit={handleUpdateConfiguration}
@@ -1504,6 +1517,7 @@ export function TestEnvironmentPage({ view }: { view: TestEnvironmentPageView })
             draft={createConfigurationDraft}
             isSubmitting={createConfiguration.isPending}
             mobileOsOptions={mobileOsOptions}
+            showMobileMetadata={canUseMobileMetadata}
             onChange={setCreateConfigurationDraft}
             onSubmit={handleCreateConfiguration}
             submitLabel={createConfiguration.isPending ? "Creating…" : "Create configuration"}
@@ -1642,6 +1656,7 @@ function ConfigurationForm({
   draft,
   browserOptions,
   mobileOsOptions,
+  showMobileMetadata,
   onChange,
   onSubmit,
   onDelete,
@@ -1651,6 +1666,7 @@ function ConfigurationForm({
   draft: ConfigurationDraft;
   browserOptions: Array<{ value: string; label: string }>;
   mobileOsOptions: Array<{ value: string; label: string }>;
+  showMobileMetadata: boolean;
   onChange: (draft: ConfigurationDraft) => void;
   onSubmit: (event: FormEvent<HTMLFormElement>) => void;
   onDelete?: () => void;
@@ -1672,14 +1688,16 @@ function ConfigurationForm({
               ))}
             </select>
           </FormField>
-          <FormField label="Mobile OS">
-            <select value={draft.mobile_os} onChange={(event) => onChange({ ...draft, mobile_os: event.target.value })}>
-              <option value="">Any mobile OS</option>
-              {mobileOsOptions.map((option) => (
-                <option key={option.value} value={option.value}>{option.label}</option>
-              ))}
-            </select>
-          </FormField>
+          {showMobileMetadata ? (
+            <FormField label="Mobile OS">
+              <select value={draft.mobile_os} onChange={(event) => onChange({ ...draft, mobile_os: event.target.value })}>
+                <option value="">Any mobile OS</option>
+                {mobileOsOptions.map((option) => (
+                  <option key={option.value} value={option.value}>{option.label}</option>
+                ))}
+              </select>
+            </FormField>
+          ) : null}
           <FormField label="Version">
             <input placeholder="17, 14, 124, or API v2" value={draft.platform_version} onChange={(event) => onChange({ ...draft, platform_version: event.target.value })} />
           </FormField>

@@ -27,8 +27,11 @@ import { TileCardStatusIndicator } from "../components/TileCardPrimitives";
 import { WorkspaceBackButton, WorkspaceMasterDetail } from "../components/WorkspaceMasterDetail";
 import { useDeleteConfirmation } from "../components/DeleteConfirmationDialog";
 import { useDomainMetadata } from "../hooks/useDomainMetadata";
+import { useFeatureFlags } from "../hooks/useFeatureFlags";
 import { api } from "../lib/api";
+import { areFeatureFlagsEnabled } from "../lib/featureFlags";
 import { buildBrowserUrl } from "../lib/integrationUrls";
+import { hasPermission } from "../lib/permissions";
 import { readDefaultCatalogViewMode } from "../lib/viewPreferences";
 import type { Integration } from "../types";
 
@@ -714,7 +717,7 @@ function getDraftFromIntegration(
   }, definitions);
 }
 
-function buildIntegrationConfig(draft: IntegrationDraft, definitions: IntegrationTypeDefinition[]): Record<string, unknown> {
+function buildIntegrationConfig(draft: IntegrationDraft, definitions: IntegrationTypeDefinition[], includeMobileAppium = false): Record<string, unknown> {
   const emailDefaults = getIntegrationTypeDefinition("email", definitions)?.defaults || {};
 
   if (draft.type === "email") {
@@ -782,16 +785,18 @@ function buildIntegrationConfig(draft: IntegrationDraft, definitions: Integratio
       queue_poll_interval_minutes: Number.parseFloat(draft.engine_queue_poll_interval_minutes) || 5,
       max_api_workers: Number.parseInt(draft.engine_max_api_workers, 10) || 10,
       max_web_workers: Number.parseInt(draft.engine_max_web_workers, 10) || 5,
-      max_android_workers: Number.parseInt(draft.engine_max_android_workers, 10) || 2,
       live_view_url: draft.engine_live_view_url.trim() || null,
-      mobile_engine_url: draft.engine_mobile_engine_url.trim() || null,
-      mobile_cloud_provider: draft.engine_mobile_cloud_provider,
-      mobile_remote_url: draft.engine_mobile_remote_url.trim() || null,
-      mobile_username: draft.engine_mobile_username.trim() || null,
-      mobile_access_key: isMaskedSecretValue(draft.engine_mobile_access_key) ? undefined : draft.engine_mobile_access_key.trim() || null,
-      device_name: draft.engine_mobile_device_name.trim() || null,
-      platform_version: draft.engine_mobile_platform_version.trim() || null,
-      android_app: draft.engine_android_app.trim() || null,
+      ...(includeMobileAppium ? {
+        max_android_workers: Number.parseInt(draft.engine_max_android_workers, 10) || 2,
+        mobile_engine_url: draft.engine_mobile_engine_url.trim() || null,
+        mobile_cloud_provider: draft.engine_mobile_cloud_provider,
+        mobile_remote_url: draft.engine_mobile_remote_url.trim() || null,
+        mobile_username: draft.engine_mobile_username.trim() || null,
+        mobile_access_key: isMaskedSecretValue(draft.engine_mobile_access_key) ? undefined : draft.engine_mobile_access_key.trim() || null,
+        device_name: draft.engine_mobile_device_name.trim() || null,
+        platform_version: draft.engine_mobile_platform_version.trim() || null,
+        android_app: draft.engine_android_app.trim() || null
+      } : {}),
       promote_healed_patches: "review"
     };
   }
@@ -803,8 +808,10 @@ function buildIntegrationConfig(draft: IntegrationDraft, definitions: Integratio
       remote_url: draft.cloud_run_remote_url.trim() || draft.base_url.trim() || null,
       browser: draft.cloud_run_browser.trim() || "Chrome",
       os: draft.cloud_run_os.trim() || "Windows",
-      device_name: draft.cloud_run_device_name.trim() || null,
-      platform_version: draft.cloud_run_platform_version.trim() || null,
+      ...(includeMobileAppium ? {
+        device_name: draft.cloud_run_device_name.trim() || null,
+        platform_version: draft.cloud_run_platform_version.trim() || null
+      } : {}),
       build_name: draft.cloud_run_build_name.trim() || null,
       session_name: draft.cloud_run_session_name.trim() || null,
       provider_options: {}
@@ -831,7 +838,7 @@ function buildIntegrationConfig(draft: IntegrationDraft, definitions: Integratio
   return {};
 }
 
-function getIntegrationSummary(integration: Integration, definitions: IntegrationTypeDefinition[]) {
+function getIntegrationSummary(integration: Integration, definitions: IntegrationTypeDefinition[], includeMobileAppium = false) {
   const config: Record<string, unknown> = integration.config || {};
   const emailDefaults = getIntegrationTypeDefinition("email", definitions)?.defaults || {};
 
@@ -889,7 +896,7 @@ function getIntegrationSummary(integration: Integration, definitions: Integratio
 
     return {
       primary: integration.base_url || "Engine host not set",
-      secondary: `${typeof config.project_id === "string" && config.project_id.trim() ? "project-specific" : "all projects"} · queue pull every ${pollIntervalMinutes} min · caps API ${apiWorkers}/Web ${webWorkers}/Android ${androidWorkers} · ${String(activeWebEngine).toUpperCase()} web · video ${String(config.video_mode || "off")}${qairaApiBaseUrl ? ` · QAira API ${qairaApiBaseUrl}` : ""}`
+      secondary: `${typeof config.project_id === "string" && config.project_id.trim() ? "project-specific" : "all projects"} · queue pull every ${pollIntervalMinutes} min · caps API ${apiWorkers}/Web ${webWorkers}${includeMobileAppium ? `/Android ${androidWorkers}` : ""} · ${String(activeWebEngine).toUpperCase()} web · video ${String(config.video_mode || "off")}${qairaApiBaseUrl ? ` · QAira API ${qairaApiBaseUrl}` : ""}`
     };
   }
 
@@ -901,7 +908,7 @@ function getIntegrationSummary(integration: Integration, definitions: Integratio
 
     return {
       primary: integration.base_url || (typeof config.remote_url === "string" ? config.remote_url : "Remote hub not set"),
-      secondary: `${provider} · ${deviceName ? `${deviceName} · ` : ""}${browser} on ${os}`
+      secondary: `${provider} · ${includeMobileAppium && deviceName ? `${deviceName} · ` : ""}${browser} on ${os}`
     };
   }
 
@@ -920,13 +927,19 @@ function getIntegrationSummary(integration: Integration, definitions: Integratio
 
 function IntegrationReadOnlyDetails({
   integration,
-  definitions
+  definitions,
+  includeMobileAppium
 }: {
   integration: Integration;
   definitions: IntegrationTypeDefinition[];
+  includeMobileAppium: boolean;
 }) {
-  const summary = getIntegrationSummary(integration, definitions);
-  const configEntries = Object.entries(integration.config || {}).filter(([, value]) => value !== null && value !== undefined && value !== "");
+  const summary = getIntegrationSummary(integration, definitions, includeMobileAppium);
+  const mobileConfigKeys = new Set(['android_app', 'device_name', 'platform_version', 'max_android_workers']);
+  const configEntries = Object.entries(integration.config || {}).filter(([key, value]) =>
+    value !== null && value !== undefined && value !== ""
+    && (includeMobileAppium || (!key.startsWith('mobile_') && !mobileConfigKeys.has(key)))
+  );
 
   return (
     <div className="detail-stack">
@@ -968,6 +981,9 @@ function IntegrationReadOnlyDetails({
 export function IntegrationsPage({ embedded = false }: { embedded?: boolean } = {}) {
   const queryClient = useQueryClient();
   const { session } = useAuth();
+  const featureFlagsQuery = useFeatureFlags(Boolean(session));
+  const canUseMobileAppium = hasPermission(session, "mobile.manage")
+    && areFeatureFlagsEnabled(featureFlagsQuery.data, ["qaira.mobile.appium"]);
   const { confirmDelete, confirmationDialog } = useDeleteConfirmation();
   const domainMetadataQuery = useDomainMetadata();
   const integrationTypeDefinitions = useMemo(
@@ -1023,7 +1039,7 @@ export function IntegrationsPage({ embedded = false }: { embedded?: boolean } = 
     }
 
     return integrations.filter((integration) => {
-      const summary = getIntegrationSummary(integration, integrationTypeDefinitions);
+      const summary = getIntegrationSummary(integration, integrationTypeDefinitions, canUseMobileAppium);
 
       return [
         integration.id,
@@ -1044,7 +1060,7 @@ export function IntegrationsPage({ embedded = false }: { embedded?: boolean } = 
         .toLowerCase()
         .includes(normalizedSearch);
     });
-  }, [integrationSearch, integrationTypeDefinitions, integrations]);
+  }, [canUseMobileAppium, integrationSearch, integrationTypeDefinitions, integrations]);
   const integrationTypeSections = useMemo(
     () =>
       integrationTypeOptions.map((definition) => {
@@ -1085,7 +1101,7 @@ export function IntegrationsPage({ embedded = false }: { embedded?: boolean } = 
       minWidth: 180,
       sortValue: (integration) => integration.name,
       render: (integration) => {
-        const summary = getIntegrationSummary(integration, integrationTypeDefinitions);
+        const summary = getIntegrationSummary(integration, integrationTypeDefinitions, canUseMobileAppium);
 
         return (
           <div className="data-table-multiline">
@@ -1116,9 +1132,9 @@ export function IntegrationsPage({ embedded = false }: { embedded?: boolean } = 
       label: "Details",
       width: 260,
       minWidth: 160,
-      render: (integration) => getIntegrationSummary(integration, integrationTypeDefinitions).secondary
+      render: (integration) => getIntegrationSummary(integration, integrationTypeDefinitions, canUseMobileAppium).secondary
     }
-  ], [integrationTypeDefinitions]);
+  ], [canUseMobileAppium, integrationTypeDefinitions]);
   const selectedIntegration = useMemo(
     () => integrations.find((item) => item.id === selectedIntegrationId) || null,
     [integrations, selectedIntegrationId]
@@ -1275,7 +1291,7 @@ export function IntegrationsPage({ embedded = false }: { embedded?: boolean } = 
         model: draft.model.trim() || undefined,
         project_key: draft.project_key.trim() || undefined,
         username: resolvedUsername.trim() || undefined,
-        config: buildIntegrationConfig(draft, integrationTypeDefinitions),
+        config: buildIntegrationConfig(draft, integrationTypeDefinitions, canUseMobileAppium),
         is_active: draft.is_active
       };
 
@@ -1397,7 +1413,7 @@ export function IntegrationsPage({ embedded = false }: { embedded?: boolean } = 
         type: draft.type,
         base_url: draft.base_url.trim() || undefined,
         api_key: draft.api_key.trim() && !isMaskedSecretValue(draft.api_key) ? draft.api_key.trim() : undefined,
-        config: buildIntegrationConfig(draft, integrationTypeDefinitions)
+        config: buildIntegrationConfig(draft, integrationTypeDefinitions, canUseMobileAppium)
       });
       if (result.type === "ops") {
         const summary = `${result.service} responded in ${result.latency_ms} ms from ${result.base_url}. Health ${result.health_url}. Events ${result.events_url}. Board ${result.board_url}.`;
@@ -1453,7 +1469,7 @@ export function IntegrationsPage({ embedded = false }: { embedded?: boolean } = 
   ) : null;
 
   const renderIntegrationTile = (integration: Integration) => {
-    const summary = getIntegrationSummary(integration, integrationTypeDefinitions);
+    const summary = getIntegrationSummary(integration, integrationTypeDefinitions, canUseMobileAppium);
 
     return (
       <button
@@ -1661,7 +1677,7 @@ export function IntegrationsPage({ embedded = false }: { embedded?: boolean } = 
               subtitle="Store the credentials and provider settings QAira needs to call external systems and power secure authentication flows."
             >
               {!isAdmin && selectedIntegration ? (
-                <IntegrationReadOnlyDetails definitions={integrationTypeDefinitions} integration={selectedIntegration} />
+                <IntegrationReadOnlyDetails definitions={integrationTypeDefinitions} includeMobileAppium={canUseMobileAppium} integration={selectedIntegration} />
               ) : isCreating || selectedIntegration ? (
                 <form className="form-grid" onSubmit={(event) => void handleSave(event)}>
                 <div className="record-grid">
@@ -1937,7 +1953,9 @@ export function IntegrationsPage({ embedded = false }: { embedded?: boolean } = 
 	                {isCloudRun ? (
 	                  <>
 	                    <div className="empty-state compact integration-helper">
-	                      Store cloud browser and device provider credentials independently from project records. These settings remain in Admin Space and can be reused across runs.
+	                      {canUseMobileAppium
+	                        ? "Store cloud browser and device provider credentials independently from project records."
+	                        : "Store cloud browser provider credentials independently from project records."} These settings remain in Admin Space and can be reused across runs.
 	                    </div>
 
 	                    <div className="record-grid">
@@ -2013,23 +2031,25 @@ export function IntegrationsPage({ embedded = false }: { embedded?: boolean } = 
 	                      </FormField>
 	                    </div>
 
-	                    <div className="record-grid">
-	                      <FormField label="Device name">
-	                        <input
-	                          placeholder="Pixel 8 or iPhone 15"
-	                          value={draft.cloud_run_device_name}
-	                          onChange={(event) => setDraft((current) => ({ ...current, cloud_run_device_name: event.target.value }))}
-	                        />
-	                      </FormField>
+	                    {canUseMobileAppium ? (
+	                      <div className="record-grid">
+	                        <FormField label="Device name">
+	                          <input
+	                            placeholder="Pixel 8 or iPhone 15"
+	                            value={draft.cloud_run_device_name}
+	                            onChange={(event) => setDraft((current) => ({ ...current, cloud_run_device_name: event.target.value }))}
+	                          />
+	                        </FormField>
 
-	                      <FormField label="Platform version">
-	                        <input
-	                          placeholder="14"
-	                          value={draft.cloud_run_platform_version}
-	                          onChange={(event) => setDraft((current) => ({ ...current, cloud_run_platform_version: event.target.value }))}
-	                        />
-	                      </FormField>
-	                    </div>
+	                        <FormField label="Platform version">
+	                          <input
+	                            placeholder="14"
+	                            value={draft.cloud_run_platform_version}
+	                            onChange={(event) => setDraft((current) => ({ ...current, cloud_run_platform_version: event.target.value }))}
+	                          />
+	                        </FormField>
+	                      </div>
+	                    ) : null}
 
 	                    <div className="record-grid">
 	                      <FormField label="Build name">
@@ -2110,7 +2130,9 @@ export function IntegrationsPage({ embedded = false }: { embedded?: boolean } = 
                       </FormField>
 
                       <div className="empty-state compact integration-helper">
-                        The standalone Test Engine uses this cadence when split API, Web, and Android workers pull queued automation jobs from QAira. Set the engine container's QAIRA_API_BASE_URL to the QAira API URL above, or to the public QAira URL when /api proxying is available.
+                        {canUseMobileAppium
+                          ? "The standalone Test Engine uses this cadence when split API, Web, and Android workers pull queued automation jobs from QAira."
+                          : "The standalone Test Engine uses this cadence when API and Web workers pull queued automation jobs from QAira."} Set the engine container's QAIRA_API_BASE_URL to the QAira API URL above, or to the public QAira URL when /api proxying is available.
                       </div>
                     </div>
 
@@ -2131,14 +2153,16 @@ export function IntegrationsPage({ embedded = false }: { embedded?: boolean } = 
                           onChange={(event) => setDraft((current) => ({ ...current, engine_max_web_workers: event.target.value }))}
                         />
                       </FormField>
-                      <FormField label="Max Android Workers">
-                        <input
-                          inputMode="numeric"
-                          placeholder="2"
-                          value={draft.engine_max_android_workers}
-                          onChange={(event) => setDraft((current) => ({ ...current, engine_max_android_workers: event.target.value }))}
-                        />
-                      </FormField>
+                      {canUseMobileAppium ? (
+                        <FormField label="Max Android Workers">
+                          <input
+                            inputMode="numeric"
+                            placeholder="2"
+                            value={draft.engine_max_android_workers}
+                            onChange={(event) => setDraft((current) => ({ ...current, engine_max_android_workers: event.target.value }))}
+                          />
+                        </FormField>
+                      ) : null}
                     </div>
 
                     <div className="record-grid">
@@ -2302,6 +2326,7 @@ export function IntegrationsPage({ embedded = false }: { embedded?: boolean } = 
                       </div>
                     </div>
 
+                    {canUseMobileAppium ? (<>
                     <div className="record-grid">
                       <FormField label="Mobile Engine URL">
                         <input
@@ -2341,7 +2366,6 @@ export function IntegrationsPage({ embedded = false }: { embedded?: boolean } = 
                         />
                       </FormField>
                     </div>
-
                     <div className="record-grid">
                       <FormField label="Device name">
                         <input
@@ -2358,6 +2382,7 @@ export function IntegrationsPage({ embedded = false }: { embedded?: boolean } = 
                         />
                       </FormField>
                     </div>
+                    </>) : null}
 
                     <div className="record-grid">
                       <label className="checkbox-field">

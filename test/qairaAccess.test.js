@@ -7,9 +7,11 @@ import {
   DEFAULT_ROLES,
   FEATURE_GROUPS,
   PERMISSION_GROUPS,
+  featureAvailabilityForPermission,
   isAdministrativePermission,
   normalizedPermissionCodes,
   permissionForRequest,
+  permissionPolicyCatalog,
   roleById
 } from '../src/qairaAccess.js';
 
@@ -124,6 +126,13 @@ describe('request authorization policy', () => {
     assert.equal(permissionForRequest('/execution-schedules/S-1/run', 'POST'), 'schedule.run');
     assert.equal(permissionForRequest('/test-cases/CASE-1/automation/build', 'POST'), 'automation.build');
     assert.equal(permissionForRequest('/projects/10000/knowledge/documents', 'POST'), 'knowledge.manage');
+    assert.equal(permissionForRequest('/requirements/REQ-1/design-test-cases-preview', 'POST'), 'requirement.ai');
+    assert.equal(permissionForRequest('/requirements/REQ-1/design-test-cases-accept', 'POST'), 'testcase.create');
+    assert.equal(permissionForRequest('/test-cases/ai-authoring-preview', 'POST'), 'testcase.ai');
+    assert.equal(permissionForRequest('/test-cases/automation/learning-cache/export.csv', 'GET'), 'automation.repository.export');
+    assert.equal(permissionForRequest('/test-cases/automation/learning-cache/import', 'POST'), 'automation.repository.import');
+    assert.equal(permissionForRequest('/executions/RUN-1/cases/CASE-1/steps/STEP-1/run', 'POST'), 'run.execute');
+    assert.equal(permissionForRequest('/workspace-transactions/TXN-1/artifacts/A-1/download', 'GET'), 'transaction.artifact.download');
   });
 
   test('protects explainable AI insights and previews with dedicated permissions', () => {
@@ -156,6 +165,16 @@ describe('request authorization policy', () => {
     assert.equal(isAdministrativePermission('role.manage'), true);
     assert.equal(isAdministrativePermission('requirement.update'), false);
     assert.equal(isAdministrativePermission('workspace.view'), false);
+  });
+
+  test('publishes a complete CRUD route catalog', () => {
+    const policies = permissionPolicyCatalog();
+    const byRoute = new Map(policies.map((policy) => [policy.route, policy.methods]));
+    assert.equal(byRoute.get('/requirements')?.GET, 'requirement.view');
+    assert.equal(byRoute.get('/requirements')?.POST, 'requirement.create');
+    assert.equal(byRoute.get('/requirements')?.PUT, 'requirement.update');
+    assert.equal(byRoute.get('/requirements')?.DELETE, 'requirement.delete');
+    assert.equal(byRoute.get('/feedback')?.DELETE, 'feedback.manage');
   });
 });
 
@@ -190,6 +209,31 @@ describe('feature flag defaults', () => {
       'qaira.automation.step_code',
       'qaira.ai.execution_analysis',
       'qaira.ai.quality_insights'
+    ];
+    assert.ok(expected.every((key) => DEFAULT_FEATURE_FLAGS[key] === true));
+  });
+
+  test('maps every feature permission to a registered capability', () => {
+    const featurePermissions = new Set(FEATURE_GROUPS.flatMap((group) =>
+      group.features.flatMap((feature) => feature.permissions)
+    ));
+    assert.deepEqual([...featurePermissions].filter((code) => !ALL_PERMISSION_CODES.includes(code)), []);
+    assert.deepEqual(ALL_PERMISSION_CODES.filter((code) => code !== 'workspace.view' && !featurePermissions.has(code)), []);
+    assert.deepEqual(
+      featureAvailabilityForPermission('feedback.manage').map((feature) => feature.key),
+      ['qaira.manual.bugs', 'qaira.ai.bug_triage']
+    );
+  });
+
+  test('separates previously coupled workspace capabilities', () => {
+    const expected = [
+      'qaira.manual.bugs',
+      'qaira.manual.environments',
+      'qaira.manual.test_data',
+      'qaira.analytics.dashboards',
+      'qaira.ai.prompt_templates',
+      'qaira.ops.projects',
+      'qaira.ops.settings'
     ];
     assert.ok(expected.every((key) => DEFAULT_FEATURE_FLAGS[key] === true));
   });

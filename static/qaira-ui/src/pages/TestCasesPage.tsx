@@ -1236,6 +1236,9 @@ export function TestCasesPage() {
 	  const canViewAutomationCode = hasPermission(session, "automation.code.view")
 	    && canUseAutomationWorkspace
 	    && areFeatureFlagsEnabled(featureFlagsQuery.data, ["qaira.automation.step_code"]);
+	  const canUseMobileAppium = hasPermission(session, "mobile.manage")
+	    && canUseAutomationWorkspace
+	    && areFeatureFlagsEnabled(featureFlagsQuery.data, ["qaira.mobile.appium"]);
 	  const { getPrompt } = useAiPromptRegistry(Boolean(session));
   const { confirmAction, confirmDelete, confirmationDialog } = useDeleteConfirmation();
   const domainMetadataQuery = useDomainMetadata();
@@ -1380,7 +1383,7 @@ export function TestCasesPage() {
     queryFn: api.projects.list
   });
   const usersQuery = useQuery({
-    queryKey: ["users"],
+    queryKey: ["users", projectId],
     queryFn: api.users.list,
     enabled: Boolean(session)
   });
@@ -1395,9 +1398,9 @@ export function TestCasesPage() {
     enabled: Boolean(projectId)
   });
   const allAppTypesQuery = useQuery({
-    queryKey: ["app-types", "all"],
-    queryFn: () => api.appTypes.list(),
-    enabled: Boolean(session)
+    queryKey: ["app-types", "all", projectId],
+    queryFn: () => api.appTypes.list({ project_id: projectId }),
+    enabled: Boolean(session && projectId)
   });
   const requirementsQuery = useQuery({
     queryKey: ["requirements", projectId],
@@ -1405,51 +1408,58 @@ export function TestCasesPage() {
     enabled: Boolean(projectId)
   });
   const suitesQuery = useQuery({
-    queryKey: ["test-case-suites", appTypeId],
+    queryKey: ["test-case-suites", appTypeId, projectId],
     queryFn: () => api.testSuites.list({ app_type_id: appTypeId }),
     enabled: Boolean(appTypeId)
   });
   const requestedCaseRouteId = searchParams.get("case") || "";
   const testCasesQuery = useQuery({
-    queryKey: ["global-test-cases", appTypeId],
+    queryKey: ["global-test-cases", appTypeId, projectId],
     queryFn: () => api.testCases.list({ app_type_id: appTypeId, page_size: 25, projection: "detail" }),
     enabled: Boolean(appTypeId)
   });
   const testCaseModulesQuery = useQuery({
-    queryKey: ["test-case-modules", appTypeId],
+    queryKey: ["test-case-modules", appTypeId, projectId],
     queryFn: () => api.testCaseModules.list({ app_type_id: appTypeId }),
     enabled: Boolean(appTypeId)
   });
   const deepLinkTestCasesQuery = useQuery({
-    queryKey: ["global-test-cases", "deep-link", requestedCaseRouteId],
+    queryKey: ["global-test-cases", "deep-link", requestedCaseRouteId, projectId],
     queryFn: () => api.testCases.list({ projection: "detail" }),
     enabled: Boolean(session && requestedCaseRouteId)
   });
   const generationJobsQuery = useQuery({
-    queryKey: ["ai-test-case-generation-jobs", appTypeId],
+    queryKey: ["ai-test-case-generation-jobs", appTypeId, projectId],
     queryFn: () => api.testCases.listGenerationJobs({ app_type_id: appTypeId }),
     enabled: Boolean(appTypeId),
-    refetchInterval: appTypeId ? 5000 : false
+    refetchInterval: (query) => (query.state.data as AiTestCaseGenerationJob[] | undefined)
+      ?.some((job) => ["queued", "running"].includes(String(job.status).toLowerCase())) ? 5_000 : false
   });
   const executionsQuery = useQuery({
     queryKey: ["executions", projectId],
     queryFn: () => api.executions.list(projectId ? { project_id: projectId } : undefined),
     enabled: Boolean(projectId),
-    refetchInterval: TEST_CASE_RUN_POLL_INTERVAL_MS
+    refetchInterval: (query) => (query.state.data as Execution[] | undefined)
+      ?.some((execution) => ["queued", "running"].includes(String(execution.status).toLowerCase()))
+      ? TEST_CASE_RUN_POLL_INTERVAL_MS
+      : false
   });
   const sharedStepGroupsQuery = useQuery({
-    queryKey: ["shared-step-groups", appTypeId],
+    queryKey: ["shared-step-groups", appTypeId, projectId],
     queryFn: () => api.sharedStepGroups.list({ app_type_id: appTypeId }),
     enabled: Boolean(appTypeId)
   });
   const executionResultsQuery = useQuery({
-    queryKey: ["global-test-case-results", appTypeId],
+    queryKey: ["global-test-case-results", appTypeId, projectId],
     queryFn: () => api.executionResults.list({ app_type_id: appTypeId }),
     enabled: Boolean(appTypeId),
-    refetchInterval: TEST_CASE_RUN_POLL_INTERVAL_MS
+    refetchInterval: (query) => (query.state.data as ExecutionResult[] | undefined)
+      ?.some((result) => String(result.status).toLowerCase() === "running")
+      ? TEST_CASE_RUN_POLL_INTERVAL_MS
+      : false
   });
   const integrationsQuery = useQuery({
-    queryKey: ["integrations", "llm"],
+    queryKey: ["integrations", "llm", projectId],
     queryFn: () => api.integrations.list({ type: "llm", is_active: true })
   });
   const testEngineIntegrationsQuery = useQuery({
@@ -1467,7 +1477,7 @@ export function TestCasesPage() {
     enabled: Boolean(canUseAutomationWorkspace && (projectId || appTypeId) && session)
   });
   const stepsQuery = useQuery({
-    queryKey: ["test-case-steps", selectedTestCaseId],
+    queryKey: ["test-case-steps", selectedTestCaseId, projectId],
     queryFn: () => api.testSteps.list({ test_case_id: selectedTestCaseId }),
     enabled: Boolean(selectedTestCaseId)
   });
@@ -5835,7 +5845,7 @@ export function TestCasesPage() {
 
     return "Mixed sources";
   }, [importBatches]);
-  const isLibraryLoading = testCasesQuery.isLoading || executionResultsQuery.isLoading;
+  const isLibraryLoading = testCasesQuery.isLoading;
 
   const selectedRequirement = requirements.find((item) => item.id === caseDraft.requirement_id) || null;
   const caseDraftLabels = useMemo(() => parseReferenceList(caseDraft.labelsText), [caseDraft.labelsText]);
@@ -8714,6 +8724,7 @@ export function TestCasesPage() {
 	                                disabled={!canUseRecorder || !selectedTestCase || !testEngineIntegration}
                                 hasSession={Boolean(recorderSession)}
                                 isStarting={startRecorder.isPending}
+                                mobileAppiumEnabled={canUseMobileAppium}
                                 mobileRemoteEnabled={mobileRemoteRecorderEnabled}
                                 onStart={(options) => void handleStartRecorder(options)}
                                 primaryAction={(
@@ -8918,6 +8929,7 @@ export function TestCasesPage() {
 	                disabled={!canUseRecorder || !selectedTestCase || !testEngineIntegration}
                 hasSession={Boolean(recorderSession)}
                 isStarting={startRecorder.isPending}
+                mobileAppiumEnabled={canUseMobileAppium}
                 mobileRemoteEnabled={mobileRemoteRecorderEnabled}
                 onStart={(options) => void handleStartRecorder(options, inspectingStep.id)}
                 localLabel="Inspect locally"

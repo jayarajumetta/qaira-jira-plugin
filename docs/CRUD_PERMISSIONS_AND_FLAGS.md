@@ -95,6 +95,7 @@ Default role behavior is fail-safe:
 - Jira project/global administrators receive the system Jira Administrator role.
 - Explicit project membership selects QA Lead, QA Member, Viewer, or a custom role.
 - A non-admin without an explicit Qaira project membership receives Viewer access, not write access.
+- Jira administrator memberships are system-managed visibility records: live Jira permission remains authoritative, Jira permission search discovers active global administrators for bounded synchronization across visible projects, and revoked global administrators return to their saved fallback role only after a complete discovery result.
 - System roles cannot be deleted; custom roles in use cannot be deleted until memberships are reassigned.
 
 The frontend hides or disables actions for usability, but backend enforcement is the security boundary. Project-property calls that require app context still occur only after the active user's project, role, Jira permission, and flag checks.
@@ -105,6 +106,8 @@ The frontend hides or disables actions for usability, but backend enforcement is
 
 Backend route families and frontend navigation/actions use the same registered keys. Unknown frontend feature keys are unavailable by default. A flag is a rollout control, not an authorization grant.
 
+Mobile/Appium is field-scoped rather than page-scoped. `mobile.view` controls mobile metadata visibility and `mobile.manage` controls mobile configuration, recorder, step, application-type, and integration payloads. Disabling `qaira.mobile.appium` leaves web/API environments and configurations available while removing mobile-specific controls; the resolver independently rejects mobile mutation payloads.
+
 The current registered keys are grouped as follows:
 
 ```text
@@ -113,8 +116,14 @@ Manual
   qaira.manual.test_cases
   qaira.manual.suites
   qaira.manual.runs
+  qaira.manual.bugs
   qaira.manual.plans
   qaira.manual.quality_gates
+  qaira.manual.environments
+  qaira.manual.test_data
+
+Analytics
+  qaira.analytics.dashboards
 
 Automation
   qaira.automation.workspace
@@ -136,9 +145,12 @@ AI
   qaira.ai.quality_insights
   qaira.ai.agentic_workflows
   qaira.ai.knowledge
+  qaira.ai.prompt_templates
 
 Administration and operations
+  qaira.ops.projects
   qaira.ops.admin
+  qaira.ops.settings
   qaira.api.integrations
   qaira.ops.notifications
   qaira.ops.telemetry
@@ -148,7 +160,7 @@ Administration and operations
 
 Requirement design, test authoring, step rephrasing, smart planning, execution analysis, automation drafting, locator recommendations, prompt templates, knowledge context, agentic-workflow records, and bounded Rovo actions are represented in the API. Durable AI-assisted artifact changes use preview/accept or another explicit user action.
 
-The 27th registered flag, `qaira.ai.quality_insights`, covers explainable portfolio insights and quality-gate assessment. `quality_insight.view` protects the portfolio read and `quality_gate.ai` protects gate assessment. The gate route also remains subject to `qaira.manual.quality_gates`; feature requirements are cumulative. The artifact impact and clustering routes likewise retain their manual domain flag plus `requirement.ai`, `testcase.ai`, or `run.ai` and the associated AI feature.
+`qaira.ai.quality_insights` covers explainable portfolio insights and quality-gate assessment. `quality_insight.view` protects the portfolio read and `quality_gate.ai` protects gate assessment. The gate route also remains subject to `qaira.manual.quality_gates`; feature requirements are cumulative. The artifact impact and clustering routes likewise retain their manual domain flag plus `requirement.ai`, `testcase.ai`, or `run.ai` and the associated AI feature.
 
 | Method and route | Deterministic preview |
 |---|---|

@@ -46,6 +46,15 @@ const formatPermissionLabel = (code: string) =>
     .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
     .join(" / ");
 
+const formatPermissionAvailability = (permission: Permission) => {
+  const enabled = (permission.features || []).filter((feature) => feature.enabled !== false);
+  const disabled = (permission.features || []).filter((feature) => feature.enabled === false);
+  return [
+    enabled.length ? `Available in: ${enabled.map((feature) => feature.label).join(", ")}` : "",
+    disabled.length ? `Paused in: ${disabled.map((feature) => feature.label).join(", ")}` : ""
+  ].filter(Boolean).join(" · ");
+};
+
 export function PeoplePage({
   forcedView,
   embedded = false
@@ -57,7 +66,17 @@ export function PeoplePage({
   const [searchParams, setSearchParams] = useSearchParams();
   const { session } = useAuth();
   const { confirmDelete, confirmationDialog } = useDeleteConfirmation();
-  const { users, roles } = useWorkspaceData();
+  const { users, roles } = useWorkspaceData({
+    projects: false,
+    projectMembers: false,
+    appTypes: false,
+    requirements: false,
+    issues: false,
+    testSuites: false,
+    testCases: false,
+    executions: false,
+    executionResults: false
+  });
   const permissions = useQuery({
     queryKey: ["permissions"],
     queryFn: api.roles.permissions,
@@ -582,6 +601,11 @@ export function PeoplePage({
                           <strong className="permission-option-title">{formatPermissionLabel(permission.code)}</strong>
                           <code className="permission-option-code">{permission.code}</code>
                           {permission.description ? <small className="permission-option-description">{permission.description}</small> : null}
+                          {permission.features?.length ? (
+                            <small className="permission-option-availability">
+                              {formatPermissionAvailability(permission)}
+                            </small>
+                          ) : null}
                         </span>
                       </label>
                     ))}

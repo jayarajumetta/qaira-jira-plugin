@@ -35,9 +35,9 @@ export const TEST_AUTHORING_SECTION_ITEMS: WorkspaceSectionItem[] = [
 ];
 
 export const TEST_ENVIRONMENT_SECTION_ITEMS: WorkspaceSectionItem[] = [
-  { to: "/test-environments", label: "Environments", shortLabel: "Env", icon: "environments", featureKeys: ["qaira.mobile.appium"] },
-  { to: "/test-data", label: "Test Data", shortLabel: "Data", icon: "data", featureKeys: ["qaira.manual.test_cases"] },
-  { to: "/test-configurations", label: "Configurations", shortLabel: "Config", icon: "configurations", featureKeys: ["qaira.mobile.appium"] }
+  { to: "/test-environments", label: "Environments", shortLabel: "Env", icon: "environments", featureKeys: ["qaira.manual.environments"] },
+  { to: "/test-data", label: "Test Data", shortLabel: "Data", icon: "data", featureKeys: ["qaira.manual.test_data"] },
+  { to: "/test-configurations", label: "Configurations", shortLabel: "Config", icon: "configurations", featureKeys: ["qaira.manual.environments"] }
 ];
 
 export const AUTOMATION_SECTION_ITEMS: WorkspaceSectionItem[] = [

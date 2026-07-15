@@ -1,5 +1,5 @@
-import { FormEvent, useEffect, useMemo, useState } from "react";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { FormEvent, useDeferredValue, useEffect, useMemo, useState } from "react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useSearchParams } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
 import { BugIcon, ExportIcon, SparkIcon } from "../components/AppIcons";
@@ -12,6 +12,7 @@ import { DialogCloseButton } from "../components/DialogCloseButton";
 import { DisplayIdBadge } from "../components/DisplayIdBadge";
 import { FormField } from "../components/FormField";
 import { JiraAttachmentPanel } from "../components/JiraAttachmentPanel";
+import { LoadingState } from "../components/LoadingState";
 import { PageHeader } from "../components/PageHeader";
 import { Panel } from "../components/Panel";
 import { RichTextContent, RichTextEditor, richTextToPlainText } from "../components/RichTextEditor";
@@ -190,7 +191,6 @@ export function IssuesPage() {
   const canDeleteAttachments = hasPermission(session, "attachment.delete");
   const { confirmDelete, confirmationDialog } = useDeleteConfirmation();
   const domainMetadataQuery = useDomainMetadata();
-  const { issues, users, executions, testCases, requirements } = useWorkspaceData();
   const canUseAiBugTriage = hasPermission(session, "feedback.manage")
     && areFeatureFlagsEnabled(featureFlagsQuery.data, ["qaira.ai.bug_triage"]);
   const [searchParams, setSearchParams] = useSearchParams();
@@ -208,6 +208,7 @@ export function IssuesPage() {
   const [catalogViewMode, setCatalogViewMode] = useState<"tile" | "list">(() => readDefaultCatalogViewMode());
   const [selectedActionIssueIds, setSelectedActionIssueIds] = useState<string[]>([]);
   const [issueSearch, setIssueSearch] = useState("");
+  const deferredIssueSearch = useDeferredValue(issueSearch);
   const [isReportMenuOpen, setIsReportMenuOpen] = useState(false);
   const [isAiBugDraftOpen, setIsAiBugDraftOpen] = useState(false);
   const [aiIntent, setAiIntent] = useState("");
@@ -221,6 +222,27 @@ export function IssuesPage() {
   const [aiDraftPreview, setAiDraftPreview] = useState<AiBugDraftPreview | null>(null);
   const [aiDraftMessage, setAiDraftMessage] = useState("");
   const [isAiContextCollapsed, setIsAiContextCollapsed] = useState(false);
+  const shouldLoadBugContext = isCreating || Boolean(selectedIssueId) || isAiBugDraftOpen;
+  const { issues, users, executions, testCases, requirements } = useWorkspaceData({
+    roles: false,
+    projects: false,
+    projectMembers: false,
+    appTypes: false,
+    testSuites: false,
+    executionResults: false,
+    issuesProjection: "summary",
+    users: shouldLoadBugContext,
+    executions: shouldLoadBugContext,
+    testCases: shouldLoadBugContext,
+    requirements: shouldLoadBugContext,
+    testCasesProjection: "summary"
+  });
+  const selectedIssueQuery = useQuery({
+    queryKey: ["bug-detail", projectId, selectedIssueId],
+    queryFn: () => api.issues.get(selectedIssueId, { project_id: projectId }),
+    enabled: Boolean(projectId && selectedIssueId),
+    staleTime: 30_000
+  });
 
   const items = issues.data || [];
   const userItems = users.data || [];
@@ -245,7 +267,7 @@ export function IssuesPage() {
     [executionItems]
   );
   const filteredItems = useMemo(() => {
-    const normalizedSearch = issueSearch.trim().toLowerCase();
+    const normalizedSearch = deferredIssueSearch.trim().toLowerCase();
 
     if (!normalizedSearch) {
       return items;
@@ -281,14 +303,12 @@ export function IssuesPage() {
         .toLowerCase()
         .includes(normalizedSearch)
     );
-  }, [assigneeLabelById, issueSearch, items, runLabelById]);
+  }, [assigneeLabelById, deferredIssueSearch, items, runLabelById]);
   const visibleIssueIds = useMemo(() => filteredItems.map((item) => item.id), [filteredItems]);
   const areAllFilteredIssuesSelected = visibleIssueIds.length > 0 && visibleIssueIds.every((id) => selectedActionIssueIds.includes(id));
   const openIssueCount = items.filter((item) => (item.status || defaultIssueStatus) === defaultIssueStatus).length;
-  const selectedItem = useMemo(
-    () => items.find((item) => item.id === selectedIssueId) || null,
-    [items, selectedIssueId]
-  );
+  const selectedItem = selectedIssueQuery.data
+    || (!selectedIssueQuery.isLoading ? items.find((item) => item.id === selectedIssueId) || null : null);
   const syncIssueSearchParams = (issueId?: string | null) => {
     const currentIssueId = searchParams.get("issue") || "";
     const targetIssueId = issueId || "";
@@ -526,7 +546,10 @@ export function IssuesPage() {
   }, [defaultIssueStatus, emptyDraft, isCreating, selectedIssueId, selectedItem]);
 
   const refresh = async () => {
-    await queryClient.invalidateQueries({ queryKey: ["issues"] });
+    await Promise.all([
+      queryClient.invalidateQueries({ queryKey: ["issues"] }),
+      queryClient.invalidateQueries({ queryKey: ["bug-detail", projectId] })
+    ]);
   };
 
   const previewAiBugDraft = useMutation({ mutationFn: api.issues.previewAiDraft });
@@ -1017,6 +1040,7 @@ export function IssuesPage() {
             title={isCreating ? "Report bug" : selectedItem ? "Bug details" : "Bug editor"}
             subtitle="Capture the bug in a Jira-ready structure with run context, reproduction evidence, ownership, and root cause."
           >
+            {!isCreating && selectedIssueId && selectedIssueQuery.isLoading ? <LoadingState label="Loading bug details" /> : null}
             {(isCreating || selectedItem) ? (
               <form className="issue-report-form" onSubmit={(event) => void handleSave(event)}>
                 <section className="issue-form-section">

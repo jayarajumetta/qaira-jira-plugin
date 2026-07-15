@@ -652,6 +652,8 @@ export const api = {
   issues: {
     list: (query?: { project_id?: string; user_id?: string; status?: string; q?: string; page_size?: number; cursor?: string; projection?: "summary" | "detail" }) =>
       request<Issue[]>(`/feedback${toQueryString(query)}`),
+    get: (id: string, query?: { project_id?: string }) =>
+      request<Issue>(`/feedback/${id}${toQueryString(query)}`),
     create: (input: IssuePayload) =>
       request<{ id: string }>("/feedback", { method: "POST", body: JSON.stringify(input) }),
     previewAiDraft: (input: {

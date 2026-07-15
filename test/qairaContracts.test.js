@@ -22,7 +22,7 @@ test('frontend fail-closed feature keys are all registered by the backend', () =
   const referenced = new Set();
   for (const file of sourceFiles(frontendRoot)) {
     const source = fs.readFileSync(file, 'utf8');
-    for (const match of source.matchAll(/qaira\.(?:manual|automation|ai|api|ops|mobile)\.[a-z0-9_.-]+/g)) {
+    for (const match of source.matchAll(/qaira\.(?:manual|analytics|automation|ai|api|ops|mobile)\.[a-z0-9_.-]+/g)) {
       referenced.add(match[0]);
     }
   }

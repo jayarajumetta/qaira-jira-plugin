@@ -15,6 +15,10 @@ const tileBrowserSource = read('../static/qaira-ui/src/components/TileBrowserPan
 const masterDetailSource = read('../static/qaira-ui/src/components/WorkspaceMasterDetail.tsx');
 const promptContextSource = read('../static/qaira-ui/src/components/AiPromptContextPanel.tsx');
 const loadingStateSource = read('../static/qaira-ui/src/components/LoadingState.tsx');
+const testEnvironmentSource = read('../static/qaira-ui/src/pages/TestEnvironmentPage.tsx');
+const recorderSource = read('../static/qaira-ui/src/components/RecorderStartControls.tsx');
+const stepAutomationSource = read('../static/qaira-ui/src/components/StepAutomationEditor.tsx');
+const integrationsSource = read('../static/qaira-ui/src/pages/IntegrationsPage.tsx');
 const stylesSource = read('../static/qaira-ui/src/styles.css');
 
 test('AI requirement creation reuses the full test-design prompt context and remains review gated', () => {
@@ -76,6 +80,19 @@ test('feature flags are externally provisioned and read-only inside the app', ()
   assert.doesNotMatch(frontendApiSource, /request<FeatureFlagSnapshot>\("\/feature-flags",[\s\S]*method: "PUT"/);
   assert.doesNotMatch(apiSource, /updateFeatureFlags/);
   assert.match(apiSource, /name: 'External feature flag setup'/);
+});
+
+test('mobile Appium is a supplementary permissioned capability rather than an environment page gate', () => {
+  assert.match(accessSource, /mobile\.view/);
+  assert.match(accessSource, /mobile\.manage/);
+  assert.match(apiSource, /usesMobileAppiumCapability/);
+  assert.match(apiSource, /requiredPermission: 'mobile\.manage'/);
+  assert.match(workspaceSectionsSource, /test-environments[\s\S]*qaira\.manual\.environments/);
+  assert.match(workspaceSectionsSource, /test-configurations[\s\S]*qaira\.manual\.environments/);
+  assert.match(testEnvironmentSource, /hasPermission\(session, "mobile\.view"\)/);
+  assert.match(recorderSource, /mobileAppiumEnabled/);
+  assert.match(stepAutomationSource, /hasPermission\(session, "mobile\.manage"\)/);
+  assert.match(integrationsSource, /buildIntegrationConfig\(draft, integrationTypeDefinitions, canUseMobileAppium\)/);
 });
 
 test('the defect workspace is consistently labeled Bugs', () => {

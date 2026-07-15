@@ -1,4 +1,4 @@
-import { ChangeEvent, CSSProperties, Dispatch, FormEvent, Fragment, ReactNode, SetStateAction, useEffect, useMemo, useRef, useState } from "react";
+import { ChangeEvent, CSSProperties, Dispatch, FormEvent, Fragment, ReactNode, SetStateAction, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useSearchParams } from "react-router-dom";
@@ -346,6 +346,7 @@ export function RequirementsPage() {
   const [selectedIterationIds, setSelectedIterationIds] = useState<string[]>([]);
   const [draggingRequirementIds, setDraggingRequirementIds] = useState<string[]>([]);
   const [requirementSearchTerm, setRequirementSearchTerm] = useState("");
+  const deferredRequirementSearchTerm = useDeferredValue(requirementSearchTerm);
   const [requirementStatusFilter, setRequirementStatusFilter] = useState("all");
   const [requirementPriorityFilter, setRequirementPriorityFilter] = useState("all");
   const [requirementLabelFilter, setRequirementLabelFilter] = useState("all");
@@ -427,12 +428,12 @@ export function RequirementsPage() {
     enabled: Boolean(projectId && canViewRequirementIterations)
   });
   const testCasesQuery = useQuery({
-    queryKey: ["requirements-test-cases", appTypeId],
+    queryKey: ["requirements-test-cases", projectId, appTypeId],
     queryFn: () => api.testCases.list({ app_type_id: appTypeId, page_size: 25, projection: "detail" }),
     enabled: Boolean(appTypeId)
   });
   const executionResultsQuery = useQuery({
-    queryKey: ["requirements-execution-results", appTypeId],
+    queryKey: ["requirements-execution-results", projectId, appTypeId],
     queryFn: () => api.executionResults.list({ app_type_id: appTypeId }),
     enabled: Boolean(appTypeId)
   });
@@ -442,27 +443,27 @@ export function RequirementsPage() {
     enabled: Boolean(projectId)
   });
   const issuesQuery = useQuery({
-    queryKey: ["requirements-issues"],
-    queryFn: () => api.issues.list(),
-    enabled: Boolean(session && isDefectSearchLoaded)
+    queryKey: ["requirements-issues", projectId],
+    queryFn: () => api.issues.list({ project_id: projectId, page_size: 25, projection: "summary" }),
+    enabled: Boolean(session && projectId && isDefectSearchLoaded)
   });
   const sharedGroupsQuery = useQuery({
-    queryKey: ["requirements-shared-step-groups", appTypeId],
+    queryKey: ["requirements-shared-step-groups", projectId, appTypeId],
     queryFn: () => api.sharedStepGroups.list({ app_type_id: appTypeId }),
     enabled: Boolean(appTypeId)
   });
   const suitesQuery = useQuery({
-    queryKey: ["requirements-test-suites", appTypeId],
+    queryKey: ["requirements-test-suites", projectId, appTypeId],
     queryFn: () => api.testSuites.list({ app_type_id: appTypeId }),
     enabled: Boolean(appTypeId)
   });
   const integrationsQuery = useQuery({
-    queryKey: ["integrations", "llm"],
+    queryKey: ["integrations", projectId, "llm"],
     queryFn: () => api.integrations.list({ type: "llm", is_active: true }),
     enabled: Boolean(session)
   });
   const usersQuery = useQuery({
-    queryKey: ["users"],
+    queryKey: ["users", projectId],
     queryFn: api.users.list,
     enabled: Boolean(session)
   });
@@ -528,9 +529,7 @@ export function RequirementsPage() {
   );
   const isRequirementCatalogLoading =
     projectsQuery.isLoading ||
-    (Boolean(projectId) && requirementsQuery.isLoading) ||
-    (Boolean(appTypeId) && executionResultsQuery.isLoading) ||
-    (Boolean(projectId) && executionsQuery.isLoading);
+    (Boolean(projectId) && requirementsQuery.isLoading);
 
   const showSuccess = (text: string) => {
     setMessageTone("success");
@@ -923,7 +922,7 @@ export function RequirementsPage() {
   );
 
   const filteredRequirements = useMemo(() => {
-    const normalizedSearch = requirementSearchTerm.trim().toLowerCase();
+    const normalizedSearch = deferredRequirementSearchTerm.trim().toLowerCase();
 
     return requirements.filter((item) => {
       const linkedCaseCount = (linkedCaseIdsByRequirementId[item.id] || []).length;
@@ -985,7 +984,7 @@ export function RequirementsPage() {
 
       return true;
     });
-  }, [defaultRequirementStatus, linkedCaseIdsByRequirementId, requirementCoverageFilter, requirementFixVersionFilter, requirementIterationById, requirementLabelFilter, requirementPriorityFilter, requirementReleaseFilter, requirementSearchTerm, requirementSprintFilter, requirementStatusFilter, requirements]);
+  }, [defaultRequirementStatus, deferredRequirementSearchTerm, linkedCaseIdsByRequirementId, requirementCoverageFilter, requirementFixVersionFilter, requirementIterationById, requirementLabelFilter, requirementPriorityFilter, requirementReleaseFilter, requirementSprintFilter, requirementStatusFilter, requirements]);
 
   const iterationRequirementOptions = useMemo(() => {
     const normalizedSearch = iterationRequirementSearch.trim().toLowerCase();
@@ -1543,10 +1542,10 @@ export function RequirementsPage() {
     await Promise.all([
       queryClient.invalidateQueries({ queryKey: ["requirements", projectId] }),
       queryClient.invalidateQueries({ queryKey: ["requirement-iterations", projectId] }),
-      queryClient.invalidateQueries({ queryKey: ["requirements-test-cases", appTypeId] }),
-      queryClient.invalidateQueries({ queryKey: ["requirements-execution-results", appTypeId] }),
+      queryClient.invalidateQueries({ queryKey: ["requirements-test-cases", projectId, appTypeId] }),
+      queryClient.invalidateQueries({ queryKey: ["requirements-execution-results", projectId, appTypeId] }),
       queryClient.invalidateQueries({ queryKey: ["requirements-executions", projectId, appTypeId] }),
-      queryClient.invalidateQueries({ queryKey: ["requirements-issues"] }),
+      queryClient.invalidateQueries({ queryKey: ["requirements-issues", projectId] }),
       queryClient.invalidateQueries({ queryKey: ["test-cases"] }),
       queryClient.invalidateQueries({ queryKey: ["workspace-transactions"] }),
       queryClient.invalidateQueries({ queryKey: ["workspace-transaction-events"] })

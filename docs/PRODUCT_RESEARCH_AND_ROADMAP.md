@@ -112,8 +112,8 @@ Each candidate is scored from 0–10 using: user/release value 30%, competitor b
 ### Project roles and Jira authority
 
 - Qaira-specific roles remain app-scoped RBAC records in Jira project properties. They are not mirrored into Jira project roles because doing so would conflate Qaira capability grants with Jira permission schemes and would require Jira-administrative role-actor mutations.
-- Jira administrator access is resolved from current Jira permissions on every authorized request. `jira-admin` cannot be assigned through Qaira membership APIs.
-- New project creation assigns the creator QA lead and requires an explicit role for every selected Jira user. Existing memberships can be reassigned without changing Jira identity or product access.
+- Jira administrator access is resolved from current Jira permissions on every authorized request. A system-managed `jira-admin` membership makes that assignment visible but cannot be assigned or removed through Qaira membership APIs and never overrides the live check.
+- New project creation assigns a verified global Jira administrator the system-managed administrator membership; other creators receive QA lead. Every additional Jira user requires an explicit Qaira role.
 - Jira-administrative permissions are excluded from QA lead/custom roles, keeping the visible role model consistent with resolver enforcement.
 
 ### Quality dashboards and AI prompt workspaces

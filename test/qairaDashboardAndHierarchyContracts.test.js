@@ -17,6 +17,10 @@ const shellSource = read('../static/qaira-ui/src/components/AppShell.tsx');
 const themeSource = read('../static/qaira-ui/src/main.tsx');
 const stylesSource = read('../static/qaira-ui/src/styles.css');
 const darkThemeSource = read('../static/qaira-ui/src/dark-theme.css');
+const issuesSource = read('../static/qaira-ui/src/pages/IssuesPage.tsx');
+const executionsSource = read('../static/qaira-ui/src/pages/ExecutionsPage.tsx');
+const workspaceDataSource = read('../static/qaira-ui/src/hooks/useWorkspaceData.ts');
+const manifestSource = read('../manifest.yml');
 
 test('hierarchy health is shared, derived, and rendered for assigned and unassigned scope', () => {
   assert.match(requirementSource, /deriveIterationHealth/);
@@ -58,6 +62,31 @@ test('Jira owns user identity while Qaira roles remain explicitly permissioned',
   assert.match(projectSource, /memberRoleIds/);
   assert.match(projectSource, /DEFAULT_NEW_PROJECT_MEMBER_ROLE_ID/);
   assert.match(projectSource, /api\.projectMembers\.update/);
+});
+
+test('Jira administrators have live-verified, system-managed Qaira memberships', () => {
+  assert.match(apiSource, /\/rest\/api\/3\/user\/permission\/search\?permissions=/);
+  assert.match(apiSource, /reconcileCurrentAdministratorMembership/);
+  assert.match(apiSource, /assignment_source: 'jira-permission'/);
+  assert.match(apiSource, /fallback_role_id/);
+  assert.match(apiSource, /synchronizeJiraAdministratorMemberships/);
+  assert.match(apiSource, /accountIds/);
+  assert.match(apiSource, /jira_admin_scope: 'global'/);
+  assert.match(apiSource, /JIRA_ADMIN_MEMBERSHIP_MANAGED/);
+  assert.match(manifestSource, /queue: qaira-admin-membership-sync/);
+  assert.match(projectSource, /isJiraManagedAdministrator/);
+});
+
+test('catalog first paint is decoupled from secondary detail and polling queries', () => {
+  assert.match(requirementSource, /const isRequirementCatalogLoading =[\s\S]*requirementsQuery\.isLoading/);
+  assert.doesNotMatch(requirementSource.match(/const isRequirementCatalogLoading =[\s\S]*?;/)?.[0] || '', /executionResultsQuery|executionsQuery/);
+  assert.match(testCaseSource, /const isLibraryLoading = testCasesQuery\.isLoading/);
+  assert.match(projectSource, /const isProjectCatalogLoading = projects\.isPending/);
+  assert.match(issuesSource, /issuesProjection: "summary"/);
+  assert.match(issuesSource, /selectedIssueQuery = useQuery/);
+  assert.match(executionsSource, /enabled: Boolean\(projectId && isExecutionRunsView\(testRunsView\)\)/);
+  assert.match(workspaceDataSource, /options: WorkspaceDataOptions/);
+  assert.match(workspaceDataSource, /WORKSPACE_QUERY_STALE_TIME_MS/);
 });
 
 test('Jira theme, selected-only tabs, and collapsed submenu recovery remain wired', () => {

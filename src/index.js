@@ -1,6 +1,11 @@
 import { makeResolver } from '@forge/resolver';
 import qairaSchema from './qairaSchema.js';
-import { executeAgenticWorkflowRun, handleQairaApi, workspaceSummary } from './qairaApi.js';
+import {
+  executeAgenticWorkflowRun,
+  handleQairaApi,
+  synchronizeJiraAdministratorMemberships,
+  workspaceSummary
+} from './qairaApi.js';
 
 function resolveProjectKey(payload = {}, context = {}) {
   return payload.projectKey
@@ -73,6 +78,16 @@ export const handler = makeResolver(definitions);
 
 export async function agenticWorkflowConsumer(event = {}) {
   const body = event.body || {};
+  if (body.jobType === 'sync-jira-admin-memberships') {
+    return synchronizeJiraAdministratorMemberships({
+      accountId: body.accountId,
+      accountIds: body.accountIds,
+      completeAdminSet: body.completeAdminSet,
+      projects: body.projects,
+      anchorKey: body.anchorKey,
+      fingerprint: body.fingerprint
+    });
+  }
   return executeAgenticWorkflowRun({
     projectKey: body.projectKey,
     runId: body.runId,

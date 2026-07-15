@@ -45,8 +45,8 @@ const navigation = [
   {
     label: "Workspace",
     items: [
-      { id: "overview", to: "/", label: "Home", shortLabel: "Home", icon: DashboardIcon, matchPaths: ["/"] },
-      { id: "projects", to: "/projects", label: "Projects", shortLabel: "Projects", icon: FolderIcon, countKey: "projects" }
+      { id: "overview", to: "/", label: "Home", shortLabel: "Home", icon: DashboardIcon, matchPaths: ["/"], featureKeys: ["qaira.analytics.dashboards"] },
+      { id: "projects", to: "/projects", label: "Projects", shortLabel: "Projects", icon: FolderIcon, countKey: "projects", featureKeys: ["qaira.ops.projects"] }
     ]
   },
   {
@@ -92,7 +92,7 @@ const navigation = [
         featureKeys: ["qaira.manual.runs"],
         disabledWhenNoProjects: true
       },
-      { id: "issues", to: "/issues", label: "Bugs", shortLabel: "Bugs", icon: BugIcon },
+      { id: "issues", to: "/issues", label: "Bugs", shortLabel: "Bugs", icon: BugIcon, featureKeys: ["qaira.manual.bugs"] },
       {
         id: "testops",
         to: "/testops",
@@ -111,8 +111,7 @@ const navigation = [
         shortLabel: "Env",
         icon: ServerIcon,
         matchPaths: TEST_ENVIRONMENT_SECTION_ITEMS.map((item) => item.to),
-        featureKeys: ["qaira.mobile.appium", "qaira.manual.test_cases"],
-        featureMatch: "any",
+        featureKeys: ["qaira.manual.environments"],
         disabledWhenNoProjects: true
       },
       { id: "knowledge", to: "/knowledge-repo", label: "Knowledge Repo", shortLabel: "Knowledge", icon: OpenBookIcon, featureKeys: ["qaira.ai.knowledge"] }

@@ -10,7 +10,7 @@ npm run build
 forge lint
 ```
 
-`npm run verify` is the repository gate. It checks the Forge backend JavaScript and tests, frontend TypeScript, all 46 canonical SQL-reference-to-Jira mappings, runtime/admin schema parity, parity for all 28 registered feature flags, canonical property keys, property-size limits, and admin/CI shell syntax. `npm run build` performs another frontend type check and produces the hosted resource under `static/qaira-ui/dist`.
+`npm run verify` is the repository gate. It checks the Forge backend JavaScript and tests, frontend TypeScript, all 46 canonical SQL-reference-to-Jira mappings, runtime/admin schema parity, parity for all 35 registered feature flags, canonical property keys, property-size limits, and admin/CI shell syntax. `npm run build` performs another frontend type check and produces the hosted resource under `static/qaira-ui/dist`.
 
 Before promotion, also run:
 

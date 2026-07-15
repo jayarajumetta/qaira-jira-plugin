@@ -1,4 +1,4 @@
-import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { FormEvent, useCallback, useDeferredValue, useEffect, useMemo, useState } from "react";
 import type { CSSProperties, ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
@@ -407,7 +407,15 @@ export function ProjectsPage() {
   const canManageAppTypes = hasJiraAdministration && hasPermission(session, "project.manage");
   const visibleUserEmail = (email?: string | null) => resolveVisibleEmail(email, canManageUsers);
   const domainMetadataQuery = useDomainMetadata();
-  const { projects, users, roles, projectMembers, appTypes, requirements, testSuites, testCases, executions, executionResults } = useWorkspaceData();
+  const [loadProjectMetrics, setLoadProjectMetrics] = useState(false);
+  const { projects, users, roles, projectMembers, appTypes, requirements, testSuites, testCases, executions, executionResults } = useWorkspaceData({
+    issues: false,
+    requirements: loadProjectMetrics,
+    testSuites: loadProjectMetrics,
+    testCases: loadProjectMetrics,
+    executions: loadProjectMetrics,
+    executionResults: loadProjectMetrics
+  });
   const [selectedProjectId, setSelectedProjectId] = useCurrentProject();
   const [focusedProjectId, setFocusedProjectId] = useState("");
   const [section, setSection] = useState<ProjectSection>("members");
@@ -415,6 +423,7 @@ export function ProjectsPage() {
   const [messageTone, setMessageTone] = useState<"success" | "error">("success");
   const [isCreateModalOpen, setIsCreateModalOpen] = useState(false);
   const [projectSearch, setProjectSearch] = useState("");
+  const deferredProjectSearch = useDeferredValue(projectSearch);
   const [projectAppTypeFilter, setProjectAppTypeFilter] = useState("all");
   const [projectMemberFilter, setProjectMemberFilter] = useState("all");
   const [projectViewMode, setProjectViewMode] = useState<"tile" | "list">(() => readDefaultCatalogViewMode());
@@ -434,7 +443,7 @@ export function ProjectsPage() {
   const [projectDraft, setProjectDraft] = useState<ProjectCreateDraft>(() => createInitialProjectDraft(defaultAppTypeValue));
   const [quickAddAppTypeType, setQuickAddAppTypeType] = useState(defaultAppTypeValue);
   const integrationsQuery = useQuery({
-    queryKey: ["integrations"],
+    queryKey: ["integrations", selectedProjectId],
     queryFn: () => api.integrations.list(),
     enabled: Boolean(session)
   });
@@ -449,15 +458,13 @@ export function ProjectsPage() {
   });
 
   const projectItems = projects.data || [];
-  const isProjectCatalogLoading =
-    projects.isPending ||
-    projectMembers.isPending ||
-    appTypes.isPending ||
-    requirements.isPending ||
-    testSuites.isPending ||
-    testCases.isPending ||
-    executions.isPending ||
-    executionResults.isPending;
+  const isProjectCatalogLoading = projects.isPending;
+
+  useEffect(() => {
+    if (!projects.data?.length || loadProjectMetrics) return;
+    const timer = window.setTimeout(() => setLoadProjectMetrics(true), 120);
+    return () => window.clearTimeout(timer);
+  }, [loadProjectMetrics, projects.data?.length]);
 
   useEffect(() => {
     if (!appTypeDropdownOptions.length) {
@@ -853,7 +860,7 @@ export function ProjectsPage() {
   }, [projectPortfolioItems]);
 
   const filteredProjectItems = useMemo(() => {
-    const normalizedSearch = projectSearch.trim().toLowerCase();
+    const normalizedSearch = deferredProjectSearch.trim().toLowerCase();
 
     return projectPortfolioItems.filter((item) => {
       const { project } = item;
@@ -920,7 +927,7 @@ export function ProjectsPage() {
     projectPortfolioItems,
     projectMemberFilter,
     projectMemberUserIdsByProjectId,
-    projectSearch,
+    deferredProjectSearch,
     userSearchValueById
   ]);
 
@@ -2051,13 +2058,14 @@ export function ProjectsPage() {
                   const user = users.data?.find((item) => item.id === member.user_id);
                   const role = roles.data?.find((item) => item.id === member.role_id);
                   const isCurrentUser = member.user_id === session?.user.id;
+                  const isJiraManagedAdministrator = member.role_id === "jira-admin" && member.assignment_source === "jira-permission";
 
                   return (
                     <article className="mini-card" key={member.id}>
                       <strong>{user?.name || visibleUserEmail(user?.email) || member.user_id}</strong>
                       <select
                         aria-label={`Qaira role for ${user?.name || member.user_id}`}
-                        disabled={!canManageProjectMembers || updateMemberRole.isPending}
+                        disabled={!canManageProjectMembers || updateMemberRole.isPending || isJiraManagedAdministrator}
                         onChange={(event) => updateMemberRole.mutate({ memberId: member.id, roleId: event.target.value })}
                         value={member.role_id}
                       >
@@ -2074,7 +2082,7 @@ export function ProjectsPage() {
                       {isCurrentUser ? <span className="text-muted project-member-note">You</span> : null}
                       <button
                         className="ghost-button danger"
-                        disabled={!canManageProjectMembers}
+                        disabled={!canManageProjectMembers || isJiraManagedAdministrator}
                         onClick={() => void handleRemoveMember(member)}
                         type="button"
                       >
@@ -2212,7 +2220,7 @@ export function ProjectsPage() {
 
                 <div className="detail-summary">
                   <strong>Project-scoped access from the first save</strong>
-                  <span>The creator receives QA lead. Every selected member must have a Qaira role; Jira administrator access remains derived from live Jira permissions.</span>
+                  <span>The creator receives the Jira administrator role when Jira grants Administer Jira; otherwise the creator receives QA lead. Every selected member must have a Qaira role.</span>
                 </div>
 
                 <section className="project-create-section">
@@ -2302,12 +2310,12 @@ export function ProjectsPage() {
                                 <strong>{user.name || visibleUserEmail(user.email) || "Unnamed user"}</strong>
                                 <span>{visibleUserEmail(user.email)}</span>
                                 <span className="project-member-option-meta">
-                                  {isAutoIncluded ? "Project creator · QA lead" : isSelected ? "Role required" : "Not added"}
+                                  {isAutoIncluded ? `Project creator · ${hasJiraAdministration ? "Jira administrator" : "QA lead"}` : isSelected ? "Role required" : "Not added"}
                                 </span>
                               </span>
                             </label>
                             {isAutoIncluded ? (
-                              <span className="status-pill tone-info">QA lead</span>
+                              <span className="status-pill tone-info">{hasJiraAdministration ? "Jira administrator" : "QA lead"}</span>
                             ) : isSelected ? (
                               <select
                                 aria-label={`Qaira role for ${user.name || visibleUserEmail(user.email) || "selected user"}`}

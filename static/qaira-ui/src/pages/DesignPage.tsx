@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
 import { AddIcon, ClearSelectionIcon, EyeIcon, GridIcon, LayersIcon, SelectAllIcon } from "../components/AppIcons";
+import { CatalogSelectionControls } from "../components/CatalogSelectionControls";
 import { CreateRunActionButton } from "../components/CreateRunActionButton";
 import { CatalogViewToggle } from "../components/CatalogViewToggle";
 import { CatalogSearchFilter } from "../components/CatalogSearchFilter";
@@ -22,7 +23,6 @@ import { StepParameterDialog } from "../components/StepParameterDialog";
 import { SharedGroupLevelIcon } from "../components/StepAutomationEditor";
 import { StatusBadge } from "../components/StatusBadge";
 import {
-  TileCardCaseIcon,
   TileCardLinkIcon,
   formatTileCardLabel
 } from "../components/TileCardPrimitives";
@@ -37,7 +37,10 @@ import { useDeleteConfirmation } from "../components/DeleteConfirmationDialog";
 import { useCurrentAppType, useCurrentProject } from "../hooks/useCurrentProject";
 import { useDomainMetadata } from "../hooks/useDomainMetadata";
 import { useDialogFocus } from "../hooks/useDialogFocus";
+import { useFeatureFlags } from "../hooks/useFeatureFlags";
 import { api } from "../lib/api";
+import { areFeatureFlagsEnabled } from "../lib/featureFlags";
+import { hasPermission } from "../lib/permissions";
 import {
   collectStepParameters,
   filterStepParameterValues,
@@ -182,6 +185,16 @@ function ExecutionStepsIcon() {
   );
 }
 
+function UnlinkSuiteCasesIcon() {
+  return (
+    <svg aria-hidden="true" fill="none" height="16" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.9" viewBox="0 0 24 24" width="16">
+      <path d="m9.5 14.5-1 1a4 4 0 0 1-5.7-5.7l2.5-2.5A4 4 0 0 1 11 7" />
+      <path d="m14.5 9.5 1-1a4 4 0 0 1 5.7 5.7l-2.5 2.5A4 4 0 0 1 13 17" />
+      <path d="m8 8 8 8" />
+    </svg>
+  );
+}
+
 function StepKindIconBadge({
   kind,
   label,
@@ -214,7 +227,24 @@ export function DesignPage() {
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const { session } = useAuth();
-  const { confirmDelete, confirmationDialog } = useDeleteConfirmation();
+  const featureFlagsQuery = useFeatureFlags(Boolean(session));
+  const canUseManualSuites = areFeatureFlagsEnabled(featureFlagsQuery.data, ["qaira.manual.suites"]);
+  const canCreateSuites = hasPermission(session, "suite.create") && canUseManualSuites;
+  const canUpdateSuites = hasPermission(session, "suite.update") && canUseManualSuites;
+  const canDeleteSuites = hasPermission(session, "suite.delete") && canUseManualSuites;
+  const canCreateManualRuns = hasPermission(session, "run.create")
+    && areFeatureFlagsEnabled(featureFlagsQuery.data, ["qaira.manual.runs"]);
+  const canUseAutomationWorkspace = areFeatureFlagsEnabled(featureFlagsQuery.data, ["qaira.automation.workspace"]);
+  const canRunLocalAutomation = hasPermission(session, "automation.run.local")
+    && canUseAutomationWorkspace
+    && areFeatureFlagsEnabled(featureFlagsQuery.data, ["qaira.automation.local_execution"]);
+  const canRunRemoteAutomation = hasPermission(session, "automation.run.remote")
+    && canUseAutomationWorkspace
+    && areFeatureFlagsEnabled(featureFlagsQuery.data, ["qaira.automation.remote_execution"]);
+  const canConfigureParallelAutomation = hasPermission(session, "automation.run.parallel")
+    && canUseAutomationWorkspace
+    && areFeatureFlagsEnabled(featureFlagsQuery.data, ["qaira.automation.parallel_execution"]);
+  const { confirmAction, confirmDelete, confirmationDialog } = useDeleteConfirmation();
   const domainMetadataQuery = useDomainMetadata();
   const [projectId] = useCurrentProject();
   const [appTypeId, setAppTypeId] = useCurrentAppType(projectId);
@@ -244,6 +274,15 @@ export function DesignPage() {
   const [executionStartMode, setExecutionStartMode] = useState<ExecutionStartMode>("manual");
   const [executionParallelEnabled, setExecutionParallelEnabled] = useState(false);
   const [executionParallelCount, setExecutionParallelCount] = useState(1);
+
+  useEffect(() => {
+    if (!canConfigureParallelAutomation && executionParallelEnabled) {
+      setExecutionParallelEnabled(false);
+      setExecutionParallelCount(1);
+    }
+    if (executionStartMode === "local" && !canRunLocalAutomation) setExecutionStartMode("manual");
+    if (executionStartMode === "remote" && !canRunRemoteAutomation) setExecutionStartMode("manual");
+  }, [canConfigureParallelAutomation, canRunLocalAutomation, canRunRemoteAutomation, executionParallelEnabled, executionStartMode]);
   const [executionHookDraft, setExecutionHookDraft] = useState<RunHookSelection[]>([]);
   const [suiteModalMode, setSuiteModalMode] = useState<SuiteModalMode>("create");
   const [isSuiteModalOpen, setIsSuiteModalOpen] = useState(false);
@@ -345,7 +384,8 @@ export function DesignPage() {
       api.testSuites.update(id, input)
   });
   const assignSuiteCasesMutation = useMutation({
-    mutationFn: ({ id, testCaseIds }: { id: string; testCaseIds: string[] }) => api.testSuites.assignTestCases(id, testCaseIds)
+    mutationFn: ({ id, testCaseIds, expectedRevision, append = true }: { id: string; testCaseIds: string[]; expectedRevision?: number; append?: boolean }) =>
+      api.testSuites.assignTestCases(id, testCaseIds, expectedRevision, append)
   });
   const reorderSuiteCasesMutation = useMutation({
     mutationFn: ({ suiteId, testCaseIds }: { suiteId: string; testCaseIds: string[] }) =>
@@ -397,6 +437,7 @@ export function DesignPage() {
   };
 
   const openCreateSuiteModal = () => {
+    if (!canCreateSuites) return;
     setSuiteModalMode("create");
     setIsSuiteModalOpen(true);
   };
@@ -1091,34 +1132,44 @@ export function DesignPage() {
   };
 
   const handleSuiteSave = async (input: { name: string; labels: string[]; selectedIds: string[]; parallel_enabled?: boolean; parallel_count?: number }) => {
+    if ((suiteModalMode === "create" && !canCreateSuites) || (suiteModalMode === "edit" && !canUpdateSuites)) {
+      showError(new Error("Your Qaira role cannot save test suites."), "Unable to save suite");
+      return;
+    }
     try {
       let suiteId = selectedSuiteId;
+      let membershipExpectedRevision: number | undefined;
 
       if (suiteModalMode === "create") {
         const response = await createSuiteMutation.mutateAsync({
           app_type_id: appTypeId,
           name: input.name,
           labels: input.labels,
-          parallel_enabled: input.parallel_enabled,
-          parallel_count: input.parallel_count
+          parallel_enabled: canConfigureParallelAutomation ? input.parallel_enabled : false,
+          parallel_count: canConfigureParallelAutomation && input.parallel_enabled ? input.parallel_count : 1
         });
         suiteId = response.id;
       } else if (selectedSuite) {
-        await updateSuiteMutation.mutateAsync({
+        const response = await updateSuiteMutation.mutateAsync({
           id: selectedSuite.id,
           input: {
             name: input.name,
             labels: input.labels,
-            parallel_enabled: input.parallel_enabled,
-            parallel_count: input.parallel_count
+            ...(canConfigureParallelAutomation ? {
+              parallel_enabled: input.parallel_enabled,
+              parallel_count: input.parallel_enabled ? input.parallel_count : 1
+            } : {})
           }
         });
+        membershipExpectedRevision = response.revision;
       }
 
       if (suiteId && (suiteModalMode === "edit" || input.selectedIds.length)) {
         await assignSuiteCasesMutation.mutateAsync({
           id: suiteId,
-          testCaseIds: input.selectedIds
+          testCaseIds: input.selectedIds,
+          expectedRevision: membershipExpectedRevision,
+          append: false
         });
       }
 
@@ -1236,6 +1287,7 @@ export function DesignPage() {
   };
 
   const handleDeleteSelectedSuites = async () => {
+    if (!canDeleteSuites) return;
     const selectedSuites = suites.filter((suite) => selectedSuiteActionIds.includes(suite.id));
 
     if (!selectedSuites.length) {
@@ -1316,10 +1368,12 @@ export function DesignPage() {
         test_environment_id: selectedExecutionEnvironmentId || undefined,
         test_configuration_id: selectedExecutionConfigurationId || undefined,
         test_data_set_id: selectedExecutionDataSetId || undefined,
-        execution_mode: executionStartMode,
-        engine_base_url: executionStartMode === "local" ? "http://host.docker.internal:4301" : undefined,
-        parallel_enabled: executionParallelEnabled || undefined,
-        parallel_count: executionParallelEnabled ? executionParallelCount : undefined,
+        execution_mode: executionStartMode === "local" && canRunLocalAutomation
+          ? "local"
+          : executionStartMode === "remote" && canRunRemoteAutomation ? "remote" : "manual",
+        engine_base_url: executionStartMode === "local" && canRunLocalAutomation ? "http://host.docker.internal:4301" : undefined,
+        parallel_enabled: canConfigureParallelAutomation && executionParallelEnabled || undefined,
+        parallel_count: canConfigureParallelAutomation && executionParallelEnabled ? executionParallelCount : undefined,
         execution_hooks: executionHookDraft.length ? executionHookDraft : undefined,
         assigned_to_ids: selectedExecutionAssigneeIds.length ? selectedExecutionAssigneeIds : undefined,
         release: executionRelease.trim() || undefined,
@@ -1610,6 +1664,58 @@ export function DesignPage() {
     }
   };
 
+  const handleUnlinkSuiteCases = async (testCaseIds: string[]) => {
+    if (!selectedSuiteId || !selectedSuite || !canUpdateSuites || !testCaseIds.length) {
+      return false;
+    }
+
+    const selectedIds = new Set(testCaseIds);
+    const linkedCases = orderedSuiteCases.filter((testCase) => selectedIds.has(testCase.id));
+    if (!linkedCases.length) {
+      return false;
+    }
+
+    const confirmed = await confirmAction({
+      title: "Remove cases from suite",
+      message: `Remove ${linkedCases.length} test case${linkedCases.length === 1 ? "" : "s"} from \"${selectedSuite.name}\"? The cases remain reusable and are not deleted.`,
+      confirmLabel: linkedCases.length === 1 ? "Remove case" : "Remove cases"
+    });
+
+    if (!confirmed) {
+      return false;
+    }
+
+    try {
+      const remainingIds = orderedSuiteCases
+        .filter((testCase) => !selectedIds.has(testCase.id))
+        .map((testCase) => testCase.id);
+      await assignSuiteCasesMutation.mutateAsync({
+        id: selectedSuiteId,
+        testCaseIds: remainingIds,
+        expectedRevision: selectedSuite.revision,
+        append: false
+      });
+      updateCasesCache((current) => current.map((testCase) => (
+        selectedIds.has(testCase.id)
+          ? {
+              ...testCase,
+              suite_id: testCase.suite_id === selectedSuiteId ? null : testCase.suite_id,
+              suite_ids: (testCase.suite_ids || []).filter((suiteId) => suiteId !== selectedSuiteId)
+            }
+          : testCase
+      )));
+      if (selectedIds.has(selectedTestCaseId)) {
+        setSelectedTestCaseId("");
+      }
+      await refreshSuites();
+      showSuccess(`${linkedCases.length} test case${linkedCases.length === 1 ? "" : "s"} removed from ${selectedSuite.name}.`);
+      return true;
+    } catch (error) {
+      showError(error, "Unable to remove test cases from suite");
+      return false;
+    }
+  };
+
   const isDesignLoading =
     projectsQuery.isLoading ||
     appTypesQuery.isLoading ||
@@ -1693,9 +1799,9 @@ export function DesignPage() {
             }}
             isLoading={suitesQuery.isLoading && Boolean(appTypeId)}
             selectedAppType={selectedAppType}
-            canCreateSuite={Boolean(appTypeId)}
+            canCreateSuite={Boolean(appTypeId && canCreateSuites)}
+            canDeleteSuites={canDeleteSuites}
             canCreateExecution={Boolean(projectId && appTypeId && suites.length && session?.user.id)}
-            selectedSuiteCount={selectedSuiteActionIds.length}
             isDeletingSelectedSuites={isDeletingSelectedSuites}
             hasSuiteSearchResults={Boolean(filteredSuites.length)}
             hasAnySuites={Boolean(suites.length)}
@@ -1710,7 +1816,7 @@ export function DesignPage() {
                 <WorkspaceBackButton label="Back to suite tiles" onClick={closeSuiteWorkspace} />
                 <button
                   className="ghost-button"
-                  disabled={!selectedSuite}
+                  disabled={!selectedSuite || !canUpdateSuites}
                   onClick={() => setIsSuiteParameterDialogOpen(true)}
                   type="button"
                 >
@@ -1758,7 +1864,10 @@ export function DesignPage() {
             onCreateCase={beginCreateCase}
             onOpenCaseEditor={openSelectedCaseEditor}
             canOpenCaseEditor={Boolean(selectedTestCaseId)}
+            canUnlinkCases={canUpdateSuites}
+            isUnlinkingCases={assignSuiteCasesMutation.isPending}
             onReorderCases={handleReorderCases}
+            onUnlinkCases={handleUnlinkSuiteCases}
             viewMode={suiteCaseCatalogViewMode}
             onViewModeChange={setSuiteCaseCatalogViewMode}
           />
@@ -1801,7 +1910,18 @@ export function DesignPage() {
       {isCreateExecutionModalOpen ? (
         <SuiteExecutionModal
           assigneeOptions={assigneeOptions}
-          canCreateExecution={Boolean(projectId && appTypeId && executionTargetSuiteIds.length && session?.user.id)}
+          canCreateExecution={Boolean(
+            projectId
+            && appTypeId
+            && executionTargetSuiteIds.length
+            && session?.user.id
+            && (executionStartMode === "local"
+              ? canRunLocalAutomation
+              : executionStartMode === "remote" ? canRunRemoteAutomation : canCreateManualRuns)
+          )}
+          canConfigureParallelAutomation={canConfigureParallelAutomation}
+          canRunLocalAutomation={canRunLocalAutomation}
+          canRunRemoteAutomation={canRunRemoteAutomation}
           executionHookDraft={executionHookDraft}
           executionName={executionName}
           executionRelease={executionRelease}
@@ -1847,6 +1967,7 @@ export function DesignPage() {
           suite={suiteModalMode === "edit" ? selectedSuite : null}
           appTypeCases={allTestCases}
           availableLabels={existingSuiteLabels}
+          canConfigureParallelAutomation={canConfigureParallelAutomation}
           moduleLabelByCaseId={suitePickerModuleLabelByCaseId}
           selectedCaseIds={suiteModalMode === "edit" ? orderedSuiteCases.map((testCase) => testCase.id) : []}
           onClose={() => setIsSuiteModalOpen(false)}
@@ -1885,8 +2006,8 @@ function SuiteSidebar({
   isLoading,
   selectedAppType,
   canCreateSuite,
+  canDeleteSuites,
   canCreateExecution,
-  selectedSuiteCount,
   isDeletingSelectedSuites,
   hasSuiteSearchResults,
   hasAnySuites,
@@ -1919,8 +2040,8 @@ function SuiteSidebar({
   isLoading: boolean;
   selectedAppType: AppType | null;
   canCreateSuite: boolean;
+  canDeleteSuites: boolean;
   canCreateExecution: boolean;
-  selectedSuiteCount: number;
   isDeletingSelectedSuites: boolean;
   hasSuiteSearchResults: boolean;
   hasAnySuites: boolean;
@@ -2094,7 +2215,7 @@ function SuiteSidebar({
             <SelectAllIcon />
             <span>Select all</span>
           </button>
-          {selectedSuiteActionIds.length ? (
+          {selectedSuiteActionIds.length && canDeleteSuites ? (
             <button
               className="ghost-button catalog-selection-button"
               onClick={() => runSuiteAction("clear-selection", onClearSuiteSelection)}
@@ -2120,25 +2241,21 @@ function SuiteSidebar({
               <AddIcon />
               <span>Create Suite</span>
             </button>
-            <CreateRunActionButton
-              className="test-case-split-action-button"
-              disabled={!canCreateExecution}
-              label="Run manually"
-              selectedSuiteIds={selectedSuiteActionIds}
-              source="TEST_SUITES"
-              onCreateManualRun={() => runSuiteAction("manual-run", onCreateManualRun)}
-              onCreateLocalRun={() => runSuiteAction("local-run", onCreateLocalRun)}
-              onCreateRemoteRun={() => runSuiteAction("remote-run", onCreateRemoteRun)}
-            />
+            {selectedSuiteActionIds.length ? (
+              <CreateRunActionButton
+                className="test-case-split-action-button"
+                disabled={!canCreateExecution}
+                label="Run manually"
+                selectedSuiteIds={selectedSuiteActionIds}
+                source="TEST_SUITES"
+                onCreateManualRun={() => runSuiteAction("manual-run", onCreateManualRun)}
+                onCreateLocalRun={() => runSuiteAction("local-run", onCreateLocalRun)}
+                onCreateRemoteRun={() => runSuiteAction("remote-run", onCreateRemoteRun)}
+              />
+            ) : null}
           </div>
         </div>
 
-        {selectedSuiteCount ? (
-          <div className="detail-summary suite-selection-summary">
-            <strong>{selectedSuiteCount} suite{selectedSuiteCount === 1 ? "" : "s"} selected for bulk actions</strong>
-            <span>Checkbox selections power bulk delete and run creation. Click a card body to keep curating one suite at a time.</span>
-          </div>
-        ) : null}
         <TileBrowserPane className="test-case-library-scroll suite-tile-browser">
           {isLoading ? <TileCardSkeletonGrid /> : null}
           {!isLoading && !hasAnySuites ? (
@@ -2177,7 +2294,7 @@ function SuiteSidebar({
                       ? "AI: Requirement coverage is thin. Link more mapped cases to requirements to improve traceability."
                       : automationScore >= 70
                         ? "AI: Strong suite candidate for scheduled regression because most mapped cases are automated."
-                        : "AI: Suite coverage is traceable. Automate the highest-repeat cases next to reduce manual run effort.";
+                        : "AI: Traceability is healthy. Automate the highest-repeat cases next to reduce manual run effort.";
 
                 return (
                   <button
@@ -2201,27 +2318,16 @@ function SuiteSidebar({
 		                          />
 		                        </label>
 		                        <DisplayIdBadge value={suite.display_id || suite.id} />
-		                        <div className="test-case-card-badge-row">
-		                          <span className="test-case-source-badge">Suite</span>
+	                        <div className="catalog-inline-actions test-case-top-actions">
 	                          {suite.labels?.slice(0, 2).map((label) => (
 	                            <span className="test-case-source-badge is-api" key={label}>{label}</span>
 	                          ))}
-	                        </div>
-	                        <div className="catalog-inline-actions test-case-top-actions">
 	                          <StatusBadge value={latestRunLabel} />
 	                        </div>
 	                      </div>
-	                      <div className="test-case-requirement-block suite-coverage-block">
-	                        <span className="test-case-requirement-label">
-	                          <TileCardCaseIcon />
-	                          Suite coverage
-	                        </span>
-	                        <p>{selectedAppType ? `${selectedAppType.name} workspace suite with ${mappedCaseCount} mapped reusable case${mappedCaseCount === 1 ? "" : "s"}.` : "No app type selected"}</p>
-		                      </div>
 		                      <div className="tile-card-title-group test-case-card-title-group test-case-card-title-group--identity">
 		                        <strong>{suite.name}</strong>
 		                      </div>
-	                      <p className="tile-card-description">{suite.labels?.length ? `Labels: ${suite.labels.join(", ")}` : "Use it to curate reusable test cases into a release-ready run scope."}</p>
                       <div className="test-case-card-stats suite-card-stats" aria-label={`${suite.name} facts`}>
                         <span title={`${mappedCaseCount} mapped case${mappedCaseCount === 1 ? "" : "s"}`}>
                           <strong>{mappedCaseCount}</strong>
@@ -2319,7 +2425,10 @@ function TestCaseList({
   onCreateCase,
   onOpenCaseEditor,
   canOpenCaseEditor,
+  canUnlinkCases,
+  isUnlinkingCases,
   onReorderCases,
+  onUnlinkCases,
   viewMode,
   onViewModeChange
 }: {
@@ -2349,18 +2458,56 @@ function TestCaseList({
   onCreateCase: () => void;
   onOpenCaseEditor: (testCaseId?: string) => void;
   canOpenCaseEditor: boolean;
+  canUnlinkCases: boolean;
+  isUnlinkingCases: boolean;
   onReorderCases: (fromCaseId: string, toCaseId: string) => void;
+  onUnlinkCases: (testCaseIds: string[]) => Promise<boolean>;
   viewMode: "tile" | "list";
   onViewModeChange: (value: "tile" | "list") => void;
 }) {
   const [draggedCaseId, setDraggedCaseId] = useState("");
-  const casesWithRequirements = cases.filter((testCase) => testCase.requirement_id || testCase.requirement_ids?.length).length;
-  const casesWithHistory = cases.filter((testCase) => (historyByCaseId[testCase.id] || []).length > 0).length;
+  const [selectedCaseIds, setSelectedCaseIds] = useState<string[]>([]);
+  const selectedCaseIdSet = useMemo(() => new Set(selectedCaseIds), [selectedCaseIds]);
+  const areAllVisibleCasesSelected = Boolean(cases.length) && cases.every((testCase) => selectedCaseIdSet.has(testCase.id));
+
+  useEffect(() => {
+    setSelectedCaseIds([]);
+  }, [canUnlinkCases, selectedSuite?.id]);
+
+  const toggleCaseSelection = (testCaseId: string) => {
+    setSelectedCaseIds((current) => (
+      current.includes(testCaseId)
+        ? current.filter((id) => id !== testCaseId)
+        : [...current, testCaseId]
+    ));
+  };
+
+  const unlinkSelectedCases = async () => {
+    if (await onUnlinkCases(selectedCaseIds)) {
+      setSelectedCaseIds([]);
+    }
+  };
+
   const getRequirementTitleForCase = (testCase: TestCase) =>
     requirements
       .find((item) => (testCase.requirement_ids || [testCase.requirement_id]).includes(item.id))
       ?.title || "No requirement linked";
   const suiteCaseListColumns = useMemo<Array<DataTableColumn<TestCase>>>(() => [
+    ...(canUnlinkCases ? [{
+      key: "select",
+      label: "",
+      canToggle: false,
+      render: (testCase: TestCase) => (
+        <label className="checkbox-field suite-case-row-checkbox" onClick={(event) => event.stopPropagation()}>
+          <input
+            aria-label={`Select ${testCase.title}`}
+            checked={selectedCaseIdSet.has(testCase.id)}
+            onChange={() => toggleCaseSelection(testCase.id)}
+            type="checkbox"
+          />
+        </label>
+      )
+    }] : []),
     {
       key: "id",
       label: "ID",
@@ -2438,7 +2585,7 @@ function TestCaseList({
       label: "Runs",
       render: (testCase) => (historyByCaseId[testCase.id] || []).length
     }
-  ], [defaultCaseStatus, historyByCaseId, requirements, stepCountByCaseId]);
+  ], [canUnlinkCases, defaultCaseStatus, historyByCaseId, requirements, selectedCaseIdSet, stepCountByCaseId]);
 
   return (
     <Panel
@@ -2448,25 +2595,6 @@ function TestCaseList({
       subtitle={selectedSuite ? `Curated reusable cases inside ${selectedSuite.name}.` : "Showing all reusable cases for the current app type."}
     >
       <div className="suite-design-panel-stack">
-        <div className="metric-strip compact">
-          <div className="mini-card">
-            <strong>{cases.length}</strong>
-            <span>Visible cases</span>
-          </div>
-          <div className="mini-card">
-            <strong>{casesWithRequirements}</strong>
-            <span>Requirement-linked</span>
-          </div>
-          <div className="mini-card">
-            <strong>{casesWithHistory}</strong>
-            <span>Have run history</span>
-          </div>
-          <div className="mini-card">
-            <strong>{selectedSuite ? "Ordered" : "Library"}</strong>
-            <span>{selectedSuite ? "Drag cards to reorder the suite" : "View any case in the reusable case viewer"}</span>
-          </div>
-        </div>
-
         <div className="design-list-toolbar test-case-catalog-toolbar">
           <CatalogViewToggle onChange={onViewModeChange} value={viewMode} />
           <CatalogSearchFilter
@@ -2538,20 +2666,25 @@ function TestCaseList({
               </div>
             </div>
           </CatalogSearchFilter>
+          {selectedSuite && canUnlinkCases ? (
+            <CatalogSelectionControls
+              allSelected={areAllVisibleCasesSelected}
+              canSelectAll={Boolean(cases.length)}
+              clearLabel="Clear"
+              deleteAction={{
+                disabled: isUnlinkingCases,
+                icon: <UnlinkSuiteCasesIcon />,
+                label: isUnlinkingCases ? "Removing…" : `Remove from suite (${selectedCaseIds.length})`,
+                onClick: () => void unlinkSelectedCases()
+              }}
+              onClear={() => setSelectedCaseIds([])}
+              onSelectAll={() => setSelectedCaseIds((current) => [...new Set([...current, ...cases.map((testCase) => testCase.id)])])}
+              selectAllLabel="Select all"
+              selectedCount={selectedCaseIds.length}
+            />
+          ) : null}
           <button className="primary-button" onClick={onCreateCase} type="button"><AddIcon />New Test Case</button>
         </div>
-
-        {selectedSuite ? (
-          <div className="detail-summary suite-workspace-card">
-            <strong>{selectedSuite.name}</strong>
-            <span>Cases stay ordered inside the suite, while each case remains reusable elsewhere.</span>
-            <span>
-              {Object.keys(selectedSuite.parameter_values || {}).length
-                ? `${Object.keys(selectedSuite.parameter_values || {}).length} suite test data value${Object.keys(selectedSuite.parameter_values || {}).length === 1 ? "" : "s"} saved on this suite.`
-                : "No suite-level test data saved yet."}
-            </span>
-          </div>
-        ) : null}
 
         <TileBrowserPane className="test-case-library-scroll">
           {isLoading ? <TileCardSkeletonGrid /> : null}
@@ -2617,12 +2750,16 @@ function TestCaseList({
                   >
 		                    {selectedSuite ? <span className="drag-handle" aria-hidden="true">::</span> : null}
 		                    <div className="tile-card-main">
-		                      <div className="tile-card-select-row test-case-card-header test-case-card-header--metadata-only">
+		                      <div className={["tile-card-select-row test-case-card-header test-case-card-header--metadata-only", canUnlinkCases ? "has-selection" : ""].filter(Boolean).join(" ")}>
+		                        {canUnlinkCases ? <label className="checkbox-field suite-case-card-checkbox" onClick={(event) => event.stopPropagation()}>
+		                          <input
+		                            aria-label={`Select ${testCase.title}`}
+		                            checked={selectedCaseIdSet.has(testCase.id)}
+		                            onChange={() => toggleCaseSelection(testCase.id)}
+		                            type="checkbox"
+		                          />
+		                        </label> : null}
 		                        <DisplayIdBadge value={testCase.display_id || testCase.id} />
-		                        <div className="test-case-card-badge-row">
-	                          <span className="test-case-source-badge">{caseTypeLabel}</span>
-	                          {selectedSuite ? <span className="test-case-source-badge is-api">Suite case</span> : null}
-	                        </div>
 	                        <div className="catalog-inline-actions test-case-top-actions">
 	                          <button
 	                            aria-label={`View ${testCase.title}`}
@@ -2799,7 +2936,6 @@ function SuiteCaseEditorModal({
   onToggleStep: (stepId: string) => void;
 }) {
   const dialogRef = useDialogFocus<HTMLDivElement>({ onClose });
-  const selectedRequirement = requirements.find((item) => item.id === caseDraft.requirement_id) || null;
   const caseSectionSummary = isCreatingCase
     ? caseDraft.title.trim() || "Start the reusable case definition before saving it into the suite workspace."
     : selectedTestCase?.title || "Select a case from the workspace to edit it here.";
@@ -2850,25 +2986,6 @@ function SuiteCaseEditorModal({
             <span>Suite context: {selectedSuite?.name || caseDraft.suite_id || "All suites"}</span>
           </div>
 
-          <div className="metric-strip compact">
-            <div className="mini-card">
-              <strong>{selectedTestCase?.suite_ids?.length || (caseDraft.suite_id ? 1 : 0)}</strong>
-              <span>Linked suites</span>
-            </div>
-            <div className="mini-card">
-              <strong>{history.length}</strong>
-              <span>Run records</span>
-            </div>
-            <div className="mini-card">
-              <strong>{displaySteps.length}</strong>
-              <span>{isCreatingCase ? "Draft steps" : "Defined steps"}</span>
-            </div>
-            <div className="mini-card">
-              <strong>{selectedRequirement ? "Linked" : "Open"}</strong>
-              <span>{selectedRequirement?.title || "Requirement not linked yet"}</span>
-            </div>
-          </div>
-
           <div className="editor-accordion">
             <EditorAccordionSection
               countLabel={isCreatingCase ? "Draft" : caseDraft.status || defaultCaseStatus}
@@ -2899,7 +3016,7 @@ function SuiteCaseEditorModal({
                       ))}
                     </select>
                   </FormField>
-                  <FormField label="Status">
+                  <FormField className="form-field--compact-enum" label="Status">
                     <select value={caseDraft.status} onChange={(event) => onCaseDraftChange({ ...caseDraft, status: event.target.value })}>
                       {testCaseStatusOptions.map((option) => (
                         <option key={option.value} value={option.value}>{option.label}</option>
@@ -2913,7 +3030,7 @@ function SuiteCaseEditorModal({
                       ))}
                     </select>
                   </FormField>
-                  <FormField label="Priority">
+                  <FormField className="form-field--compact-enum form-field--compact-number" label="Priority">
                     <input
                       min="1"
                       max="5"
@@ -3209,7 +3326,7 @@ function EditableStepCard({
             <strong>Step {step.step_order}</strong>
           </div>
           {step.group_name ? <small className="suite-step-group-note">{step.group_name}</small> : null}
-          <span>{draft.action || "No action written yet"}</span>
+          <span>{richTextToPlainText(draft.action) || "No action written yet"}</span>
         </div>
         <span aria-hidden="true" className="step-card-toggle-state">
           <StepKebabIcon />
@@ -3219,10 +3336,10 @@ function EditableStepCard({
       {isExpanded ? (
         <div className="step-card-body">
           <FormField label="Action">
-            <input value={draft.action} onChange={(event) => setDraft((current) => ({ ...current, action: event.target.value }))} />
+            <RichTextEditor value={draft.action} onChange={(action) => setDraft((current) => ({ ...current, action }))} />
           </FormField>
           <FormField label="Expected result">
-            <textarea rows={3} value={draft.expected_result} onChange={(event) => setDraft((current) => ({ ...current, expected_result: event.target.value }))} />
+            <RichTextEditor rows={3} value={draft.expected_result} onChange={(expected_result) => setDraft((current) => ({ ...current, expected_result }))} />
           </FormField>
           <div className="action-row">
             <button className="ghost-button" disabled={!canMoveUp} onClick={onMoveUp} type="button">Move up</button>
@@ -3280,7 +3397,7 @@ function DraftStepCard({
               <strong>Step {step.step_order}</strong>
             </div>
             {step.group_name ? <small className="suite-step-group-note">{step.group_name}</small> : null}
-            <span>{step.action || step.expected_result || "Draft step details"}</span>
+            <span>{richTextToPlainText(step.action || step.expected_result) || "Draft step details"}</span>
           </div>
           <span aria-hidden="true" className="step-card-toggle-state">
             <StepKebabIcon />
@@ -3291,16 +3408,16 @@ function DraftStepCard({
       {isExpanded ? (
         <div className="step-card-body">
           <FormField label="Action">
-            <input
+            <RichTextEditor
               value={step.action}
-              onChange={(event) => onChange({ action: event.target.value, expected_result: step.expected_result })}
+              onChange={(action) => onChange({ action, expected_result: step.expected_result })}
             />
           </FormField>
           <FormField label="Expected result">
-            <textarea
+            <RichTextEditor
               rows={3}
               value={step.expected_result}
-              onChange={(event) => onChange({ action: step.action, expected_result: event.target.value })}
+              onChange={(expected_result) => onChange({ action: step.action, expected_result })}
             />
           </FormField>
           <div className="action-row">
@@ -3333,6 +3450,9 @@ function SuiteExecutionModal({
   executionStartMode,
   executionParallelEnabled,
   executionParallelCount,
+  canConfigureParallelAutomation,
+  canRunLocalAutomation,
+  canRunRemoteAutomation,
   executionHookDraft,
   testCases,
   canCreateExecution,
@@ -3371,6 +3491,9 @@ function SuiteExecutionModal({
   executionStartMode: ExecutionStartMode;
   executionParallelEnabled: boolean;
   executionParallelCount: number;
+  canConfigureParallelAutomation: boolean;
+  canRunLocalAutomation: boolean;
+  canRunRemoteAutomation: boolean;
   executionHookDraft: RunHookSelection[];
   testCases: TestCase[];
   canCreateExecution: boolean;
@@ -3450,12 +3573,24 @@ function SuiteExecutionModal({
               </FormField>
             </div>
 
-            <div className="execution-create-grid">
-              <FormField label="Run type">
-                <RunTypeSelector value={executionStartMode} onChange={(value) => onExecutionStartModeChange(value as ExecutionStartMode)} />
-              </FormField>
+            {canRunLocalAutomation || canRunRemoteAutomation || canConfigureParallelAutomation ? (
+              <div className="execution-create-grid">
+              {canRunLocalAutomation || canRunRemoteAutomation ? (
+                <FormField label="Run type">
+                  <RunTypeSelector
+                    allowedModes={[
+                      "manual",
+                      ...(canRunLocalAutomation ? ["local" as const] : []),
+                      ...(canRunRemoteAutomation ? ["remote" as const] : [])
+                    ]}
+                    value={executionStartMode}
+                    onChange={(value) => onExecutionStartModeChange(value as ExecutionStartMode)}
+                  />
+                </FormField>
+              ) : null}
 
-              <FormField label="Parallel execution">
+              {canConfigureParallelAutomation ? (
+                <FormField label="Parallel execution">
                 <div className="execution-parallel-control">
                   <label>
                     <input
@@ -3476,7 +3611,9 @@ function SuiteExecutionModal({
                   />
                 </div>
               </FormField>
-            </div>
+              ) : null}
+              </div>
+            ) : null}
 
             <div className="detail-summary">
               <strong>{selectedProject || "Select a project to continue"}</strong>
@@ -3659,6 +3796,7 @@ function SuiteModal({
   suite,
   appTypeCases,
   availableLabels,
+  canConfigureParallelAutomation,
   moduleLabelByCaseId,
   selectedCaseIds,
   onClose,
@@ -3669,6 +3807,7 @@ function SuiteModal({
   suite: TestSuite | null;
   appTypeCases: TestCase[];
   availableLabels: string[];
+  canConfigureParallelAutomation: boolean;
   moduleLabelByCaseId: Record<string, string>;
   selectedCaseIds: string[];
   onClose: () => void;
@@ -3687,7 +3826,7 @@ function SuiteModal({
 
   const [name, setName] = useState(() => (mode === "edit" && suite ? suite.name : ""));
   const [labelsText, setLabelsText] = useState(() => (mode === "edit" && suite ? formatReferenceList(suite.labels) : ""));
-  const [parallelEnabled, setParallelEnabled] = useState(() => Boolean(mode === "edit" && suite?.parallel_enabled));
+  const [parallelEnabled, setParallelEnabled] = useState(() => canConfigureParallelAutomation && Boolean(mode === "edit" && suite?.parallel_enabled));
   const [parallelCount, setParallelCount] = useState(() => Math.max(1, Number(mode === "edit" ? suite?.parallel_count || 1 : 1)));
   const [localSelectedIds, setLocalSelectedIds] = useState<string[]>(() => initialSelectedIds);
   const initialSelectedIdsKey = initialSelectedIds.join("::");
@@ -3696,14 +3835,14 @@ function SuiteModal({
     if (mode === "edit" && suite) {
       setName(suite.name);
       setLabelsText(formatReferenceList(suite.labels));
-      setParallelEnabled(Boolean(suite.parallel_enabled));
+      setParallelEnabled(canConfigureParallelAutomation && Boolean(suite.parallel_enabled));
       setParallelCount(Math.max(1, Number(suite.parallel_count || 1)));
       setLocalSelectedIds(initialSelectedIds);
       return;
     }
 
     setLocalSelectedIds((current) => current.filter((testCaseId) => availableCaseIdSet.has(testCaseId)));
-  }, [availableCaseIdSet, initialSelectedIdsKey, mode, suite?.id, suite?.labels, suite?.name, suite?.parallel_enabled, suite?.parallel_count]);
+  }, [availableCaseIdSet, canConfigureParallelAutomation, initialSelectedIdsKey, mode, suite?.id, suite?.labels, suite?.name, suite?.parallel_enabled, suite?.parallel_count]);
 
   return (
     <div className="modal-backdrop" onClick={() => !isSaving && onClose()} role="presentation">
@@ -3736,8 +3875,8 @@ function SuiteModal({
             onSubmit({
               name,
               labels: parseReferenceList(labelsText),
-              parallel_enabled: parallelEnabled,
-              parallel_count: parallelEnabled ? parallelCount : 1,
+              parallel_enabled: canConfigureParallelAutomation && parallelEnabled,
+              parallel_count: canConfigureParallelAutomation && parallelEnabled ? parallelCount : 1,
               selectedIds: localSelectedIds
             });
           }}
@@ -3752,29 +3891,31 @@ function SuiteModal({
                 value={labelsText}
                 onChange={setLabelsText}
               />
-              <FormField label="Suite parallel execution">
-                <div className="execution-parallel-control">
-                  <label>
-                    <input checked={parallelEnabled} onChange={(event) => setParallelEnabled(event.target.checked)} type="checkbox" />
-                    <span>Run this suite in parallel</span>
-                  </label>
-                  <input
-                    aria-label="Suite parallel count"
-                    disabled={!parallelEnabled}
-                    max={50}
-                    min={1}
-                    onChange={(event) => setParallelCount(Math.max(1, Number(event.target.value) || 1))}
-                    type="number"
-                    value={parallelCount}
-                  />
-                </div>
-              </FormField>
+              {canConfigureParallelAutomation ? (
+                <FormField label="Suite parallel execution">
+                  <div className="execution-parallel-control">
+                    <label>
+                      <input checked={parallelEnabled} onChange={(event) => setParallelEnabled(event.target.checked)} type="checkbox" />
+                      <span>Run this suite in parallel</span>
+                    </label>
+                    <input
+                      aria-label="Suite parallel count"
+                      disabled={!parallelEnabled}
+                      max={50}
+                      min={1}
+                      onChange={(event) => setParallelCount(Math.max(1, Number(event.target.value) || 1))}
+                      type="number"
+                      value={parallelCount}
+                    />
+                  </div>
+                </FormField>
+              ) : null}
             </div>
 
             <div className="suite-modal-picker-shell">
               <SuiteCasePicker
                 cases={appTypeCases}
-                description="Check the cases that belong in this suite, then use the up and down arrows to set the saved order."
+                description=""
                 emptyMessage="No test cases available in this app type yet."
                 heading="App type test cases"
                 moduleLabelByCaseId={moduleLabelByCaseId}

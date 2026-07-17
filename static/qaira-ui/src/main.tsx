@@ -2,6 +2,7 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 import { view } from "@forge/bridge";
 import { App } from "./App";
+import { rememberAtlassianSiteUrl } from "./lib/jiraBrowseUrl";
 import { syncWorkspaceThemeFromJira } from "./lib/workspacePreferences";
 import "./styles.css";
 import "./dark-theme.css";
@@ -22,6 +23,14 @@ void view.theme.enable()
       message: error instanceof Error ? error.message : String(error)
     });
     syncWorkspaceThemeFromJira();
+  });
+
+void view.getContext()
+  .then((context) => rememberAtlassianSiteUrl(context.siteUrl))
+  .catch((error) => {
+    console.warn("Qaira could not resolve the Jira site URL from Forge context.", {
+      message: error instanceof Error ? error.message : String(error)
+    });
   });
 
 ReactDOM.createRoot(document.getElementById("root")!).render(

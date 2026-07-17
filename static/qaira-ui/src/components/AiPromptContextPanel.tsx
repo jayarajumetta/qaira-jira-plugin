@@ -39,10 +39,12 @@ export function AiPromptContextPanel({
   const [contextFiles, setContextFiles] = useState<FileList | null>(null);
   const [isBuildingContext, setIsBuildingContext] = useState(false);
   const [contextMessage, setContextMessage] = useState("");
+  const [contextMessageTone, setContextMessageTone] = useState<"info" | "warning">("info");
 
   const buildSmartContext = async () => {
     setIsBuildingContext(true);
     setContextMessage("");
+    setContextMessageTone("info");
 
     try {
       const query = requirements.slice(0, 8).map((item) => item.title).filter(Boolean).join(" ");
@@ -50,6 +52,11 @@ export function AiPromptContextPanel({
         ? await api.knowledgeRepo.contextPackage(projectId, { app_type_id: appTypeId, query })
         : { knowledge: [] };
       const fileContext = await buildFileContextSection(contextFiles);
+      if (fileContext.overLimit) {
+        setContextMessageTone("warning");
+        setContextMessage(`Attachment limit exceeded. ${fileContext.blocked.join(" ")}`);
+        return;
+      }
       onAdditionalContextChange(mergeAiContextPack(additionalContext, [
         "QAira smart context pack: use this material as supporting evidence and preserve human review before applying changes.",
         buildRequirementContextSection(requirements),
@@ -59,10 +66,11 @@ export function AiPromptContextPanel({
       setContextMessage([
         requirements.length ? `${requirements.length} requirement${requirements.length === 1 ? "" : "s"}` : "",
         `${(knowledgePackage.knowledge || []).length} knowledge item${(knowledgePackage.knowledge || []).length === 1 ? "" : "s"}`,
-        fileContext.section ? "file context" : "",
+        fileContext.section ? `file context compressed ${fileContext.totalOriginalChars.toLocaleString()}→${fileContext.totalPackedChars.toLocaleString()} chars` : "",
         fileContext.skipped.length ? `Skipped ${fileContext.skipped.length}` : ""
       ].filter(Boolean).join(" · "));
     } catch (error) {
+      setContextMessageTone("warning");
       setContextMessage(error instanceof Error ? error.message : "Unable to build smart context.");
     } finally {
       setIsBuildingContext(false);
@@ -108,7 +116,7 @@ export function AiPromptContextPanel({
             <span>{isBuildingContext ? "Packing..." : "Add smart context"}</span>
           </button>
         </div>
-        {contextMessage ? <span className="ai-smart-context-note">{contextMessage}</span> : null}
+        {contextMessage ? <span className={contextMessageTone === "warning" ? "ai-smart-context-note is-warning" : "ai-smart-context-note"}>{contextMessage}</span> : null}
       </div>
 
       <FormField label="Prompt copy">

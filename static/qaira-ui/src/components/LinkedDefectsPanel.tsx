@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useState } from "react";
-import { BugIcon, SearchIcon } from "./AppIcons";
+import { BugIcon, ClearSelectionIcon, SearchIcon, SelectAllIcon } from "./AppIcons";
 import { LoadingState } from "./LoadingState";
 import { StatusBadge } from "./StatusBadge";
 import { api } from "../lib/api";
@@ -26,6 +26,7 @@ export function LinkedDefectsPanel({
   const queryClient = useQueryClient();
   const [searchTerm, setSearchTerm] = useState("");
   const [submittedSearch, setSubmittedSearch] = useState<string | null>(null);
+  const [statusFilter, setStatusFilter] = useState("all");
   const [selectedIds, setSelectedIds] = useState<string[]>(initialDefects.map((item) => item.id));
   const linkedDefectsQuery = useQuery({
     queryKey: ["linked-defects", subject, itemId],
@@ -64,11 +65,18 @@ export function LinkedDefectsPanel({
       link_source: selectedIds.includes(item.id) ? "manual" : undefined,
       created_at: item.created_at
     }));
-    return Array.from(byId.values()).sort((left, right) => {
+    return Array.from(byId.values()).filter((item) => statusFilter === "all" || String(item.status || "open") === statusFilter).sort((left, right) => {
       const linkedOrder = Number(selectedIds.includes(right.id)) - Number(selectedIds.includes(left.id));
       return linkedOrder || left.title.localeCompare(right.title);
     });
-  }, [defectSearchQuery.data, initialDefects, linkedDefects, selectedIds]);
+  }, [defectSearchQuery.data, initialDefects, linkedDefects, selectedIds, statusFilter]);
+  const statusOptions = useMemo(
+    () => Array.from(new Set([...initialDefects, ...linkedDefects, ...(defectSearchQuery.data || []).map((item) => ({ status: item.status }))].map((item) => item.status || "open"))).sort((left, right) => left.localeCompare(right)),
+    [defectSearchQuery.data, initialDefects, linkedDefects]
+  );
+  const visibleDefectIds = defects.map((defect) => defect.id);
+  const areAllVisibleDefectsSelected = visibleDefectIds.length > 0 && visibleDefectIds.every((defectId) => selectedIds.includes(defectId));
+  const hasActiveFilters = statusFilter !== "all" || searchTerm.trim().length > 0 || submittedSearch !== null;
 
   const saveLinks = async () => {
     await replaceLinks.mutateAsync(selectedIds);
@@ -82,7 +90,7 @@ export function LinkedDefectsPanel({
   return (
     <div className="linked-defects-panel">
       <div className="traceability-search-row">
-        <div className="traceability-search-input">
+        <label className="traceability-search-input">
           <SearchIcon />
           <input
             onChange={(event) => setSearchTerm(event.target.value)}
@@ -95,10 +103,54 @@ export function LinkedDefectsPanel({
             placeholder="Search Jira bugs"
             value={searchTerm}
           />
-        </div>
+        </label>
         <button className="ghost-button" onClick={() => setSubmittedSearch(searchTerm.trim())} type="button">
           <SearchIcon />
           <span>Search</span>
+        </button>
+        <label className="requirement-link-filter-field">
+          <span>Status</span>
+          <select
+            aria-label="Filter linked bugs by status"
+            value={statusFilter}
+            onChange={(event) => setStatusFilter(event.target.value)}
+          >
+            <option value="all">All statuses</option>
+            {statusOptions.map((status) => (
+              <option key={status} value={status}>{status}</option>
+            ))}
+          </select>
+        </label>
+        <button
+          className="ghost-button"
+          disabled={!canUpdate || !visibleDefectIds.length || areAllVisibleDefectsSelected}
+          onClick={() => setSelectedIds((current) => [...new Set([...current, ...visibleDefectIds])])}
+          type="button"
+        >
+          <SelectAllIcon />
+          <span>Select all</span>
+        </button>
+        <button
+          className="ghost-button"
+          disabled={!canUpdate || !selectedIds.length}
+          onClick={() => setSelectedIds([])}
+          type="button"
+        >
+          <ClearSelectionIcon />
+          <span>Clear</span>
+        </button>
+        <button
+          className="ghost-button"
+          disabled={!hasActiveFilters}
+          onClick={() => {
+            setSearchTerm("");
+            setSubmittedSearch(null);
+            setStatusFilter("all");
+          }}
+          type="button"
+        >
+          <ClearSelectionIcon />
+          <span>Clear filters</span>
         </button>
         <button
           className="primary-button"

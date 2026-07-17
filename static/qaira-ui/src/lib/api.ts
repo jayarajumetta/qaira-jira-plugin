@@ -11,7 +11,10 @@ import type {
   AiDesignImageInput,
   AiDesignPreviewResponse,
   AiPromptTemplate,
+  AiRequirementDescriptionRephraseResponse,
+  AiRichTextRephraseResponse,
   AiStepRephraseResponse,
+  AiTestDataGenerationPreviewResponse,
   AiTestCaseGenerationJob,
   AutomationBuildResponse,
   AutomationLearningCacheEntry,
@@ -72,7 +75,95 @@ import type { ExecutionStartResponse } from "./executionStartSummary";
 import type { ExecutionAiAnalysis } from "./executionLogs";
 import { appendCurrentProjectScope } from "./currentScope";
 
+type AiRequirementCreationSuggestion = {
+  client_id: string;
+  title: string;
+  description: string;
+  external_references: string[];
+  priority: number;
+  status: string;
+  acceptance_criteria: string[];
+  risks: string[];
+  open_questions: string[];
+  change_summary: string[];
+  quality_score: number;
+  rationale: string;
+};
+
+type AiRequirementCreationPreviewResponse = {
+  requirement: null;
+  integration: { id: string; name: string; type: string; model?: string | null } | null;
+  suggestion: AiRequirementCreationSuggestion & { client_id?: string };
+  requirements: AiRequirementCreationSuggestion[];
+  generated: number;
+  fallback_used: boolean;
+  fallback_reason?: string | null;
+  status?: string;
+};
+
+type AiRequirementGenerationJobResponse = Partial<AiRequirementCreationPreviewResponse> & {
+  id: string;
+  job_id?: string;
+  queued?: boolean;
+  project_id: string;
+  status: "queued" | "running" | "completed" | "failed" | string;
+  input_payload?: Record<string, unknown>;
+  last_error?: string | null;
+  created_at?: string;
+  started_at?: string | null;
+  completed_at?: string | null;
+  updated_at?: string;
+};
+
 const SESSION_KEY = "qaira.session";
+const CLIENT_GET_CACHE_TTL_MS = 1_500;
+const CLIENT_GET_CACHE_MAX_ENTRIES = 120;
+
+const inFlightClientRequests = new Map<string, Promise<unknown>>();
+const clientGetResponseCache = new Map<string, { expiresAt: number; value: unknown }>();
+export const qairaAuthSessionEvents = {
+  refresh: "qaira-auth-session-refresh"
+} as const;
+
+const stableStringify = (value: unknown): string => {
+  if (Array.isArray(value)) {
+    return `[${value.map(stableStringify).join(",")}]`;
+  }
+
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableStringify((value as Record<string, unknown>)[key])}`).join(",")}}`;
+  }
+
+  return JSON.stringify(value);
+};
+
+const rememberClientGetResponse = (key: string, value: unknown) => {
+  clientGetResponseCache.set(key, {
+    expiresAt: Date.now() + CLIENT_GET_CACHE_TTL_MS,
+    value
+  });
+
+  while (clientGetResponseCache.size > CLIENT_GET_CACHE_MAX_ENTRIES) {
+    const oldestKey = clientGetResponseCache.keys().next().value;
+    if (!oldestKey) break;
+    clientGetResponseCache.delete(oldestKey);
+  }
+};
+
+const readClientGetResponse = (key: string) => {
+  const cached = clientGetResponseCache.get(key);
+
+  if (!cached) {
+    return undefined;
+  }
+
+  if (cached.expiresAt <= Date.now()) {
+    clientGetResponseCache.delete(key);
+    return undefined;
+  }
+
+  return cached.value;
+};
 
 async function ensureJiraResponse(response: Response, action: string) {
   if (response.ok) {
@@ -143,8 +234,52 @@ type IssuePayload = {
   sprint?: string;
   fix_version?: string;
   release?: string;
+  additional_fields?: Record<string, unknown>;
   expected_revision?: number;
 };
+
+export type JiraCreateFieldMetadata = {
+  id: string;
+  key?: string;
+  name: string;
+  required: boolean;
+  has_default_value: boolean;
+  schema?: {
+    type?: string;
+    items?: string;
+    custom?: string;
+    customId?: number;
+  };
+  operations?: string[];
+  allowed_values?: Array<{
+    id?: string;
+    key?: string;
+    name?: string;
+    value?: string;
+    accountId?: string;
+    displayName?: string;
+    label?: string;
+  }>;
+};
+
+export type JiraIssueCreateMetadata = {
+  project_id: string;
+  project_key: string;
+  issue_type_id: string;
+  issue_type_name: string;
+  qaira_core_field_ids: string[];
+  required_fields: JiraCreateFieldMetadata[];
+  core_fields: JiraCreateFieldMetadata[];
+  fields: JiraCreateFieldMetadata[];
+  strategy?: {
+    requirements_source: string;
+    bugs_source: string;
+    synced_fields: string[];
+    note: string;
+  };
+};
+
+export type JiraBugCreateMetadata = JiraIssueCreateMetadata;
 
 type ForgeBlobPayload = {
   __qaira_blob__: true;
@@ -172,6 +307,50 @@ export const sessionStorage = {
   }
 };
 
+let qairaSessionRefreshPromise: Promise<SessionPayload> | null = null;
+
+function cleanForgeInvocationError(error: unknown, fallback: string) {
+  const message = error instanceof Error ? error.message : String(error || fallback);
+  return message.replace(/^There was an error invoking the function\s*-?\s*/i, "");
+}
+
+function requestPathname(rawPath: string) {
+  try {
+    return new URL(rawPath, "https://qaira.local").pathname;
+  } catch {
+    return rawPath.split("?")[0] || "/";
+  }
+}
+
+function isRecoverableAuthenticationError(message: string) {
+  if (/QAIRA_PERMISSION_DENIED|JIRA_PERMISSION_DENIED|permission is required|permission denied/i.test(message)) {
+    return false;
+  }
+
+  return /Authentication Required|Unauthenticated|Unauthorized|AUTHENTICATION_REQUIRED|\b401\b/i.test(message);
+}
+
+async function refreshQairaSession() {
+  if (!qairaSessionRefreshPromise) {
+    qairaSessionRefreshPromise = (async () => {
+      const session = (await invoke("qairaApi", {
+        path: appendCurrentProjectScope("/auth/session"),
+        method: "GET",
+        body: {},
+        headers: {}
+      })) as SessionPayload;
+      sessionStorage.write(session);
+      clientGetResponseCache.clear();
+      window.dispatchEvent(new CustomEvent(qairaAuthSessionEvents.refresh, { detail: session }));
+      return session;
+    })().finally(() => {
+      qairaSessionRefreshPromise = null;
+    });
+  }
+
+  return qairaSessionRefreshPromise;
+}
+
 function normalizeBody(body: BodyInit | null | undefined): unknown {
   if (body === undefined || body === null) return undefined;
   if (typeof body === "string") {
@@ -186,30 +365,100 @@ function normalizeBody(body: BodyInit | null | undefined): unknown {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const method = String(init?.method || "GET").toUpperCase();
+  const body = normalizeBody(init?.body);
+  const headers = init?.headers ? Object.fromEntries(new Headers(init.headers).entries()) : {};
+  const scopedPath = appendCurrentProjectScope(path);
+  const authRoute = requestPathname(scopedPath).startsWith("/auth/");
+  const canReuseRequest = method === "GET";
+  const requestKey = canReuseRequest
+    ? stableStringify({ body, headers, method, path: scopedPath })
+    : "";
+
+  if (canReuseRequest) {
+    const cached = readClientGetResponse(requestKey);
+
+    if (cached !== undefined) {
+      return cached as T;
+    }
+
+    const pending = inFlightClientRequests.get(requestKey);
+
+    if (pending) {
+      return (await pending) as T;
+    }
+  }
+
+  const executeRequest = async (allowAuthRetry = true): Promise<T> => {
+    try {
+      return (await invoke("qairaApi", {
+        path: scopedPath,
+        method,
+        body,
+        headers
+      })) as T;
+    } catch (err) {
+      const message = cleanForgeInvocationError(err, "Qaira request failed");
+      if (allowAuthRetry && !authRoute && isRecoverableAuthenticationError(message)) {
+        await refreshQairaSession();
+        return executeRequest(false);
+      }
+      throw new Error(message);
+    }
+  };
+
+  const pendingRequest = executeRequest();
+
+  if (canReuseRequest) {
+    inFlightClientRequests.set(requestKey, pendingRequest);
+  }
+
   try {
-    const scopedPath = appendCurrentProjectScope(path);
-    return (await invoke("qairaApi", {
-      path: scopedPath,
-      method: String(init?.method || "GET").toUpperCase(),
-      body: normalizeBody(init?.body),
-      headers: init?.headers ? Object.fromEntries(new Headers(init.headers).entries()) : {}
-    })) as T;
+    const response = await pendingRequest;
+
+    if (canReuseRequest) {
+      rememberClientGetResponse(requestKey, response);
+    } else {
+      clientGetResponseCache.clear();
+    }
+
+    return response;
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err || "Qaira request failed");
-    throw new Error(message.replace(/^There was an error invoking the function\s*-?\s*/i, ""));
+    throw new Error(cleanForgeInvocationError(err, "Qaira request failed"));
+  } finally {
+    if (canReuseRequest) {
+      inFlightClientRequests.delete(requestKey);
+    }
   }
 }
 
 async function requestBlob(path: string, init?: RequestInit): Promise<Blob> {
+  const scopedPath = appendCurrentProjectScope(path);
+  const method = String(init?.method || "GET").toUpperCase();
+  const body = normalizeBody(init?.body);
+  const headers = init?.headers ? Object.fromEntries(new Headers(init.headers).entries()) : {};
+  const authRoute = requestPathname(scopedPath).startsWith("/auth/");
+  const executeRequest = async (allowAuthRetry = true): Promise<ForgeBlobPayload> => {
+    try {
+      return (await invoke("qairaApi", {
+        path: scopedPath,
+        method,
+        body,
+        headers,
+        responseType: "blob"
+      })) as ForgeBlobPayload;
+    } catch (err) {
+      const message = cleanForgeInvocationError(err, "Qaira download failed");
+      if (allowAuthRetry && !authRoute && isRecoverableAuthenticationError(message)) {
+        await refreshQairaSession();
+        return executeRequest(false);
+      }
+      throw new Error(message);
+    }
+  };
+
   try {
-    const scopedPath = appendCurrentProjectScope(path);
-    const payload = (await invoke("qairaApi", {
-      path: scopedPath,
-      method: String(init?.method || "GET").toUpperCase(),
-      body: normalizeBody(init?.body),
-      headers: init?.headers ? Object.fromEntries(new Headers(init.headers).entries()) : {},
-      responseType: "blob"
-    })) as ForgeBlobPayload;
+    const payload = await executeRequest();
 
     if (!payload?.__qaira_blob__) {
       throw new Error(`Qaira did not return a downloadable artifact for ${path}`);
@@ -220,8 +469,7 @@ async function requestBlob(path: string, init?: RequestInit): Promise<Blob> {
     for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
     return new Blob([bytes], { type: payload.mimeType || "application/octet-stream" });
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err || "Qaira download failed");
-    throw new Error(message.replace(/^There was an error invoking the function\s*-?\s*/i, ""));
+    throw new Error(cleanForgeInvocationError(err, "Qaira download failed"));
   }
 }
 
@@ -236,7 +484,15 @@ type BatchQueueResponse = {
   split_count?: number;
   queued: boolean;
   status: string;
+  count?: number;
+  skipped?: Array<{ id?: string; code?: string; message?: string }>;
   records?: Array<TestCase & { steps?: TestStep[] }>;
+};
+
+type DashboardStyledReportPayload = {
+  rendered_snapshot_data_url?: string;
+  rendered_snapshot_name?: string;
+  rendered_snapshot_captured_at?: string;
 };
 
 type TestCaseImportBatchInput = {
@@ -329,7 +585,19 @@ export const api = {
   },
   ai: {
     qualityInsights: (query: { project_id: string; release?: string }) =>
-      request<QualityInsightPreviewResponse>(`/ai/quality-insights${toQueryString(query)}`)
+      request<QualityInsightPreviewResponse>(`/ai/quality-insights${toQueryString(query)}`),
+    rephraseRichText: (input: {
+      project_id: string;
+      content: string;
+      content_html?: string;
+      entity_type?: string;
+      entity_title?: string;
+      field_label?: string;
+      aria_label?: string;
+    }) => request<AiRichTextRephraseResponse>("/ai/rich-text-rephrase", {
+      method: "POST",
+      body: JSON.stringify(input)
+    })
   },
   analytics: {
     query: (input: { project_id: string; jql: string; gadget: QualityDashboardGadget; limit?: number }) =>
@@ -345,6 +613,15 @@ export const api = {
       request<QualityDashboard>("/quality-dashboards", { method: "POST", body: JSON.stringify(input) }),
     update: (id: string, input: Partial<QualityDashboard>) =>
       request<QualityDashboard>(`/quality-dashboards/${id}`, { method: "PUT", body: JSON.stringify(input) }),
+    downloadReportPdf: (id: string, input?: DashboardStyledReportPayload) =>
+      input?.rendered_snapshot_data_url
+        ? requestBlob(`/quality-dashboards/${id}/report.pdf`, { method: "POST", body: JSON.stringify(input) })
+        : requestBlob(`/quality-dashboards/${id}/report.pdf`),
+    shareReport: (id: string, input: { recipients: string[] } & DashboardStyledReportPayload) =>
+      request<{ sent: boolean; recipients: number }>(`/quality-dashboards/${id}/share-report`, {
+        method: "POST",
+        body: JSON.stringify(input)
+      }),
     delete: (id: string) => request<{ deleted: boolean }>(`/quality-dashboards/${id}`, { method: "DELETE" })
   },
   attachments: {
@@ -488,6 +765,8 @@ export const api = {
   notifications: {
     list: (query?: { status?: "unread" | "read" | string }) =>
       request<AppNotification[]>(`/notifications${toQueryString(query)}`),
+    realtimeToken: () =>
+      request<{ token: string; expires_at: number }>("/notifications/realtime-token"),
     markRead: (id: string) =>
       request<{ updated: boolean }>(`/notifications/${id}/read`, { method: "PUT" }),
     markAllRead: () =>
@@ -538,12 +817,37 @@ export const api = {
   requirements: {
     list: (query?: { project_id?: string; status?: string; priority?: number; page_size?: number; limit?: number; cursor?: string; projection?: "summary" | "detail" }) =>
       request<Requirement[]>(`/requirements${toQueryString(query)}`),
-    create: (input: { project_id: string; title: string; description?: string; external_references?: string[]; labels?: string[]; sprint?: string; fix_version?: string; release?: string; iteration_id?: string; priority?: number; status?: string }) =>
-      request<{ id: string }>("/requirements", { method: "POST", body: JSON.stringify(input) }),
+    createMetadata: (query?: { project_id?: string }) =>
+      request<JiraIssueCreateMetadata>(`/requirements/create-metadata${toQueryString(query)}`),
+    create: (input: { project_id: string; title: string; description?: string; external_references?: string[]; labels?: string[]; sprint?: string; fix_version?: string; release?: string; iteration_id?: string; priority?: number; status?: string; additional_fields?: Record<string, unknown> }) =>
+      request<{ id: string; status_warning?: { code: string; message: string; requested_status?: string | null; current_status?: string | null; issue_key?: string | null } }>("/requirements", { method: "POST", body: JSON.stringify(input) }),
     get: (id: string, query?: { project_id?: string }) =>
       request<Requirement>(`/requirements/${id}${toQueryString(query)}`),
     previewImpact: (id: string, input: { project_id: string; proposed_change?: Record<string, unknown> }) =>
       request<RequirementImpactPreviewResponse>(`/requirements/${id}/ai-impact-preview`, {
+        method: "POST",
+        body: JSON.stringify(input)
+      }),
+    rephraseDescription: (input: {
+      project_id: string;
+      integration_id?: string;
+      description?: string;
+      description_html?: string;
+      requirement?: {
+        id?: string | null;
+        display_id?: string | null;
+        title?: string | null;
+        status?: string | null;
+        priority?: number | null;
+        labels?: string[];
+        sprint?: string | null;
+        fix_version?: string | null;
+        release?: string | null;
+        iteration_id?: string | null;
+        external_references?: string[];
+      };
+    }) =>
+      request<AiRequirementDescriptionRephraseResponse>("/requirements/ai-description-rephrase", {
         method: "POST",
         body: JSON.stringify(input)
       }),
@@ -557,27 +861,20 @@ export const api = {
         method: "POST",
         body: JSON.stringify(input)
       }),
-    previewCreation: (input: { project_id: string; integration_id?: string; additional_context?: string; external_links?: string[]; images?: AiDesignImageInput[]; priority?: number; status?: string }) =>
-      request<{
-        requirement: null;
-        integration: { id: string; name: string; type: string; model?: string | null } | null;
-        suggestion: {
-          title: string;
-          description: string;
-          external_references: string[];
-          priority: number;
-          status: string;
-          acceptance_criteria: string[];
-          risks: string[];
-          open_questions: string[];
-          change_summary: string[];
-        };
-        fallback_used: boolean;
-        fallback_reason?: string | null;
-      }>("/requirements/ai-create-preview", {
+    previewCreation: (input: { project_id: string; integration_id?: string; model?: string; additional_context?: string; external_links?: string[]; images?: AiDesignImageInput[]; priority?: number; status?: string; max_requirements?: number }) =>
+      request<AiRequirementCreationPreviewResponse>("/requirements/ai-create-preview", {
         method: "POST",
         body: JSON.stringify(input)
       }),
+    createGenerationJob: (input: { project_id: string; integration_id?: string; model?: string; additional_context?: string; external_links?: string[]; images?: AiDesignImageInput[]; priority?: number; status?: string; max_requirements?: number }) =>
+      request<AiRequirementGenerationJobResponse>("/requirements/ai-create-jobs", {
+        method: "POST",
+        body: JSON.stringify(input)
+      }),
+    getGenerationJob: (id: string, query?: { project_id?: string }) =>
+      request<AiRequirementGenerationJobResponse>(`/requirements/ai-create-jobs/${id}${toQueryString(query)}`),
+    listGenerationJobs: (query?: { project_id?: string; status?: string; limit?: number }) =>
+      request<AiRequirementGenerationJobResponse[]>(`/requirements/ai-create-jobs${toQueryString(query)}`),
     previewDesignedTestCases: (id: string, input: { app_type_id: string; integration_id?: string; max_cases?: number; additional_context?: string; external_links?: string[]; images?: AiDesignImageInput[] }) =>
       request<AiDesignPreviewResponse>(`/requirements/${id}/design-test-cases-preview`, {
         method: "POST",
@@ -588,9 +885,9 @@ export const api = {
         method: "POST",
         body: JSON.stringify(input)
       }),
-    previewOptimization: (id: string, input?: { integration_id?: string; additional_context?: string }) =>
+    previewOptimization: (id: string, input?: { integration_id?: string; model?: string; additional_context?: string; external_links?: string[]; images?: AiDesignImageInput[]; requirement_id?: string; selected_requirement_id?: string; single_requirement_only?: boolean; requirement_context?: Record<string, unknown> }) =>
       request<{
-        requirement: { id: string; title: string };
+        requirement: { id: string; title: string; description?: string; status?: string; priority?: number; external_references?: string[] };
         integration: { id: string; name: string; type: string; model?: string | null } | null;
         suggestion: {
           title: string;
@@ -654,6 +951,8 @@ export const api = {
       request<Issue[]>(`/feedback${toQueryString(query)}`),
     get: (id: string, query?: { project_id?: string }) =>
       request<Issue>(`/feedback/${id}${toQueryString(query)}`),
+    createMetadata: (query?: { project_id?: string }) =>
+      request<JiraBugCreateMetadata>(`/feedback/create-metadata${toQueryString(query)}`),
     create: (input: IssuePayload) =>
       request<{ id: string }>("/feedback", { method: "POST", body: JSON.stringify(input) }),
     previewAiDraft: (input: {
@@ -780,10 +1079,10 @@ export const api = {
       request<{ id: string }>("/test-suites", { method: "POST", body: JSON.stringify(input) }),
     update: (id: string, input: Partial<{ name: string; labels: string[]; parameter_values: Record<string, string>; parallel_enabled: boolean; parallel_count: number; expected_revision: number }>) =>
       request<{ updated: boolean; revision: number }>(`/test-suites/${id}`, { method: "PUT", body: JSON.stringify(input) }),
-    assignTestCases: (id: string, test_case_ids: string[], expected_revision?: number) =>
+    assignTestCases: (id: string, test_case_ids: string[], expected_revision?: number, append = true) =>
       request<{ updated: boolean; assigned: number; revision: number }>(`/test-suites/${id}/assign-test-cases`, {
         method: "PUT",
-        body: JSON.stringify({ test_case_ids, expected_revision })
+        body: JSON.stringify({ test_case_ids, expected_revision, append })
       }),
     delete: (id: string) => request<{ deleted: boolean }>(`/test-suites/${id}`, { method: "DELETE" })
   },
@@ -1057,12 +1356,12 @@ export const api = {
         method: "POST",
         body: JSON.stringify(input || {})
       }),
-    queueAutomationGenerator: (id: string, input?: { integration_id?: string; start_url?: string; additional_context?: string; test_environment_id?: string; test_configuration_id?: string; test_data_set_id?: string }) =>
+    queueAutomationGenerator: (id: string, input?: { integration_id?: string; start_url?: string; additional_context?: string; test_environment_id?: string; test_configuration_id?: string; test_data_set_id?: string; ai_requested?: boolean }) =>
       request<BatchQueueResponse>(`/test-cases/${id}/automation/generator-jobs`, {
         method: "POST",
         body: JSON.stringify(input || {})
       }),
-    buildAutomationBatch: (input: { app_type_id: string; test_case_ids?: string[]; integration_id?: string; start_url?: string; additional_context?: string; test_environment_id?: string; test_configuration_id?: string; test_data_set_id?: string; failure_threshold?: number }) =>
+    buildAutomationBatch: (input: { app_type_id: string; test_case_ids?: string[]; integration_id?: string; start_url?: string; additional_context?: string; test_environment_id?: string; test_configuration_id?: string; test_data_set_id?: string; failure_threshold?: number; ai_requested?: boolean }) =>
       request<BatchQueueResponse>("/test-cases/automation/build-batch", {
         method: "POST",
         body: JSON.stringify(input)
@@ -1158,6 +1457,13 @@ export const api = {
       }),
     create: (input: { test_case_id: string; step_order: number; action?: string; expected_result?: string; step_type?: TestStep["step_type"]; automation_code?: string; api_request?: TestStep["api_request"]; group_id?: string; group_name?: string; group_kind?: "local" | "reusable"; reusable_group_id?: string }) =>
       request<{ id: string }>("/test-steps", { method: "POST", body: JSON.stringify(input) }),
+    createMany: (input: {
+      test_case_id: string;
+      insertion_index: number;
+      steps: Array<{ action?: string; expected_result?: string; step_type?: TestStep["step_type"]; automation_code?: string; api_request?: TestStep["api_request"]; group_id?: string; group_name?: string; group_kind?: "local" | "reusable"; reusable_group_id?: string }>;
+    }) => request<{ ids: string[]; created: number }>("/test-steps/bulk", { method: "POST", body: JSON.stringify(input) }),
+    deleteMany: (input: { test_case_id: string; step_ids: string[] }) =>
+      request<{ deleted: number }>("/test-steps/bulk-delete", { method: "POST", body: JSON.stringify(input) }),
     update: (id: string, input: Partial<{ test_case_id: string; step_order: number; action: string; expected_result: string; step_type: TestStep["step_type"] | null; automation_code: string; api_request: TestStep["api_request"]; group_id: string | null; group_name: string | null; group_kind: "local" | "reusable" | null; reusable_group_id: string | null }>) =>
       request<{ updated: boolean }>(`/test-steps/${id}`, { method: "PUT", body: JSON.stringify(input) }),
     reorder: (test_case_id: string, step_ids: string[]) =>
@@ -1223,6 +1529,8 @@ export const api = {
       request<{ id: string }>("/test-data-sets", { method: "POST", body: JSON.stringify(input) }),
     update: (id: string, input: Partial<{ project_id: string; app_type_id: string; name: string; description: string; mode: TestDataSetMode; columns: string[]; rows: Array<Record<string, string>> }>) =>
       request<TestDataSet>(`/test-data-sets/${id}`, { method: "PUT", body: JSON.stringify(input) }),
+    previewAiData: (input: { project_id: string; app_type_id?: string; prompt: string; field_context?: string; sample_count?: number; prompt_instruction?: string; integration_id?: string }) =>
+      request<AiTestDataGenerationPreviewResponse>("/test-data-sets/ai-generate-preview", { method: "POST", body: JSON.stringify(input) }),
     delete: (id: string) => request<{ deleted: boolean }>(`/test-data-sets/${id}`, { method: "DELETE" })
   },
   executions: {
@@ -1276,13 +1584,20 @@ export const api = {
     start: (id: string, input?: { execution_mode?: "local" | "remote"; engine_base_url?: string; expected_revision?: number }) =>
       request<ExecutionStartResponse>(`/executions/${id}/start`, { method: "POST", body: JSON.stringify(input || {}) }),
     downloadReportPdf: (id: string) => requestBlob(`/executions/${id}/report.pdf`),
+    downloadCaseReportPdf: (executionId: string, testCaseId: string) =>
+      requestBlob(`/executions/${executionId}/cases/${testCaseId}/report.pdf`),
     shareReport: (id: string, input: { recipients: string[] }) =>
       request<{ sent: boolean; recipients: number }>(`/executions/${id}/share-report`, {
         method: "POST",
         body: JSON.stringify(input)
       }),
+    shareCaseReport: (executionId: string, testCaseId: string, input: { recipients: string[] }) =>
+      request<{ sent: boolean; recipients: number }>(`/executions/${executionId}/cases/${testCaseId}/share-report`, {
+        method: "POST",
+        body: JSON.stringify(input)
+      }),
     complete: (id: string, input: { status: "completed" | "failed" | "blocked" | "aborted"; expected_revision?: number }) =>
-      request<{ completed: boolean; revision: number }>(`/executions/${id}/complete`, { method: "POST", body: JSON.stringify(input) }),
+      request<{ completed: boolean; revision: number; status: Execution["status"]; counts?: { passed: number; failed: number; blocked: number; running: number; not_run: number; total: number } }>(`/executions/${id}/complete`, { method: "POST", body: JSON.stringify(input) }),
     delete: (id: string) => request<{ deleted: boolean }>(`/executions/${id}`, { method: "DELETE" })
   },
   qualityGates: {

@@ -97,6 +97,11 @@
       "initialValue": { "items": [] }
     },
     {
+      "name": "importJobs",
+      "key": "qaira.data.import-jobs.v1",
+      "initialValue": { "items": [] }
+    },
+    {
       "name": "workspaceTransactions",
       "key": "qaira.data.workspace-transactions.v1",
       "initialValue": { "items": [] }
@@ -155,9 +160,12 @@
       "qaira.automation.step_recording": true,
       "qaira.automation.local_execution": true,
       "qaira.automation.remote_execution": true,
+      "qaira.automation.parallel_execution": true,
       "qaira.automation.object_repository": true,
       "qaira.ai.requirement_design": true,
       "qaira.ai.test_authoring": true,
+      "qaira.ai.test_data_generation": true,
+      "qaira.ai.content_rephrase": true,
       "qaira.ai.bug_triage": true,
       "qaira.ai.automation": true,
       "qaira.ai.execution_analysis": true,

@@ -33,15 +33,16 @@ export function CatalogSelectionControls({
 
   return (
     <>
-      <button
-        className="ghost-button catalog-selection-button"
-        disabled={!canSelectAll || allSelected}
-        onClick={onSelectAll}
-        type="button"
-      >
-        <SelectAllIcon />
-        <span>{selectAllLabel}</span>
-      </button>
+      {canSelectAll && !allSelected ? (
+        <button
+          className="ghost-button catalog-selection-button"
+          onClick={onSelectAll}
+          type="button"
+        >
+          <SelectAllIcon />
+          <span>{selectAllLabel}</span>
+        </button>
+      ) : null}
       {hasSelection ? (
         <button className="ghost-button catalog-selection-button" onClick={onClear} type="button">
           <ClearSelectionIcon />

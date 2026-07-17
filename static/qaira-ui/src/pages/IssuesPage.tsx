@@ -2,7 +2,7 @@ import { FormEvent, useDeferredValue, useEffect, useMemo, useState } from "react
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useSearchParams } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
-import { BugIcon, ExportIcon, SparkIcon } from "../components/AppIcons";
+import { BugIcon, ClearSelectionIcon, ExportIcon, SearchIcon, SelectAllIcon, SparkIcon } from "../components/AppIcons";
 import { AiPromptContextPanel } from "../components/AiPromptContextPanel";
 import { CatalogSelectionControls } from "../components/CatalogSelectionControls";
 import { CatalogSearchFilter } from "../components/CatalogSearchFilter";
@@ -23,13 +23,14 @@ import { useDeleteConfirmation } from "../components/DeleteConfirmationDialog";
 import { useDomainMetadata } from "../hooks/useDomainMetadata";
 import { useFeatureFlags } from "../hooks/useFeatureFlags";
 import { useCurrentProject } from "../hooks/useCurrentProject";
-import { api } from "../lib/api";
-import { appendUniqueImages, parseExternalLinks, readImageFiles } from "../lib/aiDesignStudio";
+import { api, type JiraCreateFieldMetadata } from "../lib/api";
+import { mergeAiReferenceImagesWithinBudget, parseExternalLinks, readImageFiles } from "../lib/aiDesignStudio";
 import { areFeatureFlagsEnabled } from "../lib/featureFlags";
 import { hasPermission } from "../lib/permissions";
+import { getJiraBrowseUrl } from "../lib/jiraBrowseUrl";
 import { readDefaultCatalogViewMode } from "../lib/viewPreferences";
 import { useWorkspaceData } from "../hooks/useWorkspaceData";
-import type { AiBugDraftPreview, AiDesignImageInput, Issue } from "../types";
+import type { AiBugDraftPreview, AiDesignImageInput, Issue, Requirement, TestCase } from "../types";
 
 type IssueDraft = {
   title: string;
@@ -51,6 +52,7 @@ type IssueDraft = {
   labelsText: string;
   sprint: string;
   release: string;
+  additional_fields: Record<string, unknown>;
 };
 
 const DEFAULT_ISSUE_STATUS_OPTIONS = [
@@ -96,11 +98,36 @@ const createEmptyIssueDraft = (defaultStatus = "open"): IssueDraft => ({
   status: defaultStatus,
   labelsText: "",
   sprint: "",
-  release: ""
+  release: "",
+  additional_fields: {}
 });
+
+const parseQueryIdList = (...values: Array<string | null | undefined>) =>
+  Array.from(
+    new Set(
+      values
+        .flatMap((value) => String(value || "").split(/[,\n;|]/))
+        .map((value) => value.trim())
+        .filter(Boolean)
+    )
+  );
 
 const createIssueDraftFromQuery = (searchParams: URLSearchParams, defaultStatus: string): IssueDraft => {
   const runId = searchParams.get("run") || "";
+  const linkedTestCaseIds = parseQueryIdList(
+    searchParams.get("testCase"),
+    searchParams.get("testCaseId"),
+    searchParams.get("case"),
+    searchParams.get("caseId"),
+    searchParams.get("linked_test_case_ids"),
+    searchParams.get("testCases")
+  );
+  const linkedRequirementIds = parseQueryIdList(
+    searchParams.get("requirement"),
+    searchParams.get("requirementId"),
+    searchParams.get("linked_requirement_ids"),
+    searchParams.get("requirements")
+  );
   const title = searchParams.get("title") || (runId ? `Run bug: ${runId}` : "");
   const message = searchParams.get("message") || [
     "Reported from run details.",
@@ -124,14 +151,15 @@ const createIssueDraftFromQuery = (searchParams: URLSearchParams, defaultStatus:
     build: searchParams.get("build") || "",
     jira_bug_key: searchParams.get("jira") || searchParams.get("jiraBugKey") || "",
     linked_test_run_id: runId,
-    linked_test_case_ids: [],
-    linked_requirement_ids: [],
+    linked_test_case_ids: linkedTestCaseIds,
+    linked_requirement_ids: linkedRequirementIds,
     assignee_id: "",
     root_cause: "",
     status: defaultStatus,
     labelsText: "",
     sprint: "",
-    release: ""
+    release: "",
+    additional_fields: {}
   };
 };
 
@@ -160,7 +188,8 @@ const buildIssuePayload = (draft: IssueDraft, userId: string) => ({
   labels: draft.labelsText.split(",").map((value) => value.trim()).filter(Boolean),
   sprint: optionalDraftValue(draft.sprint),
   fix_version: optionalDraftValue(draft.release),
-  release: optionalDraftValue(draft.release)
+  release: optionalDraftValue(draft.release),
+  additional_fields: draft.additional_fields
 });
 
 const csvEscape = (value: unknown) => {
@@ -180,6 +209,107 @@ const downloadCsv = (filename: string, rows: string[][]) => {
   link.remove();
   URL.revokeObjectURL(url);
 };
+
+type ImpactPickerOption = {
+  id: string;
+  displayId?: string | null;
+  title: string;
+  meta?: string;
+};
+
+function ImpactCheckboxPicker({
+  disabled,
+  emptyText,
+  items,
+  label,
+  onChange,
+  placeholder,
+  selectedIds
+}: {
+  disabled?: boolean;
+  emptyText: string;
+  items: ImpactPickerOption[];
+  label: string;
+  onChange: (ids: string[]) => void;
+  placeholder: string;
+  selectedIds: string[];
+}) {
+  const [search, setSearch] = useState("");
+  const normalizedSearch = search.trim().toLowerCase();
+  const visibleItems = useMemo(
+    () =>
+      items.filter((item) =>
+        !normalizedSearch ||
+        [item.id, item.displayId || "", item.title, item.meta || ""]
+          .join(" ")
+          .toLowerCase()
+          .includes(normalizedSearch)
+      ),
+    [items, normalizedSearch]
+  );
+  const visibleIds = visibleItems.map((item) => item.id);
+  const areAllVisibleSelected = visibleIds.length > 0 && visibleIds.every((id) => selectedIds.includes(id));
+  const toggleItem = (id: string, checked: boolean) => {
+    onChange(checked ? [...new Set([...selectedIds, id])] : selectedIds.filter((selectedId) => selectedId !== id));
+  };
+
+  return (
+    <FormField label={label}>
+      <div className="impact-checkbox-picker">
+        <div className="impact-checkbox-toolbar">
+          <label className="impact-checkbox-search">
+            <SearchIcon />
+            <input
+              disabled={disabled}
+              onChange={(event) => setSearch(event.target.value)}
+              placeholder={placeholder}
+              value={search}
+            />
+          </label>
+          <button
+            className="ghost-button compact"
+            disabled={disabled || !visibleIds.length || areAllVisibleSelected}
+            onClick={() => onChange([...new Set([...selectedIds, ...visibleIds])])}
+            type="button"
+          >
+            <SelectAllIcon />
+            <span>Select all</span>
+          </button>
+          <button
+            className="ghost-button compact"
+            disabled={disabled || !selectedIds.length}
+            onClick={() => onChange([])}
+            type="button"
+          >
+            <ClearSelectionIcon />
+            <span>Clear</span>
+          </button>
+        </div>
+        <div className="impact-checkbox-list" role="listbox" aria-label={label}>
+          {visibleItems.map((item) => {
+            const isChecked = selectedIds.includes(item.id);
+
+            return (
+              <label className={isChecked ? "impact-checkbox-option is-selected" : "impact-checkbox-option"} key={item.id}>
+                <input
+                  checked={isChecked}
+                  disabled={disabled}
+                  onChange={(event) => toggleItem(item.id, event.target.checked)}
+                  type="checkbox"
+                />
+                <span>
+                  <strong>{item.title}</strong>
+                  <small>{[item.displayId || item.id, item.meta].filter(Boolean).join(" · ")}</small>
+                </span>
+              </label>
+            );
+          })}
+          {!visibleItems.length ? <div className="empty-state compact">{items.length ? "No records match this search." : emptyText}</div> : null}
+        </div>
+      </div>
+    </FormField>
+  );
+}
 
 export function IssuesPage() {
   const queryClient = useQueryClient();
@@ -222,6 +352,7 @@ export function IssuesPage() {
   const [aiDraftPreview, setAiDraftPreview] = useState<AiBugDraftPreview | null>(null);
   const [aiDraftMessage, setAiDraftMessage] = useState("");
   const [isAiContextCollapsed, setIsAiContextCollapsed] = useState(false);
+  const [hasAppliedBugContextDefaults, setHasAppliedBugContextDefaults] = useState(true);
   const shouldLoadBugContext = isCreating || Boolean(selectedIssueId) || isAiBugDraftOpen;
   const { issues, users, executions, testCases, requirements } = useWorkspaceData({
     roles: false,
@@ -243,6 +374,12 @@ export function IssuesPage() {
     enabled: Boolean(projectId && selectedIssueId),
     staleTime: 30_000
   });
+  const bugCreateMetadataQuery = useQuery({
+    queryKey: ["bug-create-metadata", projectId],
+    queryFn: () => api.issues.createMetadata({ project_id: projectId }),
+    enabled: Boolean(projectId && isCreating),
+    staleTime: 5 * 60_000
+  });
 
   const items = issues.data || [];
   const userItems = users.data || [];
@@ -250,6 +387,66 @@ export function IssuesPage() {
   const testCaseItems = testCases.data || [];
   const requirementItems = requirements.data || [];
   const executionById = useMemo(() => new Map(executionItems.map((execution) => [execution.id, execution])), [executionItems]);
+  const testCaseById = useMemo(() => new Map(testCaseItems.map((testCase) => [testCase.id, testCase])), [testCaseItems]);
+  const requirementIdsFromTestCases = (testCaseIds: string[]) =>
+    Array.from(
+      new Set(
+        testCaseIds.flatMap((testCaseId) => {
+          const testCase = testCaseById.get(testCaseId);
+          return [
+            ...(testCase?.requirement_ids || []),
+            testCase?.requirement_id || ""
+          ].filter(Boolean);
+        })
+      )
+    );
+  const updateDraftLinkedTestCases = (nextIds: string[]) => {
+    const uniqueIds = [...new Set(nextIds)];
+    const autoRequirementIds = requirementIdsFromTestCases(uniqueIds);
+
+    setDraft((current) => ({
+      ...current,
+      linked_test_case_ids: uniqueIds,
+      linked_requirement_ids: [...new Set([...current.linked_requirement_ids, ...autoRequirementIds])]
+    }));
+  };
+  const updateDraftLinkedRequirements = (nextIds: string[]) => {
+    setDraft((current) => ({
+      ...current,
+      linked_requirement_ids: [...new Set(nextIds)]
+    }));
+  };
+  const updateAiLinkedTestCases = (nextIds: string[]) => {
+    const uniqueIds = [...new Set(nextIds)];
+    setAiLinkedCaseIds(uniqueIds);
+    setAiLinkedRequirementIds((current) => [...new Set([...current, ...requirementIdsFromTestCases(uniqueIds)])]);
+  };
+  const testCaseImpactOptions = useMemo<ImpactPickerOption[]>(
+    () =>
+      testCaseItems.map((testCase: TestCase) => ({
+        id: testCase.id,
+        displayId: testCase.display_id,
+        title: testCase.title,
+        meta: [
+          testCase.status || "Draft",
+          (testCase.requirement_ids || []).length || testCase.requirement_id ? `${(testCase.requirement_ids || []).length || 1} requirement${((testCase.requirement_ids || []).length || 1) === 1 ? "" : "s"}` : "No requirement"
+        ].filter(Boolean).join(" · ")
+      })),
+    [testCaseItems]
+  );
+  const requirementImpactOptions = useMemo<ImpactPickerOption[]>(
+    () =>
+      requirementItems.map((requirement: Requirement) => ({
+        id: requirement.id,
+        displayId: requirement.display_id,
+        title: requirement.title,
+        meta: [
+          requirement.status || "Open",
+          requirement.priority ? `P${requirement.priority}` : null
+        ].filter(Boolean).join(" · ")
+      })),
+    [requirementItems]
+  );
   const assigneeLabelById = useMemo(
     () => new Map(userItems.map((user) => [user.id, user.name || user.email || user.id])),
     [userItems]
@@ -309,6 +506,136 @@ export function IssuesPage() {
   const openIssueCount = items.filter((item) => (item.status || defaultIssueStatus) === defaultIssueStatus).length;
   const selectedItem = selectedIssueQuery.data
     || (!selectedIssueQuery.isLoading ? items.find((item) => item.id === selectedIssueId) || null : null);
+  const requiredJiraBugFields = bugCreateMetadataQuery.data?.required_fields || [];
+  const updateAdditionalJiraField = (fieldId: string, value: unknown) => {
+    setDraft((current) => ({
+      ...current,
+      additional_fields: {
+        ...current.additional_fields,
+        [fieldId]: value
+      }
+    }));
+  };
+  const renderAdditionalJiraField = (field: JiraCreateFieldMetadata) => {
+    const schemaType = String(field.schema?.type || "").toLowerCase();
+    const itemType = String(field.schema?.items || "").toLowerCase();
+    const customType = String(field.schema?.custom || "").toLowerCase();
+    const allowedValues = field.allowed_values || [];
+    const value = draft.additional_fields[field.id];
+
+    if (allowedValues.length && (schemaType === "array" || itemType)) {
+      const selectedValues = Array.isArray(value) ? value.map(String) : [];
+      return (
+        <FormField
+          hint={`Required by Jira Bug create metadata. Field ID: ${field.id}`}
+          key={field.id}
+          label={field.name}
+          required
+        >
+          <select
+            multiple
+            onChange={(event) => updateAdditionalJiraField(field.id, Array.from(event.currentTarget.selectedOptions, (option) => option.value))}
+            size={Math.min(6, Math.max(3, allowedValues.length))}
+            value={selectedValues}
+          >
+            {allowedValues.map((option) => (
+              <option key={option.id || option.value || option.name || option.label} value={option.id || option.value || option.name || option.label || ""}>
+                {option.label || option.name || option.value || option.id}
+              </option>
+            ))}
+          </select>
+        </FormField>
+      );
+    }
+
+    if (allowedValues.length) {
+      return (
+        <FormField
+          hint={`Required by Jira Bug create metadata. Field ID: ${field.id}`}
+          key={field.id}
+          label={field.name}
+          required
+        >
+          <select value={String(value || "")} onChange={(event) => updateAdditionalJiraField(field.id, event.target.value)}>
+            <option value="">Select {field.name}</option>
+            {allowedValues.map((option) => (
+              <option key={option.id || option.value || option.name || option.label} value={option.id || option.value || option.name || option.label || ""}>
+                {option.label || option.name || option.value || option.id}
+              </option>
+            ))}
+          </select>
+        </FormField>
+      );
+    }
+
+    if (schemaType === "user") {
+      return (
+        <FormField
+          hint={`Required by Jira Bug create metadata. Field ID: ${field.id}`}
+          key={field.id}
+          label={field.name}
+          required
+        >
+          <select value={String(value || "")} onChange={(event) => updateAdditionalJiraField(field.id, event.target.value)}>
+            <option value="">Select user</option>
+            {userItems.map((user) => (
+              <option key={user.id} value={user.id}>{user.name || user.email || user.id}</option>
+            ))}
+          </select>
+        </FormField>
+      );
+    }
+
+    if (schemaType === "number") {
+      return (
+        <FormField
+          hint={`Required by Jira Bug create metadata. Field ID: ${field.id}`}
+          key={field.id}
+          label={field.name}
+          required
+        >
+          <input type="number" value={String(value || "")} onChange={(event) => updateAdditionalJiraField(field.id, event.target.value)} />
+        </FormField>
+      );
+    }
+
+    if (schemaType === "date" || schemaType === "datetime") {
+      return (
+        <FormField
+          hint={`Required by Jira Bug create metadata. Field ID: ${field.id}`}
+          key={field.id}
+          label={field.name}
+          required
+        >
+          <input type={schemaType === "date" ? "date" : "datetime-local"} value={String(value || "")} onChange={(event) => updateAdditionalJiraField(field.id, event.target.value)} />
+        </FormField>
+      );
+    }
+
+    if (customType.includes(":textarea")) {
+      return (
+        <FormField
+          hint={`Required by Jira Bug create metadata. Field ID: ${field.id}`}
+          key={field.id}
+          label={field.name}
+          required
+        >
+          <textarea rows={4} value={String(value || "")} onChange={(event) => updateAdditionalJiraField(field.id, event.target.value)} />
+        </FormField>
+      );
+    }
+
+    return (
+      <FormField
+        hint={`Required by Jira Bug create metadata. Field ID: ${field.id}`}
+        key={field.id}
+        label={field.name}
+        required
+      >
+        <input value={String(value || "")} onChange={(event) => updateAdditionalJiraField(field.id, event.target.value)} />
+      </FormField>
+    );
+  };
   const syncIssueSearchParams = (issueId?: string | null) => {
     const currentIssueId = searchParams.get("issue") || "";
     const targetIssueId = issueId || "";
@@ -339,7 +666,7 @@ export function IssuesPage() {
       width: 132,
       minWidth: 100,
       sortValue: (item) => item.id,
-      render: (item) => <DisplayIdBadge value={item.id} />
+      render: (item) => <DisplayIdBadge value={item.jira_bug_key || item.id} href={getJiraBrowseUrl(item.jira_bug_key, item.jira_url)} />
     },
     {
       key: "title",
@@ -357,6 +684,7 @@ export function IssuesPage() {
     {
       key: "description",
       label: "Description",
+      defaultVisible: false,
       width: 360,
       minWidth: 200,
       render: (item) => <span className="data-table-description-clamp">{richTextToPlainText(item.message)}</span>
@@ -372,6 +700,7 @@ export function IssuesPage() {
     {
       key: "jira",
       label: "Jira Bug Key",
+      defaultVisible: false,
       width: 150,
       minWidth: 120,
       sortValue: (item) => item.jira_bug_key || "",
@@ -440,9 +769,11 @@ export function IssuesPage() {
   ], [assigneeLabelById, defaultIssueStatus, runLabelById]);
 
   const handleExportIssuesCsv = () => {
+    const selectedItems = filteredItems.filter((item) => selectedActionIssueIds.includes(item.id));
+    if (!selectedItems.length) return;
     downloadCsv("bugs.csv", [
       ["ID", "Bug Title", "Description", "Status", "Jira Bug Key", "Severity", "Priority", "Linked Test Run", "Environment", "Build", "Assignee", "Reporter", "Steps To Reproduce", "Expected Result", "Actual Result", "Root Cause"],
-      ...filteredItems.map((item) => [
+      ...selectedItems.map((item) => [
         item.id,
         item.title,
         richTextToPlainText(item.message),
@@ -471,6 +802,7 @@ export function IssuesPage() {
     setIsCreating(true);
     setSelectedIssueId("");
     setDraft(createIssueDraftFromQuery(searchParams, defaultIssueStatus));
+    setHasAppliedBugContextDefaults(false);
 
     const nextParams = new URLSearchParams(searchParams);
     nextParams.delete("create");
@@ -536,14 +868,32 @@ export function IssuesPage() {
         status: selectedItem.status || defaultIssueStatus,
         labelsText: (selectedItem.labels || []).join(", "),
         sprint: selectedItem.sprint || "",
-        release: selectedItem.fix_version || selectedItem.release || ""
+        release: selectedItem.fix_version || selectedItem.release || "",
+        additional_fields: {}
       });
+      setHasAppliedBugContextDefaults(true);
       return;
     }
 
     setSelectedIssueId("");
     setDraft(emptyDraft);
+    setHasAppliedBugContextDefaults(true);
   }, [defaultIssueStatus, emptyDraft, isCreating, selectedIssueId, selectedItem]);
+
+  useEffect(() => {
+    if (!isCreating || hasAppliedBugContextDefaults || !draft.linked_test_case_ids.length || !testCaseItems.length) {
+      return;
+    }
+
+    const autoRequirementIds = requirementIdsFromTestCases(draft.linked_test_case_ids);
+    if (autoRequirementIds.length) {
+      setDraft((current) => ({
+        ...current,
+        linked_requirement_ids: [...new Set([...current.linked_requirement_ids, ...autoRequirementIds])]
+      }));
+    }
+    setHasAppliedBugContextDefaults(true);
+  }, [draft.linked_test_case_ids, hasAppliedBugContextDefaults, isCreating, testCaseItems]);
 
   const refresh = async () => {
     await Promise.all([
@@ -559,6 +909,7 @@ export function IssuesPage() {
     setIsCreating(true);
     setSelectedIssueId("");
     setDraft(emptyDraft);
+    setHasAppliedBugContextDefaults(true);
     setIsReportMenuOpen(false);
   };
 
@@ -580,7 +931,15 @@ export function IssuesPage() {
   const handleAddAiReferenceImages = async (files: FileList | null) => {
     try {
       const images = await readImageFiles(files);
-      setAiReferenceImages((current) => appendUniqueImages(current, images).slice(0, 8));
+      let budgetMessage = "";
+      setAiReferenceImages((current) => {
+        const result = mergeAiReferenceImagesWithinBudget(current, images);
+        budgetMessage = result.message;
+        return result.images;
+      });
+      if (budgetMessage) {
+        setAiDraftMessage(budgetMessage);
+      }
     } catch (error) {
       setAiDraftMessage(error instanceof Error ? error.message : "Unable to attach the selected reference image.");
     }
@@ -632,6 +991,7 @@ export function IssuesPage() {
       linked_test_case_ids: candidate.linked_test_case_ids,
       linked_requirement_ids: candidate.linked_requirement_ids
     });
+    setHasAppliedBugContextDefaults(false);
     syncIssueSearchParams(null);
     setSelectedIssueId("");
     setIsCreating(true);
@@ -688,6 +1048,12 @@ export function IssuesPage() {
     event.preventDefault();
 
     if (!session?.user.id) {
+      return;
+    }
+
+    if (isCreating && bugCreateMetadataQuery.isLoading) {
+      setMessageTone("success");
+      setMessage("Checking this Jira project's Bug create fields. Try again in a moment.");
       return;
     }
 
@@ -797,32 +1163,24 @@ export function IssuesPage() {
                         ))}
                       </select>
                     </FormField>
-                    <FormField label="Impacted Test Cases">
-                      <select
-                        disabled={previewAiBugDraft.isPending}
-                        multiple
-                        onChange={(event) => setAiLinkedCaseIds(Array.from(event.currentTarget.selectedOptions, (option) => option.value))}
-                        size={5}
-                        value={aiLinkedCaseIds}
-                      >
-                        {testCaseItems.map((testCase) => (
-                          <option key={testCase.id} value={testCase.id}>{[testCase.display_id || testCase.id, testCase.title].filter(Boolean).join(" · ")}</option>
-                        ))}
-                      </select>
-                    </FormField>
-                    <FormField label="Impacted Requirements">
-                      <select
-                        disabled={previewAiBugDraft.isPending}
-                        multiple
-                        onChange={(event) => setAiLinkedRequirementIds(Array.from(event.currentTarget.selectedOptions, (option) => option.value))}
-                        size={5}
-                        value={aiLinkedRequirementIds}
-                      >
-                        {requirementItems.map((requirement) => (
-                          <option key={requirement.id} value={requirement.id}>{[requirement.display_id || requirement.id, requirement.title].filter(Boolean).join(" · ")}</option>
-                        ))}
-                      </select>
-                    </FormField>
+                    <ImpactCheckboxPicker
+                      disabled={previewAiBugDraft.isPending}
+                      emptyText="No test cases are available for this project."
+                      items={testCaseImpactOptions}
+                      label="Impacted Test Cases"
+                      onChange={updateAiLinkedTestCases}
+                      placeholder="Search test cases"
+                      selectedIds={aiLinkedCaseIds}
+                    />
+                    <ImpactCheckboxPicker
+                      disabled={previewAiBugDraft.isPending}
+                      emptyText="No requirements are available for this project."
+                      items={requirementImpactOptions}
+                      label="Impacted Requirements"
+                      onChange={setAiLinkedRequirementIds}
+                      placeholder="Search requirements"
+                      selectedIds={aiLinkedRequirementIds}
+                    />
                   </div>
                 </section>
 
@@ -911,9 +1269,16 @@ export function IssuesPage() {
                 onSelectAll={() => setSelectedActionIssueIds((current) => Array.from(new Set([...current, ...visibleIssueIds])))}
                 selectedCount={selectedActionIssueIds.length}
               />
-              <div className={canUseAiBugTriage ? "issue-report-split" : "issue-report-split is-single"}>
+              <div
+                className={[
+                  "create-run-action-button",
+                  "report-bug-split-action-button",
+                  "issue-report-split",
+                  canUseAiBugTriage ? "" : "is-single"
+                ].filter(Boolean).join(" ")}
+              >
                 <button
-                  className="primary-button catalog-selection-button issue-report-split-main"
+                  className="run-action-main issue-report-split-main"
                   onClick={openManualBugReport}
                   type="button"
                 >
@@ -926,11 +1291,13 @@ export function IssuesPage() {
                       aria-expanded={isReportMenuOpen}
                       aria-haspopup="menu"
                       aria-label="More bug reporting options"
-                      className="primary-button issue-report-split-toggle"
+                      className="run-action-toggle issue-report-split-toggle"
                       onClick={() => setIsReportMenuOpen((current) => !current)}
                       type="button"
                     >
-                      <span aria-hidden="true">▾</span>
+                      <svg aria-hidden="true" fill="none" height="16" viewBox="0 0 24 24" width="16">
+                        <path d="m7 10 5 5 5-5" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" />
+                      </svg>
                     </button>
                     {isReportMenuOpen ? (
                       <div className="issue-report-split-menu" role="menu">
@@ -938,7 +1305,6 @@ export function IssuesPage() {
                           <SparkIcon />
                           <span>
                             <strong>Report Bug using AI</strong>
-                            <small>Draft from intent, context, evidence, test scope, and Jira project knowledge.</small>
                           </span>
                         </button>
                       </div>
@@ -946,10 +1312,12 @@ export function IssuesPage() {
                   </>
                 ) : null}
               </div>
-              <button className="ghost-button catalog-selection-button" disabled={!filteredItems.length} onClick={handleExportIssuesCsv} type="button">
-                <ExportIcon />
-                <span>Export</span>
-              </button>
+              {selectedActionIssueIds.length ? (
+                <button className="ghost-button catalog-selection-button" onClick={handleExportIssuesCsv} type="button">
+                  <ExportIcon />
+                  <span>Export bugs</span>
+                </button>
+              ) : null}
               <CatalogViewToggle onChange={setCatalogViewMode} value={catalogViewMode} />
             </div>
 
@@ -985,7 +1353,7 @@ export function IssuesPage() {
                           />
                           <span className="sr-only">Select bug</span>
                         </label>
-                        <DisplayIdBadge value={item.id} />
+                        <DisplayIdBadge value={item.jira_bug_key || item.id} href={getJiraBrowseUrl(item.jira_bug_key, item.jira_url)} />
                       </div>
                       <div className="tile-card-header">
                         <span className="issue-card-badge">BG</span>
@@ -1043,46 +1411,45 @@ export function IssuesPage() {
             {!isCreating && selectedIssueId && selectedIssueQuery.isLoading ? <LoadingState label="Loading bug details" /> : null}
             {(isCreating || selectedItem) ? (
               <form className="issue-report-form" onSubmit={(event) => void handleSave(event)}>
+                {!isCreating && selectedItem?.jira_bug_key ? (
+                  <div className="requirement-detail-id-row">
+                    <span>Bug ID</span>
+                    <DisplayIdBadge value={selectedItem.jira_bug_key} href={getJiraBrowseUrl(selectedItem.jira_bug_key, selectedItem.jira_url)} />
+                  </div>
+                ) : null}
                 <section className="issue-form-section">
                   <div className="issue-form-section-head">
                     <strong>Bug summary</strong>
-                    <span>Title, classification, ownership, and linked execution context.</span>
                   </div>
                   <div className="issue-form-grid">
                     <FormField label="Title" required>
                       <input required value={draft.title} onChange={(event) => setDraft((current) => ({ ...current, title: event.target.value }))} />
                     </FormField>
-                    <FormField label="Jira Bug Key">
-                      <input disabled placeholder="Assigned by Jira" value={draft.jira_bug_key} />
-                    </FormField>
                   </div>
 
-                  <div className="issue-form-grid issue-form-grid--triple">
-                    <FormField label="Status">
+                  <div className="issue-form-compact-grid issue-form-classification-grid">
+                    <FormField className="form-field--compact-enum bug-field-status" label="Status">
                       <select value={draft.status} onChange={(event) => setDraft((current) => ({ ...current, status: event.target.value }))}>
                         {issueStatusOptions.map((option) => (
                           <option key={option.value} value={option.value}>{option.label}</option>
                         ))}
                       </select>
                     </FormField>
-                    <FormField label="Severity">
+                    <FormField className="form-field--compact-enum bug-field-severity" label="Severity">
                       <select value={draft.severity} onChange={(event) => setDraft((current) => ({ ...current, severity: event.target.value }))}>
                         {ISSUE_SEVERITY_OPTIONS.map((option) => (
                           <option key={option.value || "none"} value={option.value}>{option.label}</option>
                         ))}
                       </select>
                     </FormField>
-                    <FormField label="Priority">
+                    <FormField className="form-field--compact-enum bug-field-priority" label="Priority">
                       <select value={draft.priority} onChange={(event) => setDraft((current) => ({ ...current, priority: event.target.value }))}>
                         {ISSUE_PRIORITY_OPTIONS.map((option) => (
                           <option key={option.value || "none"} value={option.value}>{option.label}</option>
                         ))}
                       </select>
                     </FormField>
-                  </div>
-
-                  <div className="issue-form-grid issue-form-grid--triple">
-                    <FormField label="Assignee">
+                    <FormField className="bug-field-assignee" label="Assignee">
                       <select value={draft.assignee_id} onChange={(event) => setDraft((current) => ({ ...current, assignee_id: event.target.value }))}>
                         <option value="">Unassigned</option>
                         {userItems.map((user) => (
@@ -1090,60 +1457,44 @@ export function IssuesPage() {
                         ))}
                       </select>
                     </FormField>
-                    <FormField label="Environment">
-                      <input placeholder="QA, UAT, iOS 18, Chrome" value={draft.environment} onChange={(event) => setDraft((current) => ({ ...current, environment: event.target.value }))} />
-                    </FormField>
-                    <FormField label="Build">
-                      <input placeholder="2026.07.02" value={draft.build} onChange={(event) => setDraft((current) => ({ ...current, build: event.target.value }))} />
-                    </FormField>
                   </div>
 
-                  <FormField label="Linked Test Run">
-                    <select value={draft.linked_test_run_id} onChange={(event) => setDraft((current) => ({ ...current, linked_test_run_id: event.target.value }))}>
-                      <option value="">No linked run</option>
-                      {draft.linked_test_run_id && !executionById.has(draft.linked_test_run_id) ? (
-                        <option value={draft.linked_test_run_id}>{draft.linked_test_run_id}</option>
-                      ) : null}
-                      {executionItems.map((execution) => (
-                        <option key={execution.id} value={execution.id}>{runLabelById.get(execution.id) || execution.id}</option>
-                      ))}
-                    </select>
-                  </FormField>
+                  <div className="issue-form-compact-grid issue-form-context-grid">
+                    <FormField className="bug-field-environment" label="Environment">
+                      <input placeholder="QA, UAT, iOS 18, Chrome" value={draft.environment} onChange={(event) => setDraft((current) => ({ ...current, environment: event.target.value }))} />
+                    </FormField>
+                    <FormField className="bug-field-build" label="Build">
+                      <input placeholder="2026.07.02" value={draft.build} onChange={(event) => setDraft((current) => ({ ...current, build: event.target.value }))} />
+                    </FormField>
+                    <FormField className="bug-field-linked-run" label="Linked Test Run">
+                      <select value={draft.linked_test_run_id} onChange={(event) => setDraft((current) => ({ ...current, linked_test_run_id: event.target.value }))}>
+                        <option value="">No linked run</option>
+                        {draft.linked_test_run_id && !executionById.has(draft.linked_test_run_id) ? (
+                          <option value={draft.linked_test_run_id}>{draft.linked_test_run_id}</option>
+                        ) : null}
+                        {executionItems.map((execution) => (
+                          <option key={execution.id} value={execution.id}>{runLabelById.get(execution.id) || execution.id}</option>
+                        ))}
+                      </select>
+                    </FormField>
+                  </div>
                   <div className="issue-form-grid issue-form-impact-grid">
-                    <FormField label="Impacted Test Cases">
-                      <select
-                        multiple
-                        onChange={(event) => setDraft((current) => ({
-                          ...current,
-                          linked_test_case_ids: Array.from(event.currentTarget.selectedOptions, (option) => option.value)
-                        }))}
-                        size={Math.min(6, Math.max(3, testCaseItems.length))}
-                        value={draft.linked_test_case_ids}
-                      >
-                        {testCaseItems.map((testCase) => (
-                          <option key={testCase.id} value={testCase.id}>
-                            {[testCase.display_id || testCase.id, testCase.title].filter(Boolean).join(" · ")}
-                          </option>
-                        ))}
-                      </select>
-                    </FormField>
-                    <FormField label="Impacted Requirements">
-                      <select
-                        multiple
-                        onChange={(event) => setDraft((current) => ({
-                          ...current,
-                          linked_requirement_ids: Array.from(event.currentTarget.selectedOptions, (option) => option.value)
-                        }))}
-                        size={Math.min(6, Math.max(3, requirementItems.length))}
-                        value={draft.linked_requirement_ids}
-                      >
-                        {requirementItems.map((requirement) => (
-                          <option key={requirement.id} value={requirement.id}>
-                            {[requirement.display_id || requirement.id, requirement.title].filter(Boolean).join(" · ")}
-                          </option>
-                        ))}
-                      </select>
-                    </FormField>
+                    <ImpactCheckboxPicker
+                      emptyText="No test cases are available for this project."
+                      items={testCaseImpactOptions}
+                      label="Impacted Test Cases"
+                      onChange={updateDraftLinkedTestCases}
+                      placeholder="Search test cases"
+                      selectedIds={draft.linked_test_case_ids}
+                    />
+                    <ImpactCheckboxPicker
+                      emptyText="No requirements are available for this project."
+                      items={requirementImpactOptions}
+                      label="Impacted Requirements"
+                      onChange={updateDraftLinkedRequirements}
+                      placeholder="Search requirements"
+                      selectedIds={draft.linked_requirement_ids}
+                    />
                   </div>
                   <div className="issue-form-grid issue-form-grid--triple">
                     <FormField label="Labels">
@@ -1163,6 +1514,24 @@ export function IssuesPage() {
                     </FormField>
                   </div>
                 </section>
+
+                {isCreating && (bugCreateMetadataQuery.isLoading || requiredJiraBugFields.length) ? (
+                  <section className="issue-form-section">
+                    <div className="issue-form-section-head">
+                      <strong>Jira required fields</strong>
+                      <span>
+                        These fields come from this project’s Jira Bug create screen. Qaira collects them before creating the Bug so Jira validation does not fail after submission.
+                      </span>
+                    </div>
+                    {bugCreateMetadataQuery.isLoading ? (
+                      <LoadingState label="Checking Jira Bug create fields" />
+                    ) : (
+                      <div className="issue-form-grid issue-form-grid--triple">
+                        {requiredJiraBugFields.map(renderAdditionalJiraField)}
+                      </div>
+                    )}
+                  </section>
+                ) : null}
 
                 <section className="issue-form-section">
                   <div className="issue-form-section-head">
@@ -1224,7 +1593,17 @@ export function IssuesPage() {
                   />
                 ) : null}
                 <div className="action-row">
-                  <button className="primary-button" type="submit">{isCreating ? "Save bug" : "Update bug"}</button>
+                  <button
+                    className="primary-button"
+                    disabled={createIssue.isPending || updateIssue.isPending || (isCreating && bugCreateMetadataQuery.isLoading)}
+                    type="submit"
+                  >
+                    {createIssue.isPending || updateIssue.isPending
+                      ? (isCreating ? "Saving…" : "Updating…")
+                      : isCreating && bugCreateMetadataQuery.isLoading
+                        ? "Checking Jira fields…"
+                        : isCreating ? "Save bug" : "Update bug"}
+                  </button>
                   {!isCreating && selectedItem ? (
                     <button
                       className="ghost-button danger"

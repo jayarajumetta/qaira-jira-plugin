@@ -5,7 +5,14 @@ export const AI_CONTEXT_PACK_LIMIT = 18_000;
 const REQUIREMENT_CONTEXT_LIMIT = 7_000;
 const KNOWLEDGE_CONTEXT_LIMIT = 6_000;
 const FILE_CONTEXT_LIMIT = 4_000;
-const FILE_CONTEXT_PER_FILE_LIMIT = 1_600;
+const FILE_CONTEXT_PER_FILE_LIMIT = 1_250;
+const FILE_CONTEXT_MAX_FILES = 5;
+const FILE_CONTEXT_MAX_FILE_BYTES = 1_500_000;
+const FILE_CONTEXT_MAX_TOTAL_BYTES = 3_500_000;
+const FILE_CONTEXT_READ_LIMIT = 180_000;
+const REFERENCE_IMAGE_MAX_COUNT = 6;
+const REFERENCE_IMAGE_MAX_TOTAL_CHARS = 950_000;
+const REFERENCE_IMAGE_MAX_FILE_BYTES = 8_000_000;
 const TEXT_CONTEXT_EXTENSIONS = new Set(["txt", "md", "markdown", "csv", "json", "xml", "yaml", "yml", "feature", "log"]);
 
 const trimToBudget = (value: string, limit: number) => {
@@ -20,9 +27,34 @@ const compactText = (value: unknown) =>
   String(value ?? "")
     .replace(/\r\n/g, "\n")
     .replace(/\r/g, "\n")
+    .replace(/data:[^,\s]+;base64,[A-Za-z0-9+/=]+/g, "[base64 attachment omitted]")
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "")
     .replace(/[ \t]+/g, " ")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
+
+const compressFileTextForPrompt = (value: string, limit: number) => {
+  const text = compactText(value).slice(0, FILE_CONTEXT_READ_LIMIT);
+
+  if (text.length <= limit) {
+    return text;
+  }
+
+  const lines = text
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const importantLines = lines
+    .filter((line) => /(shall|must|should|acceptance|criteria|requirement|risk|error|fail|security|permission|role|admin|audit|api|workflow|boundary|edge|constraint|metric|evidence)/i.test(line))
+    .slice(0, 18);
+  const sampled = [
+    text.slice(0, Math.floor(limit * 0.36)),
+    importantLines.length ? `Key requirement-like lines:\n${importantLines.join("\n")}` : "",
+    text.slice(Math.max(0, text.length - Math.floor(limit * 0.28)))
+  ].filter(Boolean).join("\n...\n");
+
+  return trimToBudget(sampled, limit);
+};
 
 export const buildRequirementContextSection = (requirements: Requirement[]) => {
   if (!requirements.length) {
@@ -90,14 +122,27 @@ const readFileAsText = (file: File) =>
   });
 
 export const buildFileContextSection = async (files: FileList | null) => {
-  const selectedFiles = Array.from(files || []).slice(0, 5);
+  const allFiles = Array.from(files || []);
+  const selectedFiles = allFiles.slice(0, FILE_CONTEXT_MAX_FILES);
 
   if (!selectedFiles.length) {
-    return { section: "", skipped: [] as string[] };
+    return { section: "", skipped: [] as string[], blocked: [] as string[], overLimit: false, included: 0, totalOriginalChars: 0, totalPackedChars: 0 };
   }
 
   const snippets: string[] = [];
   const skipped: string[] = [];
+  const blocked: string[] = [];
+  let totalOriginalChars = 0;
+  let totalPackedChars = 0;
+
+  if (allFiles.length > FILE_CONTEXT_MAX_FILES) {
+    blocked.push(`Select at most ${FILE_CONTEXT_MAX_FILES} context files. Remove ${allFiles.length - FILE_CONTEXT_MAX_FILES} file${allFiles.length - FILE_CONTEXT_MAX_FILES === 1 ? "" : "s"}.`);
+  }
+
+  const selectedBytes = selectedFiles.reduce((sum, file) => sum + file.size, 0);
+  if (selectedBytes > FILE_CONTEXT_MAX_TOTAL_BYTES) {
+    blocked.push(`Selected files are ${(selectedBytes / 1_000_000).toFixed(1)} MB before compression; keep the set under ${(FILE_CONTEXT_MAX_TOTAL_BYTES / 1_000_000).toFixed(1)} MB.`);
+  }
 
   for (const file of selectedFiles) {
     const extension = file.name.split(".").pop()?.toLowerCase() || "";
@@ -110,15 +155,33 @@ export const buildFileContextSection = async (files: FileList | null) => {
       continue;
     }
 
-    if (file.size > 1_500_000) {
-      skipped.push(`${file.name} (larger than 1.5 MB)`);
+    if (file.size > FILE_CONTEXT_MAX_FILE_BYTES) {
+      blocked.push(`${file.name} is ${(file.size / 1_000_000).toFixed(1)} MB; remove or split files larger than ${(FILE_CONTEXT_MAX_FILE_BYTES / 1_000_000).toFixed(1)} MB.`);
+      continue;
+    }
+  }
+
+  if (blocked.length) {
+    return { section: "", skipped, blocked, overLimit: true, included: 0, totalOriginalChars, totalPackedChars };
+  }
+
+  for (const file of selectedFiles) {
+    const extension = file.name.split(".").pop()?.toLowerCase() || "";
+    const isTextLike = file.type.startsWith("text/")
+      || ["application/json", "application/xml", "application/x-yaml"].includes(file.type)
+      || TEXT_CONTEXT_EXTENSIONS.has(extension);
+
+    if (!isTextLike) {
       continue;
     }
 
     try {
-      const text = trimToBudget(compactText(await readFileAsText(file)), FILE_CONTEXT_PER_FILE_LIMIT);
+      const originalText = await readFileAsText(file);
+      totalOriginalChars += originalText.length;
+      const text = compressFileTextForPrompt(originalText, FILE_CONTEXT_PER_FILE_LIMIT);
+      totalPackedChars += text.length;
       if (text) {
-        snippets.push(`File: ${file.name}\n${text}`);
+        snippets.push(`File: ${file.name} (${file.size.toLocaleString()} bytes compressed for prompt)\n${text}`);
       }
     } catch {
       skipped.push(`${file.name} (could not be read)`);
@@ -127,7 +190,12 @@ export const buildFileContextSection = async (files: FileList | null) => {
 
   return {
     section: snippets.length ? trimToBudget(["Attached file context:", ...snippets].join("\n\n"), FILE_CONTEXT_LIMIT) : "",
-    skipped
+    skipped,
+    blocked,
+    overLimit: false,
+    included: snippets.length,
+    totalOriginalChars,
+    totalPackedChars
   };
 };
 
@@ -165,7 +233,7 @@ const loadImage = (url: string) =>
     image.src = url;
   });
 
-const compressImageDataUrl = async (dataUrl: string, maxEdge = 720, quality = 0.35) => {
+const compressImageDataUrl = async (dataUrl: string, maxEdge = 520, quality = 0.28) => {
   const image = await loadImage(dataUrl);
   const scale = Math.min(1, maxEdge / Math.max(image.naturalWidth || image.width, image.naturalHeight || image.height, 1));
   const width = Math.max(1, Math.round((image.naturalWidth || image.width) * scale));
@@ -185,6 +253,10 @@ const compressImageDataUrl = async (dataUrl: string, maxEdge = 720, quality = 0.
 
 export const readImageFiles = async (files: FileList | null) => {
   const collection = Array.from(files || []);
+  const oversized = collection.find((file) => file.size > REFERENCE_IMAGE_MAX_FILE_BYTES);
+  if (oversized) {
+    throw new Error(`${oversized.name} is too large for AI context. Remove it or upload a smaller screenshot.`);
+  }
   const images = await Promise.all(
     collection.map(async (file) => ({
       name: file.name,
@@ -203,6 +275,27 @@ export const appendUniqueImages = (current: AiDesignImageInput[], incoming: AiDe
   });
 
   return Array.from(byUrl.values());
+};
+
+export const mergeAiReferenceImagesWithinBudget = (current: AiDesignImageInput[], incoming: AiDesignImageInput[]) => {
+  const images = appendUniqueImages(current, incoming);
+  const totalChars = images.reduce((sum, image) => sum + image.url.length, 0);
+
+  if (images.length > REFERENCE_IMAGE_MAX_COUNT) {
+    return {
+      images: current,
+      message: `AI reference images are limited to ${REFERENCE_IMAGE_MAX_COUNT}. Remove older screenshots before adding more.`
+    };
+  }
+
+  if (totalChars > REFERENCE_IMAGE_MAX_TOTAL_CHARS) {
+    return {
+      images: current,
+      message: "The compressed screenshots still exceed the AI context budget. Remove one or more images, or crop them to the important area."
+    };
+  }
+
+  return { images, message: "" };
 };
 
 export const toggleRequirementOnPreviewCase = (

@@ -194,7 +194,7 @@ export function TestOpsPage({ initialView = "batch-process" }: { initialView?: T
   const canBuildAutomation = hasPermission(session, "automation.build");
   const canUseAutomationAi = hasPermission(session, "automation.ai");
   const canUseRecorder = hasPermission(session, "automation.recorder");
-  const canManageTransactions = hasPermission(session, "transaction.manage");
+  const canManageTransactions = hasPermission(session, "ops.manage");
   const canDownloadArtifacts = hasPermission(session, "transaction.artifact.download");
 
   useEffect(() => {

@@ -89,10 +89,12 @@ export const PERMISSION_GROUPS = [
       read('automation.repository.export', 'Export object repository records.'),
       write('automation.build', 'Create automation drafts.'),
       write('automation.ai', 'Use AI automation assistance.'),
+      write('content.ai', 'Rephrase rich-text authoring fields with the configured Qaira LLM.'),
       read('quality_insight.view', 'View explainable Jira-native quality insights.'),
       write('automation.recorder', 'Use recorder workflows.'),
       write('automation.run.local', 'Prepare local runner executions.'),
       write('automation.run.remote', 'Prepare remote runner executions.'),
+      write('automation.run.parallel', 'Configure parallel execution for automation suites and runs.'),
       read('mobile.view', 'View mobile and Appium configuration metadata.'),
       write('mobile.manage', 'Manage mobile and Appium configuration and recorder workflows.'),
       read('automation.code.view', 'View generated automation code.'),
@@ -140,6 +142,7 @@ export const PERMISSION_GROUPS = [
       write('configuration.manage', 'Manage test configurations.'),
       read('data.view', 'View non-sensitive test data metadata.'),
       write('data.manage', 'Manage non-sensitive test data metadata.'),
+      write('data.ai', 'Generate human-reviewed synthetic test data with the configured Qaira LLM.'),
       write('data.import', 'Import test data.'),
       read('data.export', 'Export test data.')
     ]
@@ -301,6 +304,7 @@ export const FEATURE_GROUPS = [
       { key: 'qaira.automation.step_recording', label: 'External recorder workflows', routes: ['/automation'], permissions: ['automation.recorder'] },
       { key: 'qaira.automation.local_execution', label: 'Local runner hand-off', routes: ['/automation', '/executions'], permissions: ['automation.run.local'] },
       { key: 'qaira.automation.remote_execution', label: 'Remote runner hand-off', routes: ['/automation', '/executions'], permissions: ['automation.run.remote'] },
+      { key: 'qaira.automation.parallel_execution', label: 'Parallel automation execution', routes: ['/design', '/test-cases', '/executions'], permissions: ['automation.run.parallel'] },
       { key: 'qaira.automation.object_repository', label: 'Object repository', routes: ['/object-repository'], permissions: ['automation.view', 'automation.repository.manage', 'automation.repository.import', 'automation.repository.export'] },
       { key: 'qaira.automation.batch_process', label: 'Batch process', routes: ['/testops'], permissions: ['transaction.view', 'transaction.artifact.download'] },
       { key: 'qaira.mobile.appium', label: 'Mobile and Appium', routes: ['/test-environments', '/test-configurations', '/automation'], permissions: ['mobile.view', 'mobile.manage'] }
@@ -313,6 +317,8 @@ export const FEATURE_GROUPS = [
     features: [
       { key: 'qaira.ai.requirement_design', label: 'Requirement design assistance', routes: ['/requirements'], permissions: ['requirement.ai'] },
       { key: 'qaira.ai.test_authoring', label: 'Test authoring assistance', routes: ['/test-cases'], permissions: ['testcase.ai'] },
+      { key: 'qaira.ai.test_data_generation', label: 'Synthetic test data generation', routes: ['/test-data'], permissions: ['data.ai'] },
+      { key: 'qaira.ai.content_rephrase', label: 'Rich-text AI rephrase', routes: ['/requirements', '/test-cases', '/design', '/issues', '/automation', '/shared-steps', '/test-environments', '/test-data'], permissions: ['content.ai'] },
       { key: 'qaira.ai.bug_triage', label: 'AI-assisted bug triage', routes: ['/feedback'], permissions: ['feedback.manage'] },
       { key: 'qaira.ai.automation', label: 'Automation assistance', routes: ['/automation'], permissions: ['automation.ai'] },
       { key: 'qaira.ai.execution_analysis', label: 'Execution analysis', routes: ['/executions'], permissions: ['run.ai'] },
@@ -399,8 +405,15 @@ const methodIndex = (method) => ({ GET: 0, POST: 1, PUT: 2, PATCH: 2, DELETE: 3 
 
 export function permissionForRequest(pathname, method = 'GET') {
   if (pathname === '/feature-flags') return method === 'GET' ? 'workspace.view' : 'feature_flag.manage';
+  if (pathname === '/requirements/create-metadata') return 'requirement.create';
   if (pathname === '/requirements/ai-create-preview') return 'requirement.ai';
+  if (pathname === '/requirements/ai-description-rephrase') return 'requirement.ai';
+  if (pathname === '/ai/rich-text-rephrase') return 'content.ai';
+  if (pathname === '/test-data-sets/ai-generate-preview') return 'data.ai';
+  if (pathname === '/executions/smart-plan-preview') return 'run.ai';
+  if (pathname === '/requirements/ai-create-jobs' || /^\/requirements\/ai-create-jobs\/[^/]+$/.test(pathname)) return 'requirement.ai';
   if (pathname === '/feedback/ai-draft-preview') return 'feedback.manage';
+  if (pathname === '/feedback/create-metadata') return 'feedback.manage';
   if (pathname === '/requirements/import') return 'requirement.import';
   if (pathname === '/requirements/export') return 'requirement.export';
   if (pathname === '/test-cases/import') return 'testcase.import';
@@ -435,8 +448,12 @@ export function permissionForRequest(pathname, method = 'GET') {
   if (/^\/requirements\/[^/]+\/design-test-cases-accept$/.test(pathname)) return 'testcase.create';
   if (/^\/test-cases\/[^/]+\/ai-impact-preview$/.test(pathname)) return 'testcase.ai';
   if (/^\/quality-gates\/[^/]+\/ai-assessment$/.test(pathname)) return 'quality_gate.ai';
+  if (/^\/executions\/[^/]+\/cases\/[^/]+\/report\.pdf$/.test(pathname)) return 'run.report.export';
+  if (/^\/executions\/[^/]+\/cases\/[^/]+\/share-report$/.test(pathname)) return 'run.report.share';
   if (/^\/executions\/[^/]+\/report\.pdf$/.test(pathname)) return 'run.report.export';
   if (/^\/executions\/[^/]+\/share-report$/.test(pathname)) return 'run.report.share';
+  if (/^\/quality-dashboards\/[^/]+\/report\.pdf$/.test(pathname)) return 'dashboard.view';
+  if (/^\/quality-dashboards\/[^/]+\/share-report$/.test(pathname)) return 'dashboard.manage';
   if (/^\/execution-schedules\/[^/]+\/run$/.test(pathname)) return 'schedule.run';
   if (/^\/workspace-transactions\/[^/]+\/artifacts\/[^/]+\/download$/.test(pathname)) return 'transaction.artifact.download';
   if (pathname.startsWith('/requirement-test-cases')) return method === 'GET' ? 'requirement.view' : 'requirement.update';

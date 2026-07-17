@@ -23,13 +23,14 @@ import { useCurrentAppType, useCurrentProject } from "../hooks/useCurrentProject
 import { useDomainMetadata } from "../hooks/useDomainMetadata";
 import { useDialogFocus } from "../hooks/useDialogFocus";
 import { useFeatureFlags } from "../hooks/useFeatureFlags";
+import { useAiPromptRegistry } from "../hooks/useAiPromptRegistry";
 import { api } from "../lib/api";
 import { areFeatureFlagsEnabled } from "../lib/featureFlags";
 import { hasPermission } from "../lib/permissions";
 import { parseTestDataFile, toKeyValueRows } from "../lib/testDataImport";
 import { countGeneratedTestDataFields, evaluateTestDataTemplate, hasTestDataGeneratorTemplate, materializeTestDataRows, TEST_DATA_GENERATOR_TEMPLATES } from "../lib/testDataGenerators";
 import { readDefaultCatalogViewMode } from "../lib/viewPreferences";
-import type { KeyValueEntry, TestConfiguration, TestDataSet, TestDataSetMode, TestDataSetRow, TestEnvironment } from "../types";
+import type { AiTestDataGenerationPreviewResponse, KeyValueEntry, TestConfiguration, TestDataSet, TestDataSetMode, TestDataSetRow, TestEnvironment } from "../types";
 
 type TestEnvironmentPageView = "environments" | "data" | "configurations";
 
@@ -48,8 +49,7 @@ const DEFAULT_TEST_DATA_UTILS: TestDataUtilityOption[] = [
   { id: "default-tomorrow", key: "future_date", label: "Tomorrow", template: TEST_DATA_GENERATOR_TEMPLATES.tomorrow, group: "Data utility" },
   { id: "default-random-string", key: "unique_id", label: "Random text", template: TEST_DATA_GENERATOR_TEMPLATES.randomString, group: "Data utility" },
   { id: "default-random-number", key: "random_number", label: "Random number", template: TEST_DATA_GENERATOR_TEMPLATES.randomNumber, group: "Data utility" },
-  { id: "default-timestamp", key: "timestamp", label: "Timestamp", template: TEST_DATA_GENERATOR_TEMPLATES.timestamp, group: "Data utility" },
-  { id: "default-ai-data", key: "ai_data", label: "AI data", template: TEST_DATA_GENERATOR_TEMPLATES.aiData, group: "Data utility" }
+  { id: "default-timestamp", key: "timestamp", label: "Timestamp", template: TEST_DATA_GENERATOR_TEMPLATES.timestamp, group: "Data utility" }
 ];
 
 type EnvironmentDraft = {
@@ -1904,12 +1904,27 @@ function DataSetForm({
 
 function DataUtilityPicker({
   options,
+  contextLabel,
   onSelect
 }: {
   options: TestDataUtilityOption[];
+  contextLabel?: string;
   onSelect: (template: string, mode: "template" | "static") => void;
 }) {
+  const { session } = useAuth();
+  const [projectId] = useCurrentProject();
+  const [appTypeId] = useCurrentAppType(projectId);
+  const featureFlagsQuery = useFeatureFlags(Boolean(session));
+  const canGenerateAiData = hasPermission(session, "data.ai")
+    && areFeatureFlagsEnabled(featureFlagsQuery.data, ["qaira.ai.test_data_generation"]);
+  const { getPrompt, getLlmIntegrationId } = useAiPromptRegistry(Boolean(session) && canGenerateAiData);
   const [searchTerm, setSearchTerm] = useState("");
+  const [aiPrompt, setAiPrompt] = useState("");
+  const [sampleCount, setSampleCount] = useState(6);
+  const [aiPreview, setAiPreview] = useState<AiTestDataGenerationPreviewResponse | null>(null);
+  const [selectedSuggestionId, setSelectedSuggestionId] = useState("");
+  const [aiMessage, setAiMessage] = useState("");
+  const generateAiData = useMutation({ mutationFn: api.testDataSets.previewAiData });
   const filteredOptions = useMemo(() => {
     const search = searchTerm.trim().toLowerCase();
 
@@ -1927,16 +1942,119 @@ function DataUtilityPicker({
       ].join(" ").toLowerCase().includes(search)
     );
   }, [options, searchTerm]);
+  const selectedSuggestion = aiPreview?.suggestions.find((item) => item.id === selectedSuggestionId)
+    || aiPreview?.suggestions[0]
+    || null;
+
+  const handleAiGeneration = async () => {
+    const prompt = aiPrompt.trim();
+    if (!projectId || prompt.length < 3) {
+      setAiMessage("Describe the synthetic data you want in at least a few words.");
+      return;
+    }
+    setAiMessage("");
+    try {
+      const preview = await generateAiData.mutateAsync({
+        project_id: projectId,
+        app_type_id: appTypeId || undefined,
+        prompt,
+        field_context: contextLabel || undefined,
+        sample_count: sampleCount,
+        prompt_instruction: getPrompt("ai.test_data.synthetic") || undefined,
+        integration_id: getLlmIntegrationId("ai.test_data.synthetic") || undefined
+      });
+      setAiPreview(preview);
+      setSelectedSuggestionId(preview.suggestions[0]?.id || "");
+      setAiMessage(preview.fallback_used
+        ? "The LLM was unavailable, so Qaira prepared safe synthetic fallback values for review."
+        : "AI values are ready. Select one for Static, or randomize from the reviewed pool.");
+    } catch (error) {
+      setAiPreview(null);
+      setSelectedSuggestionId("");
+      setAiMessage(error instanceof Error ? error.message : "Unable to generate synthetic test data.");
+    }
+  };
 
   return (
     <div className="test-data-utility-panel">
-      <input
-        aria-label="Search data utilities"
-        onChange={(event) => setSearchTerm(event.target.value)}
-        placeholder="Search data utilities"
-        type="search"
-        value={searchTerm}
-      />
+      {canGenerateAiData ? (
+        <section className="ai-test-data-utility" aria-label="AI synthetic data generator">
+          <div className="ai-test-data-utility-head">
+            <div>
+              <strong>Generate synthetic data with AI</strong>
+              <span>Describe the format, locale, constraints, boundaries, or scenario you need. Generated values stay reviewable before they enter the data set.</span>
+            </div>
+            <span className="count-pill">LLM</span>
+          </div>
+          <textarea
+            aria-label="Describe the synthetic test data"
+            onChange={(event) => {
+              setAiPrompt(event.target.value);
+              setAiPreview(null);
+              setSelectedSuggestionId("");
+              setAiMessage("");
+            }}
+            placeholder="Example: Six fictional UK customer reference numbers, uppercase, 12 characters, starting with VIP-"
+            rows={3}
+            value={aiPrompt}
+          />
+          <div className="ai-test-data-utility-controls">
+            <label>
+              <span>Values</span>
+              <select aria-label="Number of generated values" onChange={(event) => setSampleCount(Number(event.target.value))} value={sampleCount}>
+                {[4, 6, 8, 10, 12].map((value) => <option key={value} value={value}>{value}</option>)}
+              </select>
+            </label>
+            <button className="primary-button" disabled={generateAiData.isPending || aiPrompt.trim().length < 3} onClick={() => void handleAiGeneration()} type="button">
+              {generateAiData.isPending ? "Generating…" : "Generate data"}
+            </button>
+          </div>
+          {aiMessage ? <p aria-live="polite" className={aiPreview ? "form-success ai-test-data-message" : "form-error ai-test-data-message"}>{aiMessage}</p> : null}
+          {aiPreview?.suggestions.length ? (
+            <div className="ai-test-data-review">
+              <div className="ai-test-data-review-head">
+                <div>
+                  <strong>{aiPreview.summary}</strong>
+                  <span>{aiPreview.suggestions.length} fictional value{aiPreview.suggestions.length === 1 ? "" : "s"} · human review required</span>
+                </div>
+                <div className="ai-test-data-apply-actions">
+                  <button className="primary-button compact" onClick={() => onSelect(aiPreview.randomized_template, "template")} type="button">Randomize</button>
+                  <button className="ghost-button compact" disabled={!selectedSuggestion} onClick={() => selectedSuggestion && onSelect(selectedSuggestion.value, "static")} type="button">Static</button>
+                </div>
+              </div>
+              <div className="ai-test-data-suggestions" role="radiogroup" aria-label="Generated synthetic values">
+                {aiPreview.suggestions.map((suggestion) => {
+                  const isSelected = suggestion.id === (selectedSuggestion?.id || "");
+                  return (
+                    <button
+                      aria-checked={isSelected}
+                      className={isSelected ? "ai-test-data-suggestion is-selected" : "ai-test-data-suggestion"}
+                      key={suggestion.id}
+                      onClick={() => setSelectedSuggestionId(suggestion.id)}
+                      role="radio"
+                      type="button"
+                    >
+                      <span aria-hidden="true" className="ai-test-data-radio" />
+                      <code>{suggestion.value}</code>
+                    </button>
+                  );
+                })}
+              </div>
+              <small>Randomize chooses from this reviewed pool when a run snapshot is created. Static stores only the selected value.</small>
+            </div>
+          ) : null}
+        </section>
+      ) : null}
+      <div className="test-data-utility-search">
+        <strong>Reusable utilities</strong>
+        <input
+          aria-label="Search data utilities"
+          onChange={(event) => setSearchTerm(event.target.value)}
+          placeholder="Search utilities"
+          type="search"
+          value={searchTerm}
+        />
+      </div>
       <div className="test-data-utility-list">
         {filteredOptions.map((option) => {
           const staticPreview = evaluateTestDataTemplate(option.template);
@@ -2021,6 +2139,7 @@ function TestDataCellValueEditor({
           <button className="ghost-button compact" onClick={onToggleUtility} type="button">Close</button>
         </div>
         <DataUtilityPicker
+          contextLabel={modalContextLabel}
           options={utilityOptions}
           onSelect={(template, mode) => {
             onApplyUtility(template, mode);

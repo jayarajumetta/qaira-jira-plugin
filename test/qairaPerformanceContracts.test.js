@@ -8,6 +8,7 @@ const currentScopeSource = readFileSync(new URL('../static/qaira-ui/src/lib/curr
 const appSource = readFileSync(new URL('../static/qaira-ui/src/App.tsx', import.meta.url), 'utf8');
 const requirementsSource = readFileSync(new URL('../static/qaira-ui/src/pages/RequirementsPage.tsx', import.meta.url), 'utf8');
 const appShellSource = readFileSync(new URL('../static/qaira-ui/src/components/AppShell.tsx', import.meta.url), 'utf8');
+const routePrefetchSource = readFileSync(new URL('../static/qaira-ui/src/lib/routePrefetch.ts', import.meta.url), 'utf8');
 const stylesSource = readFileSync(new URL('../static/qaira-ui/src/styles.css', import.meta.url), 'utf8');
 const testCasesSource = readFileSync(new URL('../static/qaira-ui/src/pages/TestCasesPage.tsx', import.meta.url), 'utf8');
 
@@ -59,10 +60,24 @@ test('workspace transactions are project and app scoped', () => {
 
 test('frontend requests and caches are separated by selected Jira project', () => {
   assert.match(frontendApiSource, /appendCurrentProjectScope\(path\)/);
+  assert.match(frontendApiSource, /inFlightClientRequests/);
+  assert.match(frontendApiSource, /CLIENT_GET_CACHE_TTL_MS = 1_500/);
+  assert.match(frontendApiSource, /clientGetResponseCache\.clear\(\)/);
   assert.match(currentScopeSource, /projectAwareQueryKey/);
   assert.match(currentScopeSource, /\["qaira-project", readCurrentProjectId\(\) \|\| "unselected", queryKey\]/);
   assert.match(appSource, /queryKeyHashFn:[\s\S]*projectAwareQueryKey/);
   assert.doesNotMatch(appSource, /placeholderData:\s*keepPreviousData/);
+});
+
+test('workspace navigation prefetches lazy route chunks without eager-loading every page', () => {
+  assert.match(appSource, /const RequirementsPage = lazy/);
+  assert.match(routePrefetchSource, /preloadWorkspaceRoute/);
+  assert.match(routePrefetchSource, /requestIdleCallback/);
+  assert.ok(routePrefetchSource.includes('"/requirements": () => import("../pages/RequirementsPage")'));
+  assert.match(appShellSource, /onMouseEnter=\{\(\) => prefetchNavigationTarget\(navigationTarget, isDisabled\)\}/);
+  assert.match(appShellSource, /onFocus=\{\(\) => preloadWorkspaceRoute\(subItem\.to\)\}/);
+  assert.match(appShellSource, /realtime\.subscribeGlobal/);
+  assert.match(appShellSource, /refetchInterval: 300_000/);
 });
 
 test('workspace chrome is removed from app content areas', () => {

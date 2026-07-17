@@ -1,8 +1,9 @@
 import type { ReactNode } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { NavLink, Outlet, useLocation } from "react-router-dom";
+import { NavLink, Outlet, useLocation, useNavigate } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
+import { realtime, showFlag } from "@forge/bridge";
 import { useAuth } from "../auth/AuthContext";
 import { useLocalization } from "../context/LocalizationContext";
 import { AppTypeInlineValue } from "./AppTypeDropdown";
@@ -15,8 +16,10 @@ import { api } from "../lib/api";
 import { areFeatureFlagsEnabled, requiredFeatureFlagsForPath } from "../lib/featureFlags";
 import { getNavigationItemLabel, getNavigationItemPermissions, isNavigationItemActive } from "../lib/navigation";
 import { getUnreadNotificationCount, NOTIFICATIONS_UPDATED_EVENT } from "../lib/notificationCenter";
+import { readNotificationPreferences } from "../lib/notificationPreferences";
 import { canAccessPath, hasAnyPermission } from "../lib/permissions";
 import { queryKeys } from "../lib/queryKeys";
+import { preloadWorkspaceRoute } from "../lib/routePrefetch";
 import {
   PREFERENCES_UPDATED_EVENT,
   readSidebarMode,
@@ -38,8 +41,10 @@ import {
   WORKSPACE_PAGE_LABELS,
   WORKSPACE_SECTION_LABEL_KEYS
 } from "../lib/workspaceSections";
+import type { AppNotification } from "../types";
 
 const MOBILE_SIDEBAR_BREAKPOINT = "(max-width: 768px)";
+const NOTIFICATION_REALTIME_CHANNEL = "qaira-notifications";
 
 const navigation = [
   {
@@ -401,6 +406,7 @@ function SidebarScopeSelector({
 
 export function AppShell() {
   const location = useLocation();
+  const navigate = useNavigate();
   const { session, error, clearError } = useAuth();
   const { t } = useLocalization();
   const domainMetadataQuery = useDomainMetadata();
@@ -415,7 +421,8 @@ export function AppShell() {
     queryKey: ["notifications", "unread"],
     queryFn: () => api.notifications.list({ status: "unread" }),
     enabled: Boolean(session),
-    refetchInterval: 30_000
+    refetchInterval: 300_000,
+    staleTime: 240_000
   });
   const [theme, setTheme] = useState(readWorkspaceTheme);
   const [isCollapsed, setIsCollapsed] = useState(() => readSidebarMode() === "collapsed");
@@ -423,6 +430,15 @@ export function AppShell() {
   const [isMobileSidebarOpen, setIsMobileSidebarOpen] = useState(false);
   const [notificationUnreadCount, setNotificationUnreadCount] = useState(() => getUnreadNotificationCount());
   const [sidebarProjectId, setSidebarProjectId] = useCurrentProject();
+  const notificationRealtimeTokenQuery = useQuery({
+    queryKey: ["notifications", "realtime-token", sidebarProjectId || "workspace"],
+    queryFn: api.notifications.realtimeToken,
+    enabled: Boolean(session),
+    refetchInterval: 10 * 60_000,
+    staleTime: 9 * 60_000
+  });
+  const knownServerNotificationIds = useRef(new Set<string>());
+  const serverNotificationFeedInitialized = useRef(false);
 
   const projects = projectsQuery.data || [];
   const hasNoProjects = !projectsQuery.isPending && projects.length === 0;
@@ -432,7 +448,64 @@ export function AppShell() {
   const navCounts = {
     projects: projects.length
   };
-  const totalNotificationUnreadCount = notificationUnreadCount + (serverUnreadNotificationsQuery.data?.length || 0);
+  const visibleServerUnreadNotifications = (serverUnreadNotificationsQuery.data || []).filter((item) => {
+    const preferences = readNotificationPreferences();
+    const preference = item.preference as keyof typeof preferences | undefined;
+    return !preference || preferences[preference] !== false;
+  });
+  const totalNotificationUnreadCount = notificationUnreadCount + visibleServerUnreadNotifications.length;
+
+  const showAppNotification = useCallback((item: AppNotification) => {
+    const preferences = readNotificationPreferences();
+    const preference = item.preference as keyof typeof preferences | undefined;
+    if (!preferences.inApp || (preference && preferences[preference] === false)) return;
+    if (item.user_id && String(item.user_id) !== String(session?.user.id || "")) return;
+    if (knownServerNotificationIds.current.has(item.id)) return;
+    knownServerNotificationIds.current.add(item.id);
+    const type = item.tone === "error" ? "error" : item.tone === "warning" ? "warning" : item.tone === "success" ? "success" : "info";
+    try {
+      showFlag({
+        id: `qaira-${item.id}`,
+        title: item.title,
+        description: item.message,
+        type,
+        isAutoDismiss: type !== "error" && type !== "warning",
+        ...(item.target_url ? { actions: [{ text: "View", onClick: () => navigate(item.target_url || "/notifications") }] } : {})
+      });
+    } catch {
+      // The persistent notification center and polling path remain available outside an Atlassian host frame.
+    }
+  }, [navigate, session?.user.id]);
+
+  useEffect(() => {
+    if (!serverUnreadNotificationsQuery.data) return;
+    const items = serverUnreadNotificationsQuery.data;
+    if (!serverNotificationFeedInitialized.current) {
+      items.forEach((item) => knownServerNotificationIds.current.add(item.id));
+      serverNotificationFeedInitialized.current = true;
+      return;
+    }
+    items.forEach(showAppNotification);
+  }, [serverUnreadNotificationsQuery.data, showAppNotification]);
+
+  useEffect(() => {
+    const token = notificationRealtimeTokenQuery.data?.token;
+    if (!session?.user.id || !token) return undefined;
+    const subscription = realtime.subscribeGlobal(NOTIFICATION_REALTIME_CHANNEL, (payload) => {
+      let item: AppNotification | null = null;
+      try {
+        item = (typeof payload === "string" ? JSON.parse(payload) : payload) as AppNotification;
+      } catch {
+        item = null;
+      }
+      if (!item?.id) return;
+      showAppNotification(item);
+      void serverUnreadNotificationsQuery.refetch();
+    }, { token });
+    return () => {
+      void subscription.then((activeSubscription) => activeSubscription.unsubscribe()).catch(() => undefined);
+    };
+  }, [notificationRealtimeTokenQuery.data?.token, session?.user.id, showAppNotification]);
 
   useEffect(() => {
     writeWorkspaceTheme(theme);
@@ -646,6 +719,11 @@ export function AppShell() {
   };
 
   const refreshCurrentScreen = () => window.location.reload();
+  const prefetchNavigationTarget = (target: string, disabled = false) => {
+    if (!disabled) {
+      preloadWorkspaceRoute(target);
+    }
+  };
 
   return (
     <div className="app-shell app-layout app-layout--workspace-wide">
@@ -761,6 +839,8 @@ export function AppShell() {
                         end={item.to === "/"}
                         title={shouldCollapseSidebar ? resolveNavLabel(item) : undefined}
                         aria-label={resolveNavLabel(item)}
+                        onFocus={() => prefetchNavigationTarget(navigationTarget, isDisabled)}
+                        onMouseEnter={() => prefetchNavigationTarget(navigationTarget, isDisabled)}
                         onClick={(e) => {
                           if (isDisabled) {
                             e.preventDefault();
@@ -800,6 +880,8 @@ export function AppShell() {
                               <NavLink
                                 className={isSubActive ? "nav-submenu-link is-active" : "nav-submenu-link"}
                                 key={subItem.to}
+                                onFocus={() => preloadWorkspaceRoute(subItem.to)}
+                                onMouseEnter={() => preloadWorkspaceRoute(subItem.to)}
                                 to={subItem.to}
                               >
                                 <span className="nav-submenu-icon" aria-hidden="true"><SubIcon /></span>

@@ -79,7 +79,7 @@ export const AI_PROMPT_REGISTRY: AiPromptRegistryItem[] = [
     key: "ai.test_data.synthetic",
     label: "Synthetic test data",
     surface: "Test data generation",
-    value: "Generate realistic reusable test data values from a field hint while avoiding brittle placeholder names unless no better context exists."
+    value: "Generate concise, distinct, fictional test data from the user's descriptive request. Honor requested formats, locales, lengths, prefixes, boundary conditions, and negative scenarios; never return real personal data, secrets, production credentials, or unexplained placeholders."
   }
 ];
 

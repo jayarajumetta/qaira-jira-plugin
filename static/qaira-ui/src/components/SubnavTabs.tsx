@@ -11,7 +11,7 @@ export function SubnavTabs<T extends string>({
   items,
   ariaLabel = "Section navigation",
   className = "",
-  showIndicator = true
+  showIndicator = false
 }: {
   value: T;
   onChange: (value: T) => void;

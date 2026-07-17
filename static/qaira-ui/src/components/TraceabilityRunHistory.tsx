@@ -1,6 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
+import { useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { ActivityIcon, OpenIcon } from "./AppIcons";
+import { ActivityIcon, ClearSelectionIcon, OpenIcon, SearchIcon } from "./AppIcons";
 import { DataTable, type DataTableColumn } from "./DataTable";
 import { DisplayIdBadge } from "./DisplayIdBadge";
 import { LoadingState } from "./LoadingState";
@@ -49,6 +50,31 @@ export function TraceabilityRunHistory({
     staleTime: 30_000
   });
   const rows = historyQuery.data || [];
+  const [searchTerm, setSearchTerm] = useState("");
+  const [resultFilter, setResultFilter] = useState("all");
+  const filteredRows = useMemo(() => {
+    const normalizedSearch = searchTerm.trim().toLowerCase();
+
+    return rows.filter((row) => {
+      if (resultFilter !== "all" && row.result_status !== resultFilter) return false;
+      if (!normalizedSearch) return true;
+      return [
+        row.execution_id,
+        row.execution_display_id || "",
+        row.execution_name,
+        row.execution_status || "",
+        row.test_case_id,
+        row.test_case_title,
+        row.result_status,
+        row.release || "",
+        ...row.defects
+      ].join(" ").toLowerCase().includes(normalizedSearch);
+    });
+  }, [resultFilter, rows, searchTerm]);
+  const resultOptions = useMemo(
+    () => Array.from(new Set(rows.map((row) => row.result_status).filter(Boolean))).sort((left, right) => left.localeCompare(right)),
+    [rows]
+  );
 
   const openRun = (item: TraceabilityRunHistoryItem) => {
     const view = item.trigger === "local" ? "local-runs" : item.suite_ids.length ? "suite-runs" : "test-case-runs";
@@ -135,7 +161,38 @@ export function TraceabilityRunHistory({
     <div className="traceability-run-history">
       <div className="traceability-section-toolbar">
         <ActivityIcon />
-        <strong>{rows.length} run outcome{rows.length === 1 ? "" : "s"}</strong>
+        <strong>{filteredRows.length} of {rows.length} run outcome{rows.length === 1 ? "" : "s"}</strong>
+      </div>
+      <div className="traceability-search-row traceability-run-filter-row">
+        <label className="traceability-search-input">
+          <SearchIcon />
+          <input
+            onChange={(event) => setSearchTerm(event.target.value)}
+            placeholder="Search runs, test cases, bugs, release"
+            value={searchTerm}
+          />
+        </label>
+        <label className="requirement-link-filter-field">
+          <span>Result</span>
+          <select value={resultFilter} onChange={(event) => setResultFilter(event.target.value)}>
+            <option value="all">All results</option>
+            {resultOptions.map((result) => (
+              <option key={result} value={result}>{result}</option>
+            ))}
+          </select>
+        </label>
+        <button
+          className="ghost-button"
+          disabled={!searchTerm.trim() && resultFilter === "all"}
+          onClick={() => {
+            setSearchTerm("");
+            setResultFilter("all");
+          }}
+          type="button"
+        >
+          <ClearSelectionIcon />
+          <span>Clear filters</span>
+        </button>
       </div>
       <DataTable
         columns={columns}
@@ -143,7 +200,7 @@ export function TraceabilityRunHistory({
         getRowKey={(item) => item.id}
         hideToolbarCopy
         onRowClick={openRun}
-        rows={rows}
+        rows={filteredRows}
         storageKey={`qaira:traceability-runs:${requirementId ? "requirement" : "test-case"}`}
       />
     </div>

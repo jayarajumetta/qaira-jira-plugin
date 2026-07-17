@@ -8,6 +8,7 @@ function mergeAriaDescribedBy(...values: Array<string | undefined>) {
 export function FormField({
   label,
   children,
+  className = "",
   error,
   hint,
   inputId,
@@ -15,6 +16,7 @@ export function FormField({
 }: {
   label: string;
   children: ReactNode;
+  className?: string;
   error?: string;
   hint?: string;
   inputId?: string;
@@ -42,7 +44,7 @@ export function FormField({
       : children;
 
   return (
-    <div className="form-field">
+    <div className={["form-field", className].filter(Boolean).join(" ")}>
       <label className="form-field-label" htmlFor={id}>
         <span>{label}</span>
         {required ? <span aria-hidden="true"> *</span> : null}

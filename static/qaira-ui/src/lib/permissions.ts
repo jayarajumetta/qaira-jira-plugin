@@ -45,7 +45,7 @@ export function hasPermission(session: SessionPayload | null, permission: string
     return false;
   }
 
-  if (session.user.role === ADMIN_ROLE) {
+  if (session.user.role === ADMIN_ROLE || session.user.role_id === "jira-admin") {
     return true;
   }
 

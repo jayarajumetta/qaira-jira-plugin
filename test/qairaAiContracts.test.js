@@ -5,6 +5,8 @@ import { test } from 'node:test';
 
 const root = path.resolve(import.meta.dirname, '..');
 const apiSource = fs.readFileSync(path.join(root, 'src/qairaApi.js'), 'utf8');
+const indexSource = fs.readFileSync(path.join(root, 'src/index.js'), 'utf8');
+const manifestSource = fs.readFileSync(path.join(root, 'manifest.yml'), 'utf8');
 
 function sourceBetween(startMarker, endMarker) {
   const start = apiSource.indexOf(startMarker);
@@ -151,6 +153,10 @@ test('all dynamic AI preview routes are wired to their fail-closed feature contr
     'function featuresForRequest(pathname)',
     'async function resolveAuthorizationProject('
   );
+  const authorization = sourceBetween(
+    'async function authorizeQairaRequest(',
+    'function stableJson(value)'
+  );
 
   assert.ok(routing.includes("/^\\/requirements\\/[^/]+\\/(?:ai-)?(?:optimize-preview|impact-preview)$/.test(pathname)"));
   assert.ok(routing.includes("/^\\/test-cases\\/[^/]+\\/ai-impact-preview$/.test(pathname)"));
@@ -160,6 +166,162 @@ test('all dynamic AI preview routes are wired to their fail-closed feature contr
   assert.ok(routing.includes("features.push('qaira.ai.test_authoring')"));
   assert.ok(routing.includes("features.push('qaira.ai.execution_analysis')"));
   assert.ok(routing.includes("features.push('qaira.ai.quality_insights')"));
+  assert.ok(routing.includes("removeFeature('qaira.manual.requirements')"), 'AI requirement routes must not inherit manual requirement feature gates');
+  assert.ok(routing.includes("removeFeature('qaira.manual.test_cases')"), 'AI test-design routes must not inherit manual test-case feature gates');
+  assert.doesNotMatch(authorization, /featureKeys\.push\('qaira\.automation\.step_code'\)/, 'optional automation_code metadata must not block normal manual or AI test design flows');
+});
+
+test('request authorization can recover identity from Forge context when Jira user auth expires', () => {
+  assert.match(apiSource, /function contextAccountId/);
+  assert.match(apiSource, /async function userFromAccountId/);
+  assert.match(apiSource, /async function currentUserForRequest/);
+  assert.match(apiSource, /currentUserForRequest\(context\)/);
+  assert.match(apiSource, /allowAuthFallback:\s*true/);
+  assert.match(apiSource, /fallbackJiraPermissionsForContextUser/);
+  assert.match(apiSource, /fallbackVerifiedJiraAdmin/);
+  assert.match(apiSource, /fallbackProjectLeadAdmin/);
+});
+
+test('requirement create and import Jira reads recover when Atlassian user auth expires', () => {
+  const jiraHelpers = sourceBetween(
+    'async function jiraMutationRequest(',
+    'async function currentUser()'
+  );
+  const requirementHandler = sourceBetween(
+    'async function handleRequirements(',
+    'async function handleRequirementIterations('
+  );
+  const requirementImportWorker = sourceBetween(
+    'async function importRequirementRows',
+    'async function handleRequirements('
+  );
+
+  assert.match(jiraHelpers, /async function jiraReadRequest/);
+  assert.match(jiraHelpers, /isAuthenticationRequiredError\(error\)/);
+  assert.match(jiraHelpers, /return jiraAppRequest\(target, options\)/);
+
+  assert.match(apiSource, /jiraReadRequest\(route`\/rest\/api\/3\/project\/\$\{String\(ref\)\}`,\s*\{\},\s*'project-get'\)/);
+  assert.match(apiSource, /jiraReadRequest\(route`\/rest\/api\/3\/issue\/createmeta\/\$\{project\.key\}\/issuetypes\/\$\{issueTypeRef\}/);
+  assert.match(apiSource, /jiraReadRequest\(route`\/rest\/api\/3\/search\/jql`/);
+  assert.match(apiSource, /jiraReadRequest\(route`\/rest\/api\/3\/issue\/\$\{String\(issueIdOrKey\)\}\?fields=\$\{fieldsParam\}`/);
+  assert.match(apiSource, /jiraReadRequest\(route`\/rest\/api\/3\/field`/);
+  assert.match(apiSource, /jiraReadRequest\(route`\/rest\/api\/3\/project\/\$\{project\.key\}\/version/);
+
+  assert.match(requirementHandler, /const createMetadata = await jiraRequirementCreateMetadata\(project, registry\)/);
+  assert.match(requirementImportWorker, /const created = await handleRequirements\('\/requirements', 'POST'/);
+  assert.match(requirementHandler, /jobType:\s*'requirements-bulk-import'/);
+  assert.match(requirementHandler, /queued:\s*true/);
+});
+
+test('Jira Software and create-metadata scope mismatches do not break core requirement authoring', () => {
+  const requiredScopes = [
+    'read:board-scope:jira-software',
+    'read:sprint:jira-software',
+    'read:issue-meta:jira',
+    'read:avatar:jira',
+    'read:field-configuration:jira',
+    'read:issue.transition:jira',
+    'read:status:jira'
+  ];
+  for (const scope of requiredScopes) {
+    assert.ok(manifestSource.includes(`- ${scope}`), `manifest must include ${scope}`);
+  }
+
+  const helperSource = sourceBetween(
+    'function isAuthenticationRequiredError(error)',
+    'function systemActor(project, reason ='
+  );
+  const sprintSource = sourceBetween(
+    'async function listJiraProjectSprints(project)',
+    'async function jiraProjectDeliveryMetadata(project)'
+  );
+  const createMetaSource = sourceBetween(
+    'async function jiraCreateFieldMetadata(project, issueTypeId)',
+    'async function jiraCoreBugFieldIds(project)'
+  );
+
+  assert.match(helperSource, /function isJiraScopeMismatchError/);
+  assert.match(helperSource, /scope does not match\|scope/);
+  assert.match(sprintSource, /isJiraScopeMismatchError\(error\)/);
+  assert.match(sprintSource, /qairaLookupUnavailable = true/);
+  assert.match(sprintSource, /return fallback/);
+  assert.match(apiSource, /sprint_lookup_unavailable:\s*Boolean\(sprints\?\.qairaLookupUnavailable\)/);
+  assert.match(apiSource, /metadata\.sprint_lookup_unavailable\) sprintFallback/);
+  assert.match(createMetaSource, /isJiraScopeMismatchError\(error\)/);
+  assert.match(createMetaSource, /core issue fields only/);
+  assert.match(createMetaSource, /return \[\]/);
+});
+
+test('async AI generation jobs have queue consumers and terminal result records', () => {
+  const testCaseJobs = sourceBetween(
+    "if (pathname === '/test-cases/ai-generation-jobs' && method === 'GET')",
+    "if (pathname === '/test-cases/import' && method === 'POST')"
+  );
+  const testCaseWorker = sourceBetween(
+    'export async function processAiTestCaseGenerationJob',
+    'export async function workspaceSummary'
+  );
+  const requirementWorker = sourceBetween(
+    'export async function processAiRequirementGenerationJob',
+    'export async function processAiTestCaseGenerationJob'
+  );
+
+  assert.match(indexSource, /processAiRequirementGenerationJob/);
+  assert.match(indexSource, /processAiTestCaseGenerationJob/);
+  assert.match(indexSource, /processRequirementImportJob/);
+  assert.match(indexSource, /unwrapAsyncPayload/);
+  assert.match(indexSource, /dispatchAgenticWorkflowPayload/);
+  assert.match(indexSource, /body\.jobType === 'requirements-bulk-import'/);
+  assert.match(indexSource, /body\.jobType === 'ai-requirement-generation'/);
+  assert.match(indexSource, /body\.jobType === 'ai-test-case-generation'/);
+
+  assert.match(testCaseJobs, /job_type:\s*'ai-test-case-generation'/);
+  assert.match(testCaseJobs, /status:\s*'queued'/);
+  assert.match(testCaseJobs, /agenticWorkflowQueue\.push/);
+  assert.match(testCaseJobs, /concurrency:\s*\{ key: `ai-test-case-generation-/);
+
+  assert.match(testCaseWorker, /status:\s*'running'/);
+  assert.match(testCaseWorker, /buildTestCaseDesignPreview/);
+  assert.match(testCaseWorker, /candidate_cases/);
+  assert.match(testCaseWorker, /createTestCasesFromCandidates/);
+  assert.match(testCaseWorker, /created_cases/);
+  assert.match(testCaseWorker, /generated_cases_count/);
+  assert.match(testCaseWorker, /status:\s*'completed'/);
+  assert.match(testCaseWorker, /status:\s*'failed'/);
+
+  assert.match(requirementWorker, /status:\s*'running'/);
+  assert.match(requirementWorker, /buildRequirementCreationPreview/);
+  assert.match(requirementWorker, /requirements:\s*asArray\(response\.requirements\)/);
+  assert.match(requirementWorker, /status:\s*'completed'/);
+  assert.match(requirementWorker, /status:\s*'failed'/);
+});
+
+test('async AI jobs and Jira-native imports preserve authorized actor and bubble auth expiry', () => {
+  const requirementHandler = sourceBetween(
+    'async function handleRequirements(',
+    'async function handleRequirementIterations('
+  );
+  const requirementImportWorker = sourceBetween(
+    'async function importRequirementRows',
+    'async function handleRequirements('
+  );
+  const testCaseJobsAndImport = sourceBetween(
+    "if (pathname === '/test-cases/ai-generation-jobs' && method === 'GET')",
+    "if (pathname === '/test-cases/export' && method === 'POST')"
+  );
+
+  assert.match(apiSource, /function isAuthenticationRequiredError/);
+  assert.match(apiSource, /async function currentActor/);
+  assert.match(apiSource, /async function currentUserOrSystem/);
+
+  assert.match(requirementHandler, /currentActor\(context, project, 'requirement-create'\)/);
+  assert.match(requirementHandler, /currentActor\(context, project, 'requirement-update'\)/);
+  assert.match(requirementHandler, /currentActor\(context, project, 'requirements-import-queue'\)/);
+  assert.match(requirementHandler, /currentActor\(context, project, 'ai-requirement-generation-queue'\)/);
+  assert.match(requirementImportWorker, /if \(isAuthenticationRequiredError\(error\)\) throw error;/);
+
+  assert.match(testCaseJobsAndImport, /currentActor\(context, project, 'ai-test-case-generation-queue'\)/);
+  assert.match(testCaseJobsAndImport, /if \(isAuthenticationRequiredError\(error\)\) throw error;/);
 });
 
 test('locator improvement separates preview from human-confirmed apply', () => {

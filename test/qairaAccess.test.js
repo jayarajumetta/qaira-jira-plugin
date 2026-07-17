@@ -44,6 +44,7 @@ describe('Qaira default role grants', () => {
     assert.equal(grants('jira-admin', 'role.manage'), true);
     assert.equal(grants('jira-admin', 'requirement.delete'), true);
     assert.equal(grants('jira-admin', 'attachment.delete'), true);
+    assert.equal(grants('jira-admin', 'automation.run.parallel'), true);
   });
 
   test('viewer receives every read permission and no write or manage permission', () => {
@@ -123,12 +124,18 @@ describe('request authorization policy', () => {
     assert.equal(permissionForRequest('/executions/RUN-1/start', 'POST'), 'run.execute');
     assert.equal(permissionForRequest('/executions/RUN-1/cases/CASE-1/ai-analysis', 'POST'), 'run.ai');
     assert.equal(permissionForRequest('/executions/RUN-1/report.pdf', 'GET'), 'run.report.export');
+    assert.equal(permissionForRequest('/executions/RUN-1/cases/CASE-1/report.pdf', 'GET'), 'run.report.export');
+    assert.equal(permissionForRequest('/executions/RUN-1/cases/CASE-1/share-report', 'POST'), 'run.report.share');
+    assert.equal(permissionForRequest('/quality-dashboards/DASH-1/report.pdf', 'GET'), 'dashboard.view');
+    assert.equal(permissionForRequest('/quality-dashboards/DASH-1/share-report', 'POST'), 'dashboard.manage');
     assert.equal(permissionForRequest('/execution-schedules/S-1/run', 'POST'), 'schedule.run');
     assert.equal(permissionForRequest('/test-cases/CASE-1/automation/build', 'POST'), 'automation.build');
     assert.equal(permissionForRequest('/projects/10000/knowledge/documents', 'POST'), 'knowledge.manage');
     assert.equal(permissionForRequest('/requirements/REQ-1/design-test-cases-preview', 'POST'), 'requirement.ai');
     assert.equal(permissionForRequest('/requirements/REQ-1/design-test-cases-accept', 'POST'), 'testcase.create');
+    assert.equal(permissionForRequest('/feedback/create-metadata', 'GET'), 'feedback.manage');
     assert.equal(permissionForRequest('/test-cases/ai-authoring-preview', 'POST'), 'testcase.ai');
+    assert.equal(permissionForRequest('/test-data-sets/ai-generate-preview', 'POST'), 'data.ai');
     assert.equal(permissionForRequest('/test-cases/automation/learning-cache/export.csv', 'GET'), 'automation.repository.export');
     assert.equal(permissionForRequest('/test-cases/automation/learning-cache/import', 'POST'), 'automation.repository.import');
     assert.equal(permissionForRequest('/executions/RUN-1/cases/CASE-1/steps/STEP-1/run', 'POST'), 'run.execute');
@@ -201,11 +208,13 @@ describe('feature flag defaults', () => {
       'qaira.manual.runs',
       'qaira.ai.requirement_design',
       'qaira.ai.test_authoring',
+      'qaira.ai.test_data_generation',
       'qaira.automation.builder',
       'qaira.ai.automation',
       'qaira.automation.step_recording',
       'qaira.automation.local_execution',
       'qaira.automation.remote_execution',
+      'qaira.automation.parallel_execution',
       'qaira.automation.step_code',
       'qaira.ai.execution_analysis',
       'qaira.ai.quality_insights'

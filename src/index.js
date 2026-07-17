@@ -3,6 +3,9 @@ import qairaSchema from './qairaSchema.js';
 import {
   executeAgenticWorkflowRun,
   handleQairaApi,
+  processAiRequirementGenerationJob,
+  processAiTestCaseGenerationJob,
+  processRequirementImportJob,
   synchronizeJiraAdministratorMemberships,
   workspaceSummary
 } from './qairaApi.js';
@@ -76,8 +79,43 @@ const definitions = {
 // makeResolver avoids CommonJS/ESM constructor interop problems in Node 22.
 export const handler = makeResolver(definitions);
 
-export async function agenticWorkflowConsumer(event = {}) {
-  const body = event.body || {};
+function decodeAsyncValue(value) {
+  if (typeof value !== 'string') return value;
+  try { return JSON.parse(value); } catch { return {}; }
+}
+
+function unwrapAsyncPayload(value, depth = 0) {
+  const decoded = decodeAsyncValue(value);
+  if (!decoded || typeof decoded !== 'object' || depth > 6) return {};
+  if (decoded.jobType || decoded.runId) return decoded;
+  for (const key of ['body', 'payload', 'eventPayload', 'data', 'message']) {
+    if (decoded[key] !== undefined) {
+      const unwrapped = unwrapAsyncPayload(decoded[key], depth + 1);
+      if (unwrapped.jobType || unwrapped.runId || Object.keys(unwrapped).length) return unwrapped;
+    }
+  }
+  return decoded;
+}
+
+function asyncPayloads(event = {}) {
+  const decoded = decodeAsyncValue(event);
+  const source = decoded?.events || decoded?.items || decoded?.records || decoded;
+  const items = Array.isArray(source) ? source : [source];
+  return items.map((item) => unwrapAsyncPayload(item)).filter((item) => item && typeof item === 'object' && Object.keys(item).length);
+}
+
+function retryCountFor(event = {}, payload = {}) {
+  return Number(
+    event.retryContext?.retryCount
+      || event.retry_context?.retryCount
+      || payload.retryContext?.retryCount
+      || payload.retry_context?.retryCount
+      || 0
+  );
+}
+
+async function dispatchAgenticWorkflowPayload(body = {}, event = {}) {
+  const retryCount = retryCountFor(event, body);
   if (body.jobType === 'sync-jira-admin-memberships') {
     return synchronizeJiraAdministratorMemberships({
       accountId: body.accountId,
@@ -88,11 +126,48 @@ export async function agenticWorkflowConsumer(event = {}) {
       fingerprint: body.fingerprint
     });
   }
+  if (body.jobType === 'requirements-bulk-import') {
+    return processRequirementImportJob({
+      projectKey: body.projectKey,
+      jobId: body.jobId,
+      transactionId: body.transactionId,
+      retryCount
+    });
+  }
+  if (body.jobType === 'ai-requirement-generation') {
+    return processAiRequirementGenerationJob({
+      projectKey: body.projectKey,
+      jobId: body.jobId,
+      retryCount
+    });
+  }
+  if (body.jobType === 'ai-test-case-generation') {
+    return processAiTestCaseGenerationJob({
+      projectKey: body.projectKey,
+      jobId: body.jobId,
+      retryCount
+    });
+  }
   return executeAgenticWorkflowRun({
     projectKey: body.projectKey,
     runId: body.runId,
-    retryCount: Number(event.retryContext?.retryCount || 0)
+    retryCount
   });
+}
+
+export async function agenticWorkflowConsumer(event = {}) {
+  const payloads = asyncPayloads(event);
+  if (!payloads.length) {
+    console.warn('Qaira async consumer received an event without a usable body.', {
+      eventKeys: event && typeof event === 'object' ? Object.keys(event) : []
+    });
+    return { processed: 0, ignored: true, reason: 'empty-event-body' };
+  }
+  const results = [];
+  for (const payload of payloads) {
+    results.push(await dispatchAgenticWorkflowPayload(payload, event));
+  }
+  return payloads.length === 1 ? results[0] : { processed: results.length, results };
 }
 
 function actionKeyFrom(payload = {}) {

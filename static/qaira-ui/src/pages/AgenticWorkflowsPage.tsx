@@ -26,8 +26,11 @@ import { Panel } from "../components/Panel";
 import { RichTextContent, RichTextEditor, richTextToPlainText } from "../components/RichTextEditor";
 import { StatusBadge } from "../components/StatusBadge";
 import { ToastMessage } from "../components/ToastMessage";
+import { useFeatureFlags } from "../hooks/useFeatureFlags";
 import { useCurrentAppType, useCurrentProject } from "../hooks/useCurrentProject";
 import { api } from "../lib/api";
+import { areFeatureFlagsEnabled } from "../lib/featureFlags";
+import { hasPermission } from "../lib/permissions";
 import { readDefaultCatalogViewMode } from "../lib/viewPreferences";
 import type {
   AgenticWorkflow,
@@ -596,6 +599,15 @@ export function AgenticWorkflowsPage() {
   const queryClient = useQueryClient();
   const [searchParams, setSearchParams] = useSearchParams();
   const { session } = useAuth();
+  const featureFlagsQuery = useFeatureFlags(Boolean(session));
+  const isAgenticWorkflowsEnabled = areFeatureFlagsEnabled(
+    featureFlagsQuery.data,
+    ["qaira.ai.agentic_workflows"]
+  );
+  const canManageAgenticWorkflows = isAgenticWorkflowsEnabled
+    && hasPermission(session, "agentic_workflow.manage");
+  const canRunAgenticWorkflows = isAgenticWorkflowsEnabled
+    && hasPermission(session, "agentic_workflow.run");
   const [projectId, setProjectId] = useCurrentProject();
   const [appTypeId, setAppTypeId] = useCurrentAppType(projectId);
   const activeTab: WorkflowTab = searchParams.get("view") === "runs" ? "runs" : "workflows";
@@ -1225,7 +1237,7 @@ export function AgenticWorkflowsPage() {
   };
 
   const saveCurrentDraft = async () => {
-    if (!draft) {
+    if (!draft || !canManageAgenticWorkflows) {
       return null;
     }
 
@@ -1234,11 +1246,13 @@ export function AgenticWorkflowsPage() {
   };
 
   const runCurrentDraft = async () => {
-    if (!draft) {
+    if (!draft || !canRunAgenticWorkflows) {
       return;
     }
 
-    const workflow = await saveCurrentDraft();
+    const workflow = canManageAgenticWorkflows
+      ? await saveCurrentDraft()
+      : workflows.find((candidate) => candidate.id === draft.id) || null;
     if (workflow) {
       runMutation.mutate(workflow);
     }
@@ -1336,7 +1350,12 @@ export function AgenticWorkflowsPage() {
               selectedCount={selectedActionIds.length}
             />
             {activeTab === "workflows" ? (
-              <button className="primary-button catalog-selection-button" disabled={emptyScope} onClick={() => openDraft()} type="button">
+              <button
+                className="primary-button catalog-selection-button"
+                disabled={emptyScope || !canManageAgenticWorkflows}
+                onClick={() => openDraft()}
+                type="button"
+              >
                 <AddIcon />
                 <span>Create Agentic Workflow</span>
               </button>
@@ -1465,7 +1484,7 @@ export function AgenticWorkflowsPage() {
           actions={(
             <div className="agentic-playground-actions">
               <button className="ghost-button" onClick={closeDraft} type="button">Back</button>
-              {draft.id ? (
+              {draft.id && canManageAgenticWorkflows ? (
                 <button
                   className="ghost-button danger"
                   disabled={deleteMutation.isPending}
@@ -1475,11 +1494,18 @@ export function AgenticWorkflowsPage() {
                   Delete
                 </button>
               ) : null}
-              <button className="ghost-button agentic-save-button" disabled={saveMutation.isPending} onClick={saveCurrentDraft} type="button">
-                <SaveIcon />
-                Save
-              </button>
-              <button className="primary-button" disabled={saveMutation.isPending || runMutation.isPending} onClick={runCurrentDraft} type="button">
+              {canManageAgenticWorkflows ? (
+                <button className="ghost-button agentic-save-button" disabled={saveMutation.isPending} onClick={saveCurrentDraft} type="button">
+                  <SaveIcon />
+                  Save
+                </button>
+              ) : null}
+              <button
+                className="primary-button"
+                disabled={!canRunAgenticWorkflows || saveMutation.isPending || runMutation.isPending || (!draft.id && !canManageAgenticWorkflows)}
+                onClick={runCurrentDraft}
+                type="button"
+              >
                 <PlayIcon />
                 Run workflow
               </button>

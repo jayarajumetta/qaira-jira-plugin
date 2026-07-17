@@ -14,16 +14,20 @@ export function RunTypeSelector({
   value,
   onChange,
   disabled = false,
+  allowedModes = ["manual", "local", "remote"],
   className = ""
 }: {
   value: RunStartMode;
   onChange: (value: RunStartMode) => void;
   disabled?: boolean;
+  allowedModes?: RunStartMode[];
   className?: string;
 }) {
+  const visibleOptions = RUN_TYPE_OPTIONS.filter((option) => allowedModes.includes(option.value));
+
   return (
     <div className={["run-type-selector", className].filter(Boolean).join(" ")} role="group" aria-label="Run type">
-      {RUN_TYPE_OPTIONS.map((option) => (
+      {visibleOptions.map((option) => (
         <button
           aria-pressed={value === option.value}
           className={value === option.value ? "run-type-option is-active" : "run-type-option"}

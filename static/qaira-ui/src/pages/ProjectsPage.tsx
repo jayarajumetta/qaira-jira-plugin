@@ -1,5 +1,5 @@
 import { FormEvent, useCallback, useDeferredValue, useEffect, useMemo, useState } from "react";
-import type { CSSProperties, ReactNode } from "react";
+import type { CSSProperties } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
 import { AddIcon, GithubIcon, GoogleDriveIcon, OpenIcon, PlayIcon, TrashIcon } from "../components/AppIcons";
@@ -38,7 +38,7 @@ import { formatAuditTimestamp } from "../lib/auditDisplay";
 import { readDefaultCatalogViewMode } from "../lib/viewPreferences";
 import { hasPermission } from "../lib/permissions";
 import { resolveVisibleEmail } from "../lib/userDisplay";
-import type { AppType, Execution, ExecutionResult, Integration, Project, WorkspaceTransaction } from "../types";
+import type { AppType, Execution, ExecutionResult, Project, WorkspaceTransaction } from "../types";
 
 type ProjectSection = "members" | "appTypes";
 
@@ -315,81 +315,6 @@ function ProjectProgressBar({
       </div>
       <ProgressMeter hideCopy tone={tone} value={safeValue} />
     </div>
-  );
-}
-
-function readIntegrationConfigValue(integration: Integration | null, keys: string[]) {
-  if (!integration?.config) {
-    return "";
-  }
-
-  for (const key of keys) {
-    const value = integration.config[key];
-    if (typeof value === "string" && value.trim()) {
-      return value.trim();
-    }
-  }
-
-  return "";
-}
-
-function ProjectSyncStatusCard({
-  actionLabel,
-  configuredSummary,
-  configureLabel,
-  icon,
-  info,
-  integration,
-  lastTransaction,
-  missingSummary,
-  onConfigure,
-  title
-}: {
-  actionLabel: string;
-  configuredSummary: string;
-  configureLabel: string;
-  icon: ReactNode;
-  info: string;
-  integration: Integration | null;
-  lastTransaction?: WorkspaceTransaction;
-  missingSummary: string;
-  onConfigure: () => void;
-  title: string;
-}) {
-  const isConfigured = Boolean(integration);
-  const mode = String(integration?.config?.schedule_mode || "manual");
-  const lastActivity = lastTransaction
-    ? formatAuditTimestamp(lastTransaction.completed_at || lastTransaction.created_at, "Not recorded")
-    : formatAuditTimestamp(typeof integration?.config?.last_synced_at === "string" ? integration.config.last_synced_at : undefined, "Not recorded");
-
-  return (
-    <article className={isConfigured ? "project-sync-status-card is-configured" : "project-sync-status-card"}>
-      <div className="project-sync-status-head">
-        <span className="project-sync-status-icon" aria-hidden="true">{icon}</span>
-        <div>
-          <div className="project-sync-status-title-row">
-            <strong>{title}</strong>
-            <InfoTooltip content={info} label={`${title} information`} />
-          </div>
-          <span className={isConfigured ? "project-sync-status-badge is-ready" : "project-sync-status-badge"}>
-            {isConfigured ? "Ready" : "Not configured"}
-          </span>
-        </div>
-      </div>
-      <p>{isConfigured ? configuredSummary : missingSummary}</p>
-      {isConfigured ? (
-        <div className="project-sync-status-meta">
-          <span><b>Mode</b>{mode}</span>
-          <span><b>Last</b>{lastActivity}</span>
-        </div>
-      ) : (
-        <button className="ghost-button project-sync-configure-button" onClick={onConfigure} type="button">
-          <OpenIcon />
-          <span>{configureLabel}</span>
-        </button>
-      )}
-      {isConfigured ? <span className="project-sync-status-action">{actionLabel}</span> : null}
-    </article>
   );
 }
 
@@ -1941,11 +1866,6 @@ export function ProjectsPage() {
                       className="ghost-button"
                       disabled={!canSyncProjects || !focusedGoogleDriveIntegration || queueProjectSync.isPending}
                       onClick={() => focusedProject && queueProjectSync.mutate({ projectId: focusedProject.id, provider: "google_drive" })}
-                      title={
-                        focusedGoogleDriveIntegration
-                          ? `Last backup: ${lastProjectBackupByProvider.google_drive ? formatAuditTimestamp(lastProjectBackupByProvider.google_drive.completed_at || lastProjectBackupByProvider.google_drive.created_at, "Not recorded") : "Not recorded"}`
-                          : "Backup is off until this project is mapped to a Google Drive integration"
-                      }
                       type="button"
                     >
                       <GoogleDriveIcon />
@@ -1955,11 +1875,6 @@ export function ProjectsPage() {
                       className="ghost-button"
                       disabled={!canSyncProjects || !focusedGithubIntegration || queueProjectSync.isPending}
                       onClick={() => focusedProject && queueProjectSync.mutate({ projectId: focusedProject.id, provider: "github" })}
-                      title={
-                        focusedGithubIntegration
-                          ? `Last sync: ${lastProjectBackupByProvider.github ? formatAuditTimestamp(lastProjectBackupByProvider.github.completed_at || lastProjectBackupByProvider.github.created_at, "Not recorded") : "Not recorded"}`
-                          : "Repository sync is off until this project is mapped to a GitHub integration"
-                      }
                       type="button"
                     >
                       <GithubIcon />
@@ -1975,39 +1890,6 @@ export function ProjectsPage() {
                         <span>{deleteProject.isPending ? "Deleting…" : "Delete project"}</span>
                       </button>
                     ) : null}
-                  </div>
-                  <div className="project-sync-status-grid">
-                    <ProjectSyncStatusCard
-                      actionLabel="Artifact backup"
-                      configuredSummary={`Artifacts are mapped to ${readIntegrationConfigValue(focusedGoogleDriveIntegration, ["folder_name", "folder_id", "drive_folder_id"]) || "the configured Drive folder"}.`}
-                      configureLabel="Configure Drive"
-                      icon={<GoogleDriveIcon />}
-                      info="Google Drive stores compressed project artifacts and run evidence snapshots when the project has an active Drive integration."
-                      integration={focusedGoogleDriveIntegration}
-                      lastTransaction={lastProjectBackupByProvider.google_drive}
-                      missingSummary="Backups are off. Connect Drive when this project needs artifact retention outside QAira."
-                      onConfigure={() => navigate("/integrations")}
-                      title="Drive backup"
-                    />
-                    <ProjectSyncStatusCard
-                      actionLabel="Automation sync"
-                      configuredSummary={`Automation code syncs to ${
-                        [
-                          readIntegrationConfigValue(focusedGithubIntegration, ["owner"]),
-                          readIntegrationConfigValue(focusedGithubIntegration, ["repo", "repository"])
-                        ].filter(Boolean).join("/")
-                        || readIntegrationConfigValue(focusedGithubIntegration, ["repository_full_name"])
-                        || "the configured repository"
-                      }${readIntegrationConfigValue(focusedGithubIntegration, ["branch"]) ? ` on ${readIntegrationConfigValue(focusedGithubIntegration, ["branch"])}` : ""}.`}
-                      configureLabel="Configure repo"
-                      icon={<GithubIcon />}
-                      info="GitHub sync publishes generated automation code and manifests to the repository mapped to this project."
-                      integration={focusedGithubIntegration}
-                      lastTransaction={lastProjectBackupByProvider.github}
-                      missingSummary="Repository sync is off. Connect GitHub when generated automation should be versioned in a repo."
-                      onConfigure={() => navigate("/integrations")}
-                      title="GitHub repository"
-                    />
                   </div>
                 </div>
               ) : (
@@ -2076,10 +1958,6 @@ export function ProjectsPage() {
                           <option key={roleOption.id} value={roleOption.id}>{roleOption.name}</option>
                         ))}
                       </select>
-                      {!assignableProjectRoles.some((roleOption) => roleOption.id === member.role_id) ? (
-                        <span>{role?.name || member.role_id} · derived by Jira</span>
-                      ) : null}
-                      {isCurrentUser ? <span className="text-muted project-member-note">You</span> : null}
                       <button
                         className="ghost-button danger"
                         disabled={!canManageProjectMembers || isJiraManagedAdministrator}

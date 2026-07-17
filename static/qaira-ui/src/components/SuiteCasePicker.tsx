@@ -41,6 +41,7 @@ type OrderedSelectionPickerProps = {
   selectedHint: string;
   emptyHint: string;
   showCaseFilters?: boolean;
+  showSelectionSummary?: boolean;
 };
 
 const moveItem = <T,>(items: T[], fromIndex: number, toIndex: number) => {
@@ -78,15 +79,16 @@ export function SuiteCasePicker({
   return (
     <OrderedSelectionPicker
       description={description}
-      emptyHint="Select cases to assign them into this suite."
+      emptyHint=""
       emptyMessage={emptyMessage}
       heading={heading}
       itemLabel="test case"
       items={items}
       onChange={onChange}
-      selectedHint="Checked cases stay pinned to the top and will be saved in this order."
+      selectedHint=""
       selectedIds={selectedCaseIds}
       showCaseFilters
+      showSelectionSummary={false}
     />
   );
 }
@@ -135,7 +137,8 @@ function OrderedSelectionPicker({
   itemLabel,
   selectedHint,
   emptyHint,
-  showCaseFilters = false
+  showCaseFilters = false,
+  showSelectionSummary = true
 }: OrderedSelectionPickerProps) {
   const [searchTerm, setSearchTerm] = useState("");
   const itemById = useMemo(() => new Map(items.map((item) => [item.id, item])), [items]);
@@ -206,11 +209,20 @@ function OrderedSelectionPicker({
       <div className="suite-case-picker-toolbar">
         <div>
           <strong>{heading}</strong>
-          <span>{description}</span>
+          {description ? <span>{description}</span> : null}
         </div>
         <div className="suite-case-picker-actions">
+          {showCaseFilters ? (
+            <input
+              aria-label={`Search ${itemLabel}s`}
+              className="suite-case-picker-search"
+              placeholder={itemLabel === "test case" ? "Search test cases" : `Search ${itemLabel}s`}
+              value={searchTerm}
+              onChange={(event) => setSearchTerm(event.target.value)}
+            />
+          ) : null}
           <button className="ghost-button" disabled={!allVisibleItemIds.length || areAllVisibleItemsSelected} onClick={selectVisibleItems} type="button">
-            Select visible
+            Select all
           </button>
           <button className="ghost-button" disabled={!selectedIds.length} onClick={() => onChange([])} type="button">
             Clear
@@ -218,27 +230,18 @@ function OrderedSelectionPicker({
         </div>
       </div>
 
-      {showCaseFilters ? (
-        <div className="suite-case-picker-filters">
-          <input
-            aria-label={`Search ${itemLabel}s`}
-            placeholder={itemLabel === "test case" ? "Search test cases by title, label, or module" : `Search ${itemLabel}s`}
-            value={searchTerm}
-            onChange={(event) => setSearchTerm(event.target.value)}
-          />
+      {showSelectionSummary ? (
+        <div className="detail-summary suite-case-picker-summary">
+          <strong>{selectedItems.length} {itemLabel}{selectedItems.length === 1 ? "" : "s"} selected</strong>
+          <span>
+            {hasActiveFilters
+              ? `${visibleSelectedCount} selected in the current filtered list.`
+              : selectedItems.length
+                ? selectedHint
+                : emptyHint}
+          </span>
         </div>
       ) : null}
-
-      <div className="detail-summary suite-case-picker-summary">
-        <strong>{selectedItems.length} {itemLabel}{selectedItems.length === 1 ? "" : "s"} selected</strong>
-        <span>
-          {hasActiveFilters
-            ? `${visibleSelectedCount} selected in the current filtered list.`
-            : selectedItems.length
-              ? selectedHint
-              : emptyHint}
-        </span>
-      </div>
 
       {!items.length ? <div className="empty-state compact">{emptyMessage}</div> : null}
       {items.length && !orderedItems.length ? <div className="empty-state compact">No {itemLabel}s match the current filters.</div> : null}

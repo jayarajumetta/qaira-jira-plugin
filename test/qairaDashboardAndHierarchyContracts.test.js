@@ -21,12 +21,17 @@ const issuesSource = read('../static/qaira-ui/src/pages/IssuesPage.tsx');
 const executionsSource = read('../static/qaira-ui/src/pages/ExecutionsPage.tsx');
 const workspaceDataSource = read('../static/qaira-ui/src/hooks/useWorkspaceData.ts');
 const manifestSource = read('../manifest.yml');
+const notificationCenterSource = read('../static/qaira-ui/src/lib/notificationCenter.ts');
 
 test('hierarchy health is shared, derived, and rendered for assigned and unassigned scope', () => {
   assert.match(requirementSource, /deriveIterationHealth/);
   assert.match(requirementSource, /Unassigned iteration/);
   assert.match(requirementSource, /label: "Coverage"/);
-  assert.match(requirementSource, /label: "Readiness"/);
+  assert.match(requirementSource, /label: "Execution"/);
+  assert.match(requirementSource, /label: "Pass rate"/);
+  assert.match(requirementSource, /label: "P1\/P2 bugs"/);
+  assert.match(requirementSource, /label: "Req risk"/);
+  assert.match(apiSource, /severity: target\.fields\?\.priority\?\.name \|\| null/);
   assert.match(testCaseSource, /deriveModuleHealth/);
   assert.match(testCaseSource, /Unassigned module/);
   assert.match(testCaseSource, /label: "Traceability"/);
@@ -48,6 +53,40 @@ test('custom dashboards use one bounded batch request with stakeholder templates
   assert.match(customDashboardSource, /Create dashboard/);
   assert.match(customDashboardSource, /Edit dashboard/);
   assert.match(customDashboardSource, /deleteSelectedDashboard/);
+});
+
+test('custom dashboard reports capture the live styled DOM and fail closed when fidelity is unavailable', () => {
+  assert.match(customDashboardSource, /import \{ toJpeg \} from "html-to-image"/);
+  assert.match(customDashboardSource, /fitDashboardSnapshotToForgePayload/);
+  assert.match(customDashboardSource, /maxDataUrlLength = 410_000/);
+  assert.doesNotMatch(customDashboardSource, /snapshot = undefined/);
+  assert.doesNotMatch(customDashboardSource, /custom-dashboard-toolbar-summary/);
+  assert.match(stylesSource, /\.custom-dashboard-selector-field/);
+  assert.match(apiSource, /DASHBOARD_SNAPSHOT_REQUIRED/);
+  assert.match(apiSource, /renderedSnapshotDataUrl \? \[\] : await mapInBatches/);
+  assert.match(apiSource, /base64\.length > 450_000/);
+});
+
+test('bug creation uses compact metadata controls without redundant section copy', () => {
+  assert.doesNotMatch(issuesSource, /Title, classification, ownership, and linked execution context\./);
+  assert.match(issuesSource, /issue-form-compact-grid issue-form-classification-grid/);
+  assert.match(issuesSource, /bug-field-linked-run/);
+  assert.match(stylesSource, /\.bug-field-assignee/);
+  assert.match(stylesSource, /\.bug-field-environment/);
+});
+
+test('notifications are persistent event records delivered through Forge Realtime and native flags', () => {
+  assert.match(apiSource, /import \{ publishGlobal, signRealtimeToken \} from '@forge\/realtime'/);
+  assert.match(apiSource, /mutationNotificationDescriptor/);
+  assert.match(apiSource, /createAppNotification/);
+  assert.match(apiSource, /NOTIFICATION_RETENTION_COUNT = 120/);
+  assert.match(apiSource, /recordMutationNotifications\(payload, result\)/);
+  assert.match(apiSource, /pathname === '\/notifications\/realtime-token'/);
+  assert.match(apiSource, /safelyCreateAppNotification/);
+  assert.match(shellSource, /realtime\.subscribeGlobal\(NOTIFICATION_REALTIME_CHANNEL/);
+  assert.match(shellSource, /showFlag\(/);
+  assert.match(notificationCenterSource, /NOTIFICATION_FEED: NotificationCenterItem\[\] = \[\]/);
+  assert.doesNotMatch(notificationCenterSource, /Nightly regression completed/);
 });
 
 test('Jira owns user identity while Qaira roles remain explicitly permissioned', () => {

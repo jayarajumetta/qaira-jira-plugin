@@ -190,6 +190,23 @@ type CatalogViewMode = "tile" | "list";
 
 type ExecutionAssigneeOption = AssigneeOption;
 
+function ReportBugSplitActionButton({
+  disabled,
+  onReportBug
+}: {
+  disabled?: boolean;
+  onReportBug: () => void;
+}) {
+  return (
+    <div className="create-run-action-button report-bug-split-action-button issue-report-split is-single">
+      <button className="run-action-main issue-report-split-main" disabled={disabled} onClick={onReportBug} type="button">
+        <BugIcon />
+        <span>Report Bug</span>
+      </button>
+    </div>
+  );
+}
+
 type ExecutionEvidencePreviewState = {
   attachmentId?: string;
   stepLabel: string;
@@ -498,6 +515,11 @@ function toStepView(snapshot: ExecutionStepSnapshot): TestStep {
     group_kind: snapshot.group_kind,
     reusable_group_id: snapshot.reusable_group_id
   };
+}
+
+function executionStepText(value?: string | null, parameterValues: Record<string, string> = {}) {
+  const plainText = richTextToPlainText(value);
+  return resolveStepParameterText(plainText, parameterValues) || plainText;
 }
 
 function isStepGroupStart(steps: TestStep[], index: number) {
@@ -1282,12 +1304,20 @@ export function ExecutionsPage() {
   const featureFlagsQuery = useFeatureFlags(Boolean(session));
   const canCreateManualRuns = hasPermission(session, "run.create")
     && areFeatureFlagsEnabled(featureFlagsQuery.data, ["qaira.manual.runs"]);
+  const canExecuteRuns = hasPermission(session, "run.execute")
+    && areFeatureFlagsEnabled(featureFlagsQuery.data, ["qaira.manual.runs"]);
   const canRunLocalAutomation = hasPermission(session, "automation.run.local")
     && areFeatureFlagsEnabled(featureFlagsQuery.data, ["qaira.automation.workspace", "qaira.automation.local_execution"]);
   const canRunRemoteAutomation = hasPermission(session, "automation.run.remote")
     && areFeatureFlagsEnabled(featureFlagsQuery.data, ["qaira.automation.workspace", "qaira.automation.remote_execution"]);
+  const canConfigureParallelAutomation = hasPermission(session, "automation.run.parallel")
+    && areFeatureFlagsEnabled(featureFlagsQuery.data, ["qaira.automation.workspace", "qaira.automation.parallel_execution"]);
   const canUseRunAi = hasPermission(session, "run.ai")
     && areFeatureFlagsEnabled(featureFlagsQuery.data, ["qaira.ai.execution_analysis"]);
+  const canViewRunAutomationCode = hasPermission(session, "automation.code.view")
+    && areFeatureFlagsEnabled(featureFlagsQuery.data, ["qaira.automation.workspace", "qaira.automation.step_code"]);
+  const canExportRunReports = hasPermission(session, "run.report.export");
+  const canShareRunReports = hasPermission(session, "run.report.share");
   const canViewRunEvidence = hasPermission(session, "result.view")
     && hasPermission(session, "attachment.view");
   const canCreateRunEvidence = hasPermission(session, "result.manage")
@@ -1310,11 +1340,24 @@ export function ExecutionsPage() {
   const [editingScheduleId, setEditingScheduleId] = useState("");
   const [selectedExecutionId, setSelectedExecutionId] = useState("");
   const [selectedScheduleId, setSelectedScheduleId] = useState("");
+
+  useEffect(() => {
+    if (!canUseRunAi && executionCreateMode === "smart") {
+      setExecutionCreateMode("manual");
+    }
+    if (!canConfigureParallelAutomation && executionParallelEnabled) {
+      setExecutionParallelEnabled(false);
+      setExecutionParallelCount(1);
+    }
+    if (executionStartMode === "local" && !canRunLocalAutomation) setExecutionStartMode("manual");
+    if (executionStartMode === "remote" && !canRunRemoteAutomation) setExecutionStartMode("manual");
+  }, [canConfigureParallelAutomation, canRunLocalAutomation, canRunRemoteAutomation, canUseRunAi, executionCreateMode, executionParallelEnabled, executionStartMode]);
   const [selectedOperationId, setSelectedOperationId] = useState("");
   const [focusedSuiteId, setFocusedSuiteId] = useState("");
   const [expandedExecutionSuiteIds, setExpandedExecutionSuiteIds] = useState<string[]>([]);
   const [selectedTestCaseId, setSelectedTestCaseId] = useState("");
   const [expandedExecutionStepGroupIds, setExpandedExecutionStepGroupIds] = useState<string[]>([]);
+  const [expandedExecutionStepSections, setExpandedExecutionStepSections] = useState({ preconditions: true, testSteps: true });
   const [expandedExecutionStepIds, setExpandedExecutionStepIds] = useState<string[]>([]);
   const [bulkSelectedStepIds, setBulkSelectedStepIds] = useState<string[]>([]);
   const [executionName, setExecutionName] = useState("");
@@ -1381,6 +1424,7 @@ export function ExecutionsPage() {
   const [executionApiDetailState, setExecutionApiDetailState] = useState<ExecutionApiDetailState | null>(null);
   const [isExecutionContextModalOpen, setIsExecutionContextModalOpen] = useState(false);
   const [isReportEmailModalOpen, setIsReportEmailModalOpen] = useState(false);
+  const [reportEmailCaseId, setReportEmailCaseId] = useState("");
   const [reportEmailDraft, setReportEmailDraft] = useState("");
   const [codePreviewState, setCodePreviewState] = useState<{ title: string; subtitle: string; code: string } | null>(null);
   const [executionAssignmentDraftIds, setExecutionAssignmentDraftIds] = useState<string[]>([]);
@@ -1575,9 +1619,17 @@ export function ExecutionsPage() {
   const downloadExecutionReport = useMutation({
     mutationFn: (executionId: string) => api.executions.downloadReportPdf(executionId)
   });
+  const downloadExecutionCaseReport = useMutation({
+    mutationFn: ({ executionId, testCaseId }: { executionId: string; testCaseId: string }) =>
+      api.executions.downloadCaseReportPdf(executionId, testCaseId)
+  });
   const shareExecutionReport = useMutation({
     mutationFn: ({ executionId, recipients }: { executionId: string; recipients: string[] }) =>
       api.executions.shareReport(executionId, { recipients })
+  });
+  const shareExecutionCaseReport = useMutation({
+    mutationFn: ({ executionId, testCaseId, recipients }: { executionId: string; testCaseId: string; recipients: string[] }) =>
+      api.executions.shareCaseReport(executionId, testCaseId, { recipients })
   });
   const createResult = useMutation({ mutationFn: api.executionResults.create });
   const updateResult = useMutation({
@@ -2266,6 +2318,7 @@ export function ExecutionsPage() {
 
   useEffect(() => {
     setExpandedExecutionStepGroupIds([]);
+    setExpandedExecutionStepSections({ preconditions: true, testSteps: true });
   }, [selectedExecutionId, selectedTestCaseId]);
 
   useEffect(() => {
@@ -2310,9 +2363,17 @@ export function ExecutionsPage() {
     () => (stepsByCaseId[selectedTestCaseId] || []).slice().sort((left, right) => left.step_order - right.step_order),
     [selectedTestCaseId, stepsByCaseId]
   );
+  const executionPreconditionSteps = useMemo(
+    () => selectedSteps.filter((step) => (step.group_name || "").trim().toLowerCase() === "preconditions"),
+    [selectedSteps]
+  );
+  const executionMainSteps = useMemo(
+    () => selectedSteps.filter((step) => (step.group_name || "").trim().toLowerCase() !== "preconditions"),
+    [selectedSteps]
+  );
   const executionStepBlocks = useMemo<ExecutionStepBlock[]>(
     () =>
-      selectedSteps.reduce<ExecutionStepBlock[]>((blocks, step) => {
+      executionMainSteps.reduce<ExecutionStepBlock[]>((blocks, step) => {
         const previousBlock = blocks[blocks.length - 1];
 
         if (step.group_id && previousBlock?.groupId === step.group_id) {
@@ -2330,7 +2391,7 @@ export function ExecutionsPage() {
 
         return blocks;
       }, []),
-    [selectedSteps]
+    [executionMainSteps]
   );
   const executionStepGroupIds = useMemo(
     () => executionStepBlocks.map((block) => block.groupId).filter((groupId): groupId is string => Boolean(groupId)),
@@ -2386,7 +2447,10 @@ export function ExecutionsPage() {
 
   useEffect(() => {
     const validGroupIds = new Set(executionStepGroupIds);
-    setExpandedExecutionStepGroupIds((current) => current.filter((groupId) => validGroupIds.has(groupId)));
+    setExpandedExecutionStepGroupIds((current) => {
+      const validCurrent = current.filter((groupId) => validGroupIds.has(groupId));
+      return !current.length && executionStepGroupIds.length ? executionStepGroupIds : validCurrent;
+    });
   }, [executionStepGroupIds]);
 
   useEffect(() => {
@@ -2436,14 +2500,14 @@ export function ExecutionsPage() {
   const stepAutomationDetails = selectedCaseLogs.stepAutomationDetails || {};
   const hasSelectedStepAutomationCode = useMemo(
     () =>
-      selectedSteps.some((step) =>
+      canViewRunAutomationCode && selectedSteps.some((step) =>
         (
           stepAutomationDetails[step.id]?.code
           || step.automation_code
           || (step.step_type === "api" && step.api_request ? resolveStepAutomationCode(step) : "")
         ).trim()
       ),
-    [selectedSteps, stepAutomationDetails]
+    [canViewRunAutomationCode, selectedSteps, stepAutomationDetails]
   );
   const stepCaptures = useMemo(
     () => mergeExecutionStepCaptures(selectedCaseLogs.stepCaptures || {}, stepApiDetails),
@@ -2905,6 +2969,10 @@ export function ExecutionsPage() {
     if (!selectedExecution) {
       return;
     }
+    if (!canExecuteRuns) {
+      showError(new Error("Permission required: run.execute"), mode === "abort" ? "Unable to abort run" : "Unable to complete run");
+      return;
+    }
 
     const status = mode === "abort" ? "aborted" : executionProgress.failedCount ? "failed" : "completed";
     const failureMessage = mode === "abort" ? "Unable to abort run" : "Unable to complete run";
@@ -2912,9 +2980,9 @@ export function ExecutionsPage() {
     setExecutionFinalizeAction(mode);
 
     try {
-      await completeExecution.mutateAsync({ id: selectedExecution.id, status });
+      const response = await completeExecution.mutateAsync({ id: selectedExecution.id, status });
       patchExecutionCache(selectedExecution.id, {
-        status,
+        status: response.status || status,
         ended_at: new Date().toISOString()
       });
       scheduleExecutionRefresh(selectedExecution.id);
@@ -2983,7 +3051,12 @@ export function ExecutionsPage() {
 
     const selectedSmartCaseIds = selectedSmartExecutableCaseIds;
 
-	    if (executionCreateMode === "smart" && !selectedSmartCaseIds.length) {
+    if (executionCreateMode === "smart" && !canUseRunAi) {
+	  showError(new Error("Permission required: run.ai"), "Unable to create AI smart run");
+	  return;
+	}
+
+	if (executionCreateMode === "smart" && !selectedSmartCaseIds.length) {
 	      setMessageTone("error");
 	      setMessage(
         executionStartMode === "manual"
@@ -3038,8 +3111,8 @@ export function ExecutionsPage() {
         test_configuration_id: selectedExecutionConfigurationId || undefined,
         test_data_set_id: selectedExecutionDataSetId || undefined,
         execution_hooks: executionHooks.length ? executionHooks : undefined,
-        parallel_enabled: executionParallelEnabled,
-        parallel_count: executionParallelEnabled ? executionParallelCount : 1,
+        parallel_enabled: canConfigureParallelAutomation && executionParallelEnabled,
+        parallel_count: canConfigureParallelAutomation && executionParallelEnabled ? executionParallelCount : 1,
         execution_mode: executionStartMode,
         engine_base_url: executionStartMode === "local" ? "http://host.docker.internal:4301" : undefined,
         assigned_to_ids: selectedExecutionAssigneeIds.length ? selectedExecutionAssigneeIds : undefined,
@@ -3196,19 +3269,19 @@ export function ExecutionsPage() {
 	    }
 
 	    const hasModeAccess = mode === "local"
-	      ? canRunLocalAutomation
+	      ? canRunLocalAutomation && canExecuteRuns
 	      : mode === "remote"
-	        ? canRunRemoteAutomation
-	        : canCreateManualRuns;
+	        ? canRunRemoteAutomation && canExecuteRuns
+	        : canExecuteRuns;
 
 	    if (!hasModeAccess) {
 	      showError(
 	        new Error(
 	          mode === "local"
-	            ? "Permission required: automation.run.local"
+	            ? "Permission required: run.execute and automation.run.local"
 	            : mode === "remote"
-	              ? "Permission required: automation.run.remote"
-	              : "Permission required: run.create"
+	              ? "Permission required: run.execute and automation.run.remote"
+	              : "Permission required: run.execute"
 	        ),
 	        "Unable to start run"
 	      );
@@ -3259,23 +3332,72 @@ export function ExecutionsPage() {
   };
 
   const handleOpenReportEmailModal = () => {
+    setReportEmailCaseId("");
     setReportEmailDraft(session?.user.email || "");
     setIsReportEmailModalOpen(true);
   };
 
-  const handleReportSelectedExecutionIssue = () => {
+  const handleDownloadExecutionCaseReport = async () => {
+    if (!selectedExecution || !selectedExecutionCase) {
+      return;
+    }
+
+    try {
+      const blob = await downloadExecutionCaseReport.mutateAsync({
+        executionId: selectedExecution.id,
+        testCaseId: selectedExecutionCase.id
+      });
+      const url = window.URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `${(selectedExecutionCase.title || selectedExecutionCase.id || "qaira-case-run-report").replace(/[^A-Za-z0-9._-]+/g, "-")}.pdf`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.URL.revokeObjectURL(url);
+      showSuccess("Test case run report PDF exported.");
+    } catch (error) {
+      showError(error, "Unable to export test case run report");
+    }
+  };
+
+  const handleOpenCaseReportEmailModal = () => {
+    if (!selectedExecutionCase) {
+      return;
+    }
+    setReportEmailCaseId(selectedExecutionCase.id);
+    setReportEmailDraft(session?.user.email || "");
+    setIsReportEmailModalOpen(true);
+  };
+
+  const handleReportSelectedExecutionIssue = (scope: "run" | "case" = "run") => {
     if (!selectedExecution) {
       return;
     }
 
+    const scopedCase = scope === "case" ? selectedExecutionCase : null;
+    const scopedCaseTitle = scopedCase ? selectedExecutionCaseReadableTitle || scopedCase.title : "";
     const params = new URLSearchParams();
     params.set("create", "1");
     params.set("run", selectedExecution.id);
     params.set("status", currentExecutionStatus);
-    params.set("title", `Run bug: ${selectedExecution.name || selectedExecution.id}`);
+    params.set("title", scopedCase
+      ? `Case bug: ${scopedCaseTitle || scopedCase.id}`
+      : `Run bug: ${selectedExecution.name || selectedExecution.id}`);
 
     if (selectedExecution.name) {
       params.set("runName", selectedExecution.name);
+    }
+    if (scopedCase) {
+      const linkedLibraryCase = smartExecutionLibraryCaseById.get(scopedCase.id);
+      const requirementIds = [...new Set([...(linkedLibraryCase?.requirement_ids || []), linkedLibraryCase?.requirement_id].filter(Boolean))] as string[];
+      params.set("testCase", scopedCase.id);
+      params.set("linked_test_case_ids", scopedCase.id);
+      params.set("testCaseTitle", scopedCaseTitle || scopedCase.title);
+      if (requirementIds.length) {
+        params.set("linked_requirement_ids", requirementIds.join(","));
+      }
+      if (scopedCase.suite_name) params.set("suiteName", scopedCase.suite_name);
     }
 
     if (selectedExecution.test_environment?.name) {
@@ -3287,12 +3409,15 @@ export function ExecutionsPage() {
     }
 
     params.set("message", [
-      "Reported from run details.",
+      scopedCase ? "Reported from a test case run." : "Reported from run details.",
       "",
       `Run ID: ${selectedExecution.id}`,
       selectedExecution.name ? `Run name: ${selectedExecution.name}` : "",
       `Run status: ${currentExecutionStatus}`,
       `Run trigger: ${selectedExecution.trigger || "manual"}`,
+      scopedCase ? `Test case ID: ${scopedCase.id}` : "",
+      scopedCase ? `Test case title: ${scopedCaseTitle || scopedCase.title}` : "",
+      scopedCase?.suite_name ? `Suite: ${scopedCase.suite_name}` : "",
       selectedExecution.test_environment?.name ? `Environment: ${selectedExecution.test_environment.name}` : "",
       selectedExecution.build ? `Build: ${selectedExecution.build}` : "",
       `Run totals: ${executionProgress.totalCases} cases, ${executionStatusCounts.failed} failed, ${executionStatusCounts.blocked} blocked`,
@@ -3321,14 +3446,21 @@ export function ExecutionsPage() {
     }
 
     try {
-      const response = await shareExecutionReport.mutateAsync({
-        executionId: selectedExecution.id,
-        recipients
-      });
+      const response = reportEmailCaseId
+        ? await shareExecutionCaseReport.mutateAsync({
+            executionId: selectedExecution.id,
+            testCaseId: reportEmailCaseId,
+            recipients
+          })
+        : await shareExecutionReport.mutateAsync({
+            executionId: selectedExecution.id,
+            recipients
+          });
       setIsReportEmailModalOpen(false);
-      showSuccess(`Run report emailed to ${response.recipients} recipient${response.recipients === 1 ? "" : "s"}.`);
+      setReportEmailCaseId("");
+      showSuccess(`${reportEmailCaseId ? "Test case run" : "Run"} report emailed to ${response.recipients} recipient${response.recipients === 1 ? "" : "s"}.`);
     } catch (error) {
-      showError(error, "Unable to email run report");
+      showError(error, reportEmailCaseId ? "Unable to email test case run report" : "Unable to email run report");
     }
   };
 
@@ -3743,7 +3875,7 @@ export function ExecutionsPage() {
     ? resolveStepParameterText(selectedExecutionCase.title, executionStepParameterValues) || selectedExecutionCase.title
     : "";
   const selectedExecutionCaseReadableDescription = selectedExecutionCase
-    ? resolveStepParameterText(selectedExecutionCase.description, executionStepParameterValues) || selectedExecutionCase.description || ""
+    ? executionStepText(selectedExecutionCase.description, executionStepParameterValues)
     : "";
 
   const handleAttachStepNetworkAutomation = async (network: NonNullable<ExecutionStepWebDetail["network"]>) => {
@@ -4736,7 +4868,6 @@ export function ExecutionsPage() {
     {
       key: "id",
       label: "Run ID",
-      defaultVisible: false,
       sortValue: (execution) => execution.id,
       render: (execution) => <DisplayIdBadge value={execution.id} />
     },
@@ -4760,6 +4891,7 @@ export function ExecutionsPage() {
     {
       key: "created",
       label: "Created",
+      defaultVisible: false,
       render: (execution) => formatExecutionTimestamp(execution.created_at, "Not recorded")
     },
     {
@@ -4771,12 +4903,14 @@ export function ExecutionsPage() {
     {
       key: "sprint",
       label: "Sprint",
+      defaultVisible: false,
       sortValue: (execution) => execution.sprint || "",
       render: (execution) => execution.sprint || "—"
     },
     {
       key: "build",
       label: "Build",
+      defaultVisible: false,
       sortValue: (execution) => execution.build || "",
       render: (execution) => execution.build || "—"
     },
@@ -4789,6 +4923,7 @@ export function ExecutionsPage() {
     {
       key: "suites",
       label: "Suites",
+      defaultVisible: false,
       render: (execution) => execution.suite_ids.length
     },
     {
@@ -4811,6 +4946,7 @@ export function ExecutionsPage() {
     {
       key: "started",
       label: "Started",
+      defaultVisible: false,
       render: (execution) => formatExecutionTimestamp(execution.started_at, "Not started yet")
     },
     {
@@ -5116,10 +5252,14 @@ export function ExecutionsPage() {
     }
   }, [executionCreateMode, executionStartMode, selectedSmartExecutionCaseIds, smartExecutionLibraryCaseById]);
 
-  const canCreateExecution =
+  const canCreateSelectedRunMode = executionStartMode === "local"
+    ? canRunLocalAutomation
+    : executionStartMode === "remote" ? canRunRemoteAutomation : canCreateManualRuns;
+  const canCreateExecution = canCreateSelectedRunMode && (
     executionCreateMode === "smart"
-      ? Boolean(projectId && appTypeId && selectedSmartExecutableCaseIds.length)
-      : Boolean(projectId && appTypeId && selectedSuiteIds.length);
+      ? Boolean(canUseRunAi && projectId && appTypeId && selectedSmartExecutableCaseIds.length)
+      : Boolean(projectId && appTypeId && selectedSuiteIds.length)
+  );
 
   const persistCaseOutcomeOnly = async (testCaseId: string, status: "passed" | "failed") => {
     const scopedAppTypeId = selectedExecution?.app_type_id;
@@ -5323,6 +5463,55 @@ export function ExecutionsPage() {
       </div>
     );
   };
+
+  const renderExecutionStepCard = (step: TestStep) => (
+    <ExecutionStepCard
+      apiDetail={stepApiDetails[step.id] || null}
+      automationDetail={stepAutomationDetails[step.id] || null}
+      availableBugs={bugs}
+      canCreateEvidence={canCreateRunEvidence}
+      canDeleteEvidence={canDeleteRunEvidence}
+      canInspectApi={step.step_type === "api" || (!step.step_type && selectedExecutionAppTypeKind === "api")}
+      canViewEvidence={canViewRunEvidence}
+      captures={stepCaptures[step.id] || stepApiDetails[step.id]?.captures || {}}
+      defectIds={stepDefects[step.id] || []}
+      evidence={stepEvidence[step.id] || null}
+      isExpanded={expandedExecutionStepIds.includes(step.id)}
+      isLinkingDefects={linkingDefectStepId === step.id}
+      isLocked={!isExecutionStarted || isExecutionLocked}
+      isOpeningEvidence={openingEvidenceStepId === step.id}
+      isRunningApi={runningExecutionApiStepId === step.id}
+      isSelected={bulkSelectedStepIds.includes(step.id)}
+      isUploadingEvidence={uploadingEvidenceStepId === step.id}
+      key={step.id}
+      note={stepNotes[step.id] || ""}
+      onAttachNetworkAutomation={(network) => void handleAttachStepNetworkAutomation(network)}
+      onDefectsChange={(defectIds) => void handleStepDefectsChange(step, defectIds)}
+      onDeleteEvidence={() => void handleDeleteStepEvidence(step)}
+      onFail={() => void handleRecordStep(step.id, "failed")}
+      onInspectApi={() => openExecutionApiDetail(step)}
+      onNoteBlur={(value) => void handleSaveStepNote(step.id, value)}
+      onPass={() => void handleRecordStep(step.id, "passed")}
+      onPreviewCode={() => openExecutionStepAutomationPreview(step)}
+      onRunStep={() => void handleRunExecutionApiStep(step)}
+      onToggle={() =>
+        setExpandedExecutionStepIds((current) =>
+          current.includes(step.id) ? current.filter((id) => id !== step.id) : [...current, step.id]
+        )
+      }
+      onToggleSelect={(checked) =>
+        setBulkSelectedStepIds((current) =>
+          checked ? [...new Set([...current, step.id])] : current.filter((id) => id !== step.id)
+        )
+      }
+      onUploadEvidence={(file) => void handleUploadStepEvidence(step, file)}
+      onViewEvidence={() => openExecutionEvidence(step, stepEvidence[step.id] as ExecutionStepEvidence)}
+      parameterValues={executionStepParameterValues}
+      status={stepStatuses[step.id] || "queued"}
+      step={step}
+      webDetail={stepWebDetails[step.id] || null}
+    />
+  );
 
   return (
     <div className="page-content page-content--executions-full">
@@ -6005,16 +6194,36 @@ export function ExecutionsPage() {
                           </button>
                           <button
                             className="ghost-button"
-                            disabled={!hasSelectedStepAutomationCode}
-                            onClick={() => {
-                              setActiveTab("overview");
-                              setExecutionStepViewMode("automation");
-                            }}
+                            disabled={!canExportRunReports || downloadExecutionCaseReport.isPending}
+                            onClick={() => void handleDownloadExecutionCaseReport()}
                             type="button"
                           >
-                            <AutomationCodeIcon />
-                            <span>Coded steps</span>
+                            <ExportIcon />
+                            <span>{downloadExecutionCaseReport.isPending ? "Exporting…" : "Export case PDF"}</span>
                           </button>
+                          <button
+                            className="ghost-button"
+                            disabled={!canShareRunReports || shareExecutionCaseReport.isPending}
+                            onClick={handleOpenCaseReportEmailModal}
+                            type="button"
+                          >
+                            <MailIcon />
+                            <span>Email case report</span>
+                          </button>
+                          {canViewRunAutomationCode ? (
+                            <button
+                              className="ghost-button"
+                              disabled={!hasSelectedStepAutomationCode}
+                              onClick={() => {
+                                setActiveTab("overview");
+                                setExecutionStepViewMode("automation");
+                              }}
+                              type="button"
+                            >
+                              <AutomationCodeIcon />
+                              <span>Coded steps</span>
+                            </button>
+                          ) : null}
                           {isExecutionLiveViewEligible ? (
                             <a
                               className="ghost-button"
@@ -6094,15 +6303,10 @@ export function ExecutionsPage() {
                                 </span>
                               </div>
                               <div className="execution-step-view-header-actions">
-                                <button
-                                  className="ghost-button"
+                                <ReportBugSplitActionButton
                                   disabled={!selectedExecution}
-                                  onClick={handleReportSelectedExecutionIssue}
-                                  type="button"
-                                >
-                                  <BugIcon />
-                                  <span>Report Bug</span>
-                                </button>
+                                  onReportBug={() => handleReportSelectedExecutionIssue(selectedExecutionCase ? "case" : "run")}
+                                />
                                 <div className="execution-step-view-toggle" role="tablist" aria-label="Step view">
                                   <button
                                     aria-selected={executionStepViewMode === "manual"}
@@ -6114,18 +6318,20 @@ export function ExecutionsPage() {
                                     <ExecutionStepsIcon />
                                     <span>Manual steps</span>
                                   </button>
-                                  <button
-                                    aria-selected={executionStepViewMode === "automation"}
-                                    className={executionStepViewMode === "automation" ? "is-active" : ""}
-                                    disabled={!hasSelectedStepAutomationCode}
-                                    onClick={() => setExecutionStepViewMode("automation")}
-                                    role="tab"
-                                    title={hasSelectedStepAutomationCode ? "View coded steps and runtime logs" : "No automation code is available for this case yet"}
-                                    type="button"
-                                  >
-                                    <AutomationCodeIcon />
-                                    <span>Coded steps</span>
-                                  </button>
+                                  {canViewRunAutomationCode ? (
+                                    <button
+                                      aria-selected={executionStepViewMode === "automation"}
+                                      className={executionStepViewMode === "automation" ? "is-active" : ""}
+                                      disabled={!hasSelectedStepAutomationCode}
+                                      onClick={() => setExecutionStepViewMode("automation")}
+                                      role="tab"
+                                      title={hasSelectedStepAutomationCode ? "View coded steps and runtime logs" : "Automation code is not available for this case yet"}
+                                      type="button"
+                                    >
+                                      <AutomationCodeIcon />
+                                      <span>Coded steps</span>
+                                    </button>
+                                  ) : null}
                                 </div>
                               </div>
                             </div>
@@ -6209,145 +6415,79 @@ export function ExecutionsPage() {
                             </div>
                           </div>
 
-                                <div className="execution-step-card-list" role="list" aria-label="Test steps for this case">
-                                  {executionStepBlocks.map((block) => {
-                            if (block.groupId) {
-                              const isExpanded = expandedExecutionStepGroupIds.includes(block.groupId);
+                                <div className="execution-step-section-list">
+                                  <section className="execution-step-section">
+                                    <button
+                                      aria-expanded={expandedExecutionStepSections.preconditions}
+                                      className="execution-step-section-toggle"
+                                      onClick={() => setExpandedExecutionStepSections((current) => ({ ...current, preconditions: !current.preconditions }))}
+                                      type="button"
+                                    >
+                                      <span aria-hidden="true" className={expandedExecutionStepSections.preconditions ? "execution-step-group-chevron is-expanded" : "execution-step-group-chevron"}>
+                                        <ExecutionAccordionChevronIcon />
+                                      </span>
+                                      <span>
+                                        <strong>Preconditions</strong>
+                                        <small>Setup that must be satisfied before executing the main flow.</small>
+                                      </span>
+                                      <span className="execution-step-section-count">{executionPreconditionSteps.length}</span>
+                                    </button>
+                                    {expandedExecutionStepSections.preconditions ? (
+                                      <div className="execution-step-card-list execution-step-section-body" role="list" aria-label="Preconditions for this case">
+                                        {executionPreconditionSteps.map(renderExecutionStepCard)}
+                                        {!executionPreconditionSteps.length ? <div className="empty-state compact">No preconditions were captured in this run snapshot.</div> : null}
+                                      </div>
+                                    ) : null}
+                                  </section>
 
-                              return (
-                                <Fragment key={block.key}>
-                                  <ExecutionStepGroupRow
-                                    isExpanded={isExpanded}
-                                    kind={block.groupKind}
-                                    name={block.groupName || "Step group"}
-                                    onPreviewCode={() => openExecutionGroupAutomationPreview(block.groupName || "Step group", block.steps)}
-                                    onToggle={() =>
-                                      setExpandedExecutionStepGroupIds((current) =>
-                                        current.includes(block.groupId as string)
-                                          ? current.filter((groupId) => groupId !== block.groupId)
-                                          : [...current, block.groupId as string]
-                                      )
-                                    }
-                                    stepCount={block.steps.length}
-                                  />
-                                  {isExpanded
-                                    ? block.steps.map((step) => {
-                                        const rowStatus = stepStatuses[step.id];
-
-                                        return (
-                                          <ExecutionStepCard
-                                            apiDetail={stepApiDetails[step.id] || null}
-                                            webDetail={stepWebDetails[step.id] || null}
-                                            automationDetail={stepAutomationDetails[step.id] || null}
-                                            captures={stepCaptures[step.id] || stepApiDetails[step.id]?.captures || {}}
-                                            evidence={stepEvidence[step.id] || null}
-                                            canCreateEvidence={canCreateRunEvidence}
-                                            canDeleteEvidence={canDeleteRunEvidence}
-                                            canViewEvidence={canViewRunEvidence}
-                                            canInspectApi={step.step_type === "api" || (!step.step_type && selectedExecutionAppTypeKind === "api")}
-                                            isExpanded={expandedExecutionStepIds.includes(step.id)}
-                                            isRunningApi={runningExecutionApiStepId === step.id}
-                                            isLocked={!isExecutionStarted || isExecutionLocked}
-                                            isSelected={bulkSelectedStepIds.includes(step.id)}
-                                            isUploadingEvidence={uploadingEvidenceStepId === step.id}
-                                            isOpeningEvidence={openingEvidenceStepId === step.id}
-                                            isLinkingDefects={linkingDefectStepId === step.id}
-                                            key={step.id}
-                                            note={stepNotes[step.id] || ""}
-                                            parameterValues={executionStepParameterValues}
-                                            availableBugs={bugs}
-                                            defectIds={stepDefects[step.id] || []}
-                                            onFail={() => void handleRecordStep(step.id, "failed")}
-                                            onDeleteEvidence={() => void handleDeleteStepEvidence(step)}
-  onInspectApi={() => openExecutionApiDetail(step)}
-  onNoteBlur={(value) => void handleSaveStepNote(step.id, value)}
-  onPass={() => void handleRecordStep(step.id, "passed")}
-                                            onPreviewCode={() => openExecutionStepAutomationPreview(step)}
-                                            onAttachNetworkAutomation={(network) => void handleAttachStepNetworkAutomation(network)}
-                                            onRunStep={() => void handleRunExecutionApiStep(step)}
-                                            onDefectsChange={(defectIds) => void handleStepDefectsChange(step, defectIds)}
-                                            onToggle={() =>
-                                              setExpandedExecutionStepIds((current) =>
-                                                current.includes(step.id)
-                                                  ? current.filter((id) => id !== step.id)
-                                                  : [...current, step.id]
-                                              )
-                                            }
-                                            onToggleSelect={(checked) =>
-                                              setBulkSelectedStepIds((current) =>
-                                                checked ? [...new Set([...current, step.id])] : current.filter((id) => id !== step.id)
-                                              )
-                                            }
-                                            onUploadEvidence={(file) => void handleUploadStepEvidence(step, file)}
-                                            onViewEvidence={() => openExecutionEvidence(step, stepEvidence[step.id] as ExecutionStepEvidence)}
-                                            status={rowStatus || "queued"}
-                                            step={step}
-                                          />
-                                        );
-                                      })
-                                    : null}
-                                </Fragment>
-                              );
-                            }
-
-                            return block.steps.map((step) => {
-                              const rowStatus = stepStatuses[step.id];
-
-                              return (
-                                <ExecutionStepCard
-                                  apiDetail={stepApiDetails[step.id] || null}
-                                  webDetail={stepWebDetails[step.id] || null}
-                                  automationDetail={stepAutomationDetails[step.id] || null}
-                                  captures={stepCaptures[step.id] || stepApiDetails[step.id]?.captures || {}}
-                                  evidence={stepEvidence[step.id] || null}
-                                  canCreateEvidence={canCreateRunEvidence}
-                                  canDeleteEvidence={canDeleteRunEvidence}
-                                  canViewEvidence={canViewRunEvidence}
-                                  canInspectApi={step.step_type === "api" || (!step.step_type && selectedExecutionAppTypeKind === "api")}
-                                  isExpanded={expandedExecutionStepIds.includes(step.id)}
-                                  isRunningApi={runningExecutionApiStepId === step.id}
-                                  isLocked={!isExecutionStarted || isExecutionLocked}
-                                  isSelected={bulkSelectedStepIds.includes(step.id)}
-                                  isUploadingEvidence={uploadingEvidenceStepId === step.id}
-                                  isOpeningEvidence={openingEvidenceStepId === step.id}
-                                  isLinkingDefects={linkingDefectStepId === step.id}
-                                  key={step.id}
-                                  note={stepNotes[step.id] || ""}
-                                  parameterValues={executionStepParameterValues}
-                                  availableBugs={bugs}
-                                  defectIds={stepDefects[step.id] || []}
-                                  onFail={() => void handleRecordStep(step.id, "failed")}
-                                  onDeleteEvidence={() => void handleDeleteStepEvidence(step)}
-  onInspectApi={() => openExecutionApiDetail(step)}
-  onNoteBlur={(value) => void handleSaveStepNote(step.id, value)}
-  onPass={() => void handleRecordStep(step.id, "passed")}
-  onPreviewCode={() => openExecutionStepAutomationPreview(step)}
-  onAttachNetworkAutomation={(network) => void handleAttachStepNetworkAutomation(network)}
-  onRunStep={() => void handleRunExecutionApiStep(step)}
-  onDefectsChange={(defectIds) => void handleStepDefectsChange(step, defectIds)}
-                                  onToggle={() =>
-                                    setExpandedExecutionStepIds((current) =>
-                                      current.includes(step.id)
-                                        ? current.filter((id) => id !== step.id)
-                                        : [...current, step.id]
-                                    )
-                                  }
-                                  onToggleSelect={(checked) =>
-                                    setBulkSelectedStepIds((current) =>
-                                      checked ? [...new Set([...current, step.id])] : current.filter((id) => id !== step.id)
-                                    )
-                                  }
-                                  onUploadEvidence={(file) => void handleUploadStepEvidence(step, file)}
-                                  onViewEvidence={() => openExecutionEvidence(step, stepEvidence[step.id] as ExecutionStepEvidence)}
-                                  status={rowStatus || "queued"}
-                                  step={step}
-                                />
-                              );
-                            });
-                                  })}
+                                  <section className="execution-step-section">
+                                    <button
+                                      aria-expanded={expandedExecutionStepSections.testSteps}
+                                      className="execution-step-section-toggle"
+                                      onClick={() => setExpandedExecutionStepSections((current) => ({ ...current, testSteps: !current.testSteps }))}
+                                      type="button"
+                                    >
+                                      <span aria-hidden="true" className={expandedExecutionStepSections.testSteps ? "execution-step-group-chevron is-expanded" : "execution-step-group-chevron"}>
+                                        <ExecutionAccordionChevronIcon />
+                                      </span>
+                                      <span>
+                                        <strong>Test steps</strong>
+                                        <small>Ungrouped steps, local groups, and shared group snapshots in execution order.</small>
+                                      </span>
+                                      <span className="execution-step-section-count">{executionMainSteps.length}</span>
+                                    </button>
+                                    {expandedExecutionStepSections.testSteps ? (
+                                      <div className="execution-step-card-list execution-step-section-body" role="list" aria-label="Test steps for this case">
+                                        {executionStepBlocks.map((block) => {
+                                          if (!block.groupId) return block.steps.map(renderExecutionStepCard);
+                                          const isExpanded = expandedExecutionStepGroupIds.includes(block.groupId);
+                                          return (
+                                            <Fragment key={block.key}>
+                                              <ExecutionStepGroupRow
+                                                isExpanded={isExpanded}
+                                                kind={block.groupKind}
+                                                name={block.groupName || "Step group"}
+                                                onPreviewCode={() => openExecutionGroupAutomationPreview(block.groupName || "Step group", block.steps)}
+                                                onToggle={() =>
+                                                  setExpandedExecutionStepGroupIds((current) =>
+                                                    current.includes(block.groupId as string)
+                                                      ? current.filter((groupId) => groupId !== block.groupId)
+                                                      : [...current, block.groupId as string]
+                                                  )
+                                                }
+                                                stepCount={block.steps.length}
+                                              />
+                                              {isExpanded ? block.steps.map(renderExecutionStepCard) : null}
+                                            </Fragment>
+                                          );
+                                        })}
+                                        {!executionMainSteps.length ? <div className="empty-state compact">No main test steps were captured in this run snapshot.</div> : null}
+                                      </div>
+                                    ) : null}
+                                  </section>
                                 </div>
                               </>
-                            ) : (
+                            ) : canViewRunAutomationCode ? (
                               <div className="execution-console-code-list execution-console-code-list--embedded" role="list" aria-label="Coded steps for this case">
                                 {selectedSteps.map((step) => {
                                   const detail = stepAutomationDetails[step.id] || null;
@@ -6373,10 +6513,10 @@ export function ExecutionsPage() {
                                   );
                                 })}
                                 {!hasSelectedStepAutomationCode ? (
-                                  <div className="empty-state compact">No automation code is available for this case yet.</div>
+                                  <div className="empty-state compact">Automation code is not available for this case yet.</div>
                                 ) : null}
                               </div>
-                            )}
+                            ) : null}
                           </div>
                         ) : null}
 
@@ -6653,7 +6793,7 @@ export function ExecutionsPage() {
                       <div className="action-row">
 	                        <button
 	                          className="ghost-button"
-	                          disabled={currentExecutionStatus !== "queued" || startExecution.isPending || completeExecution.isPending || !canCreateManualRuns}
+	                          disabled={currentExecutionStatus !== "queued" || startExecution.isPending || completeExecution.isPending || !canExecuteRuns}
 	                          onClick={() => void handleStartSelectedExecution()}
 	                          type="button"
 	                        >
@@ -6663,7 +6803,7 @@ export function ExecutionsPage() {
 
                         <button
                           className="ghost-button"
-                          disabled={!selectedExecution || downloadExecutionReport.isPending}
+                          disabled={!selectedExecution || !canExportRunReports || downloadExecutionReport.isPending}
                           onClick={() => void handleDownloadExecutionReport()}
                           type="button"
                         >
@@ -6672,26 +6812,21 @@ export function ExecutionsPage() {
                         </button>
                         <button
                           className="ghost-button"
-                          disabled={!selectedExecution || shareExecutionReport.isPending}
+                          disabled={!selectedExecution || !canShareRunReports || shareExecutionReport.isPending}
                           onClick={handleOpenReportEmailModal}
                           type="button"
                         >
                           <MailIcon />
                           <span>Email report</span>
                         </button>
-                        <button
-                          className="ghost-button"
+                        <ReportBugSplitActionButton
                           disabled={!selectedExecution}
-                          onClick={handleReportSelectedExecutionIssue}
-                          type="button"
-                        >
-                          <BugIcon />
-                          <span>Report Bug</span>
-                        </button>
+                          onReportBug={() => handleReportSelectedExecutionIssue(selectedExecutionCase ? "case" : "run")}
+                        />
 
                         <button
                           className="ghost-button"
-                          disabled={currentExecutionStatus !== "running" || completeExecution.isPending || startExecution.isPending}
+                          disabled={currentExecutionStatus !== "running" || completeExecution.isPending || startExecution.isPending || !canExecuteRuns}
                           onClick={() => void handleFinalizeExecution("complete")}
                           type="button"
                         >
@@ -6717,7 +6852,7 @@ export function ExecutionsPage() {
                               label: completeExecution.isPending && executionFinalizeAction === "abort" ? "Aborting run…" : "Abort run",
                               icon: <ExecutionAbortIcon />,
                               onClick: () => void handleFinalizeExecution("abort"),
-                              disabled: currentExecutionStatus !== "running" || completeExecution.isPending || startExecution.isPending,
+                              disabled: currentExecutionStatus !== "running" || completeExecution.isPending || startExecution.isPending || !canExecuteRuns,
                               tone: "danger"
                             }
                           ]}
@@ -7151,12 +7286,17 @@ export function ExecutionsPage() {
 
       {selectedExecution && isReportEmailModalOpen ? (
         <ReportEmailModal
-          isSubmitting={shareExecutionReport.isPending}
-          onClose={() => setIsReportEmailModalOpen(false)}
+          isSubmitting={shareExecutionReport.isPending || shareExecutionCaseReport.isPending}
+          onClose={() => {
+            setIsReportEmailModalOpen(false);
+            setReportEmailCaseId("");
+          }}
           onRecipientsChange={setReportEmailDraft}
           onSubmit={(event) => void handleShareExecutionReport(event)}
           recipients={reportEmailDraft}
-          runName={selectedExecution.name || "Selected run"}
+          runName={reportEmailCaseId
+            ? selectedExecutionCase?.title || "Selected test case run"
+            : selectedExecution.name || "Selected run"}
         />
       ) : null}
 
@@ -7166,6 +7306,10 @@ export function ExecutionsPage() {
           appTypes={appTypes}
           assigneeOptions={assigneeOptions}
           canCreateExecution={canCreateExecution}
+          canConfigureParallelAutomation={canConfigureParallelAutomation}
+          canRunLocalAutomation={canRunLocalAutomation}
+          canRunRemoteAutomation={canRunRemoteAutomation}
+          canUseRunAi={canUseRunAi}
           executionCreateMode={executionCreateMode}
           executionStartMode={executionStartMode}
           executionParallelEnabled={executionParallelEnabled}
@@ -7525,7 +7669,7 @@ function ExecutionApiStepDialog({
               <StatusBadge value={status} />
             </div>
             <h2 className="dialog-title">{`Step ${step.step_order} API details`}</h2>
-            <p>{step.action || "Inspect the snapped API request, latest response, and configured assertions for this run."}</p>
+            <p>{executionStepText(step.action) || "Inspect the snapped API request, latest response, and configured assertions for this run."}</p>
           </div>
           <button className="ghost-button" onClick={onClose} type="button">
             Close
@@ -8835,8 +8979,8 @@ function ExecutionStepCard({
   const evidenceInputRef = useRef<HTMLInputElement | null>(null);
   const resolvedKind = step.group_name ? step.group_kind || "local" : step.group_kind;
   const stepKind = getExecutionStepKindMeta(resolvedKind);
-  const resolvedAction = resolveStepParameterText(step.action, parameterValues) || step.action || "";
-  const resolvedExpectedResult = resolveStepParameterText(step.expected_result, parameterValues) || step.expected_result || "";
+  const resolvedAction = executionStepText(step.action, parameterValues);
+  const resolvedExpectedResult = executionStepText(step.expected_result, parameterValues);
   const trimmedNote = note.trim();
   const hasEvidence = hasExecutionEvidence(evidence);
   const captureEntries = useMemo(
@@ -8892,11 +9036,11 @@ function ExecutionStepCard({
                 <StatusBadge value={status} />
               </div>
             </div>
-            <p className="execution-step-card-primary" title={resolvedAction || step.action || ""}>
+            <p className="execution-step-card-primary" title={resolvedAction}>
               {resolvedAction || "No action recorded yet"}
             </p>
             <div className="execution-step-card-summary-meta">
-              <span title={resolvedExpectedResult || step.expected_result || ""}>
+              <span title={resolvedExpectedResult}>
                 {resolvedExpectedResult ? `Expected: ${resolvedExpectedResult}` : "No expected result recorded yet"}
               </span>
               <span>
@@ -9232,7 +9376,7 @@ function ExecutionAutomationStepCard({
       <div className="execution-console-code-item-head">
         <div className="execution-console-code-title">
           <strong>Step {step.step_order}</strong>
-          <span>{step.action || "No action captured"}</span>
+          <span>{executionStepText(step.action) || "No action captured"}</span>
         </div>
         <StatusBadge value={status || "queued"} />
       </div>
@@ -9498,14 +9642,14 @@ function ExecutionStructuredLogView({
               <div className="execution-verbose-log-head">
                 <div>
                   <strong>Step {step.step_order}</strong>
-                  <span>{step.action || "No step action snapshot"}</span>
+                  <span>{executionStepText(step.action) || "No step action snapshot"}</span>
                 </div>
                 {st ? <StatusBadge value={st} /> : null}
               </div>
               {step.expected_result ? (
                 <div className="execution-verbose-log-block">
                   <small>Expected result</small>
-                  <span>{step.expected_result}</span>
+                  <span>{executionStepText(step.expected_result)}</span>
                 </div>
               ) : null}
               {nt ? (
@@ -9747,6 +9891,10 @@ function ExecutionCreateModal({
   onClearSmartExecutionRequirements,
   onSelectAllSmartExecutionCases,
   onClearSmartExecutionCases,
+  canConfigureParallelAutomation,
+  canRunLocalAutomation,
+  canRunRemoteAutomation,
+  canUseRunAi,
   canCreateExecution,
   isPreviewingSmartExecution,
   isSubmitting,
@@ -9814,13 +9962,17 @@ function ExecutionCreateModal({
   onClearSmartExecutionRequirements: () => void;
   onSelectAllSmartExecutionCases: () => void;
   onClearSmartExecutionCases: () => void;
+  canConfigureParallelAutomation: boolean;
+  canRunLocalAutomation: boolean;
+  canRunRemoteAutomation: boolean;
+  canUseRunAi: boolean;
   canCreateExecution: boolean;
   isPreviewingSmartExecution: boolean;
   isSubmitting: boolean;
   onClose: () => void;
   onSubmit: (event: FormEvent<HTMLFormElement>) => void;
 }) {
-  const isSmartMode = executionCreateMode === "smart";
+  const isSmartMode = canUseRunAi && executionCreateMode === "smart";
   const smartPreviewCases = smartExecutionPreview?.cases || [];
   const hasSmartPlanningInput = Boolean(smartExecutionReleaseScope.trim() || smartExecutionAdditionalContext.trim() || selectedSmartRequirementIds.length);
   const libraryCaseById = useMemo(() => new Map(libraryCases.map((testCase) => [testCase.id, testCase])), [libraryCases]);
@@ -9931,12 +10083,24 @@ function ExecutionCreateModal({
               </FormField>
             </div>
 
-            <div className="execution-create-grid">
-              <FormField label="Run type">
-                <RunTypeSelector value={executionStartMode} onChange={(value) => onExecutionStartModeChange(value as ExecutionStartMode)} />
-              </FormField>
+            {canRunLocalAutomation || canRunRemoteAutomation || canConfigureParallelAutomation ? (
+              <div className="execution-create-grid">
+              {canRunLocalAutomation || canRunRemoteAutomation ? (
+                <FormField label="Run type">
+                  <RunTypeSelector
+                    allowedModes={[
+                      "manual",
+                      ...(canRunLocalAutomation ? ["local" as const] : []),
+                      ...(canRunRemoteAutomation ? ["remote" as const] : [])
+                    ]}
+                    value={executionStartMode}
+                    onChange={(value) => onExecutionStartModeChange(value as ExecutionStartMode)}
+                  />
+                </FormField>
+              ) : null}
 
-              <FormField label="Parallel execution">
+              {canConfigureParallelAutomation ? (
+                <FormField label="Parallel execution">
                 <div className="execution-parallel-control">
                   <label>
                     <input
@@ -9957,9 +10121,12 @@ function ExecutionCreateModal({
                   />
                 </div>
               </FormField>
-            </div>
+              ) : null}
+              </div>
+            ) : null}
 
-            <div className="execution-mode-switch" aria-label="Run creation mode" role="group">
+            {canUseRunAi ? (
+              <div className="execution-mode-switch" aria-label="Run creation mode" role="group">
               <button
                 aria-pressed={!isSmartMode}
                 className={!isSmartMode ? "execution-mode-button is-active" : "execution-mode-button"}
@@ -9978,7 +10145,8 @@ function ExecutionCreateModal({
                 <strong>AI Smart Run</strong>
                 <span>Pick impacted cases from release scope.</span>
               </button>
-            </div>
+              </div>
+            ) : null}
 
             <div className="detail-summary">
               <strong>{selectedProject || "Select a project to continue"}</strong>

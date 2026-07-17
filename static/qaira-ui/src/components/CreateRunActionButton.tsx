@@ -5,7 +5,6 @@ import { useFeatureFlags } from "../hooks/useFeatureFlags";
 import { areFeatureFlagsEnabled } from "../lib/featureFlags";
 import { hasPermission } from "../lib/permissions";
 import { PlayIcon } from "./AppIcons";
-import { InfoTooltip } from "./InfoTooltip";
 
 export type CreateRunSource = "TEST_CASES" | "TEST_SUITES" | "TEST_RUNS";
 export type CreateRunMode = "MANUAL" | "LOCAL" | "REMOTE";
@@ -31,17 +30,8 @@ function RunActionChevronIcon() {
   );
 }
 
-function resolveSourceLabel(source: CreateRunSource) {
-  if (source === "TEST_CASES") return "selected test cases";
-  if (source === "TEST_SUITES") return "selected suites";
-  return "selected runs";
-}
-
 export function CreateRunActionButton({
   source,
-  selectedTestCaseIds = [],
-  selectedSuiteIds = [],
-  selectedRunIds = [],
   className = "",
   disabled = false,
   label = "Create Manual Run",
@@ -55,8 +45,6 @@ export function CreateRunActionButton({
   const [menuStyle, setMenuStyle] = useState<CSSProperties | null>(null);
   const triggerRef = useRef<HTMLDivElement | null>(null);
   const menuRef = useRef<HTMLDivElement | null>(null);
-  const selectionCount = selectedTestCaseIds.length + selectedSuiteIds.length + selectedRunIds.length;
-  const sourceLabel = resolveSourceLabel(source);
   const canCreateManualRuns = hasPermission(session, "run.create")
     && areFeatureFlagsEnabled(featureFlagsQuery.data, ["qaira.manual.runs"]);
   const canCreateLocalRuns = hasPermission(session, "automation.run.local")
@@ -157,25 +145,12 @@ export function CreateRunActionButton({
     >
       <button disabled={!canCreateLocalRuns} onClick={() => handleSelect("LOCAL")} role="menuitem" type="button">
         <span className="run-action-option-icon"><PlayIcon /></span>
-        <span className="run-action-option-copy">
-          <span className="run-action-option-title">
-            <strong>Local Run</strong>
-            <InfoTooltip content="Use local Test Engine execution." label="Create Local Run details" trigger="span" />
-          </span>
-        </span>
+        <strong>Local Run</strong>
       </button>
       <button disabled={!canCreateRemoteRuns} onClick={() => handleSelect("REMOTE")} role="menuitem" type="button">
         <span className="run-action-option-icon"><PlayIcon /></span>
-        <span className="run-action-option-copy">
-          <span className="run-action-option-title">
-            <strong>Remote Run</strong>
-            <InfoTooltip content="Use configured remote Test Engine." label="Create Remote Run details" trigger="span" />
-          </span>
-        </span>
+        <strong>Remote Run</strong>
       </button>
-      {selectionCount ? (
-        <p>{selectionCount} {sourceLabel} ready for run creation.</p>
-      ) : null}
     </div>
   ) : null;
 
@@ -189,7 +164,7 @@ export function CreateRunActionButton({
       ref={triggerRef}
     >
       <button
-        className="run-action-main"
+        className="run-action-main issue-report-split-main"
         disabled={isManualDisabled}
         onClick={() => handleSelect("MANUAL")}
         type="button"

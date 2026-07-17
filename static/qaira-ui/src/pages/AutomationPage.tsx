@@ -940,17 +940,27 @@ export function AutomationPage({ initialView = "cases" }: { initialView?: Automa
   const { session } = useAuth();
   const { getPrompt } = useAiPromptRegistry(Boolean(session));
   const featureFlagsQuery = useFeatureFlags(Boolean(session));
+  const isAutomationWorkspaceEnabled = areFeatureFlagsEnabled(
+    featureFlagsQuery.data,
+    ["qaira.automation.workspace"]
+  );
   const canUseAutomationBuilder = hasPermission(session, "automation.build")
+    && isAutomationWorkspaceEnabled
     && areFeatureFlagsEnabled(featureFlagsQuery.data, ["qaira.automation.builder"]);
   const canUseAutomationAi = hasPermission(session, "automation.ai")
+    && isAutomationWorkspaceEnabled
     && areFeatureFlagsEnabled(featureFlagsQuery.data, ["qaira.ai.automation"]);
   const canUseRecorder = hasPermission(session, "automation.recorder")
+    && isAutomationWorkspaceEnabled
     && areFeatureFlagsEnabled(featureFlagsQuery.data, ["qaira.automation.step_recording"]);
   const canRunLocalAutomation = hasPermission(session, "automation.run.local")
+    && isAutomationWorkspaceEnabled
     && areFeatureFlagsEnabled(featureFlagsQuery.data, ["qaira.automation.local_execution"]);
   const canRunRemoteAutomation = hasPermission(session, "automation.run.remote")
+    && isAutomationWorkspaceEnabled
     && areFeatureFlagsEnabled(featureFlagsQuery.data, ["qaira.automation.remote_execution"]);
   const canViewAutomationCode = hasPermission(session, "automation.code.view")
+    && isAutomationWorkspaceEnabled
     && areFeatureFlagsEnabled(featureFlagsQuery.data, ["qaira.automation.step_code"]);
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -2279,7 +2289,8 @@ export function AutomationPage({ initialView = "cases" }: { initialView?: Automa
 	      }
 
       return api.testCases.queueAutomationGenerator(activeCase.id, {
-        additional_context: getPrompt("ai.automation.review")
+        additional_context: getPrompt("ai.automation.review"),
+        ai_requested: true
       });
     },
     onSuccess: (response) => {
@@ -3757,11 +3768,11 @@ export function AutomationPage({ initialView = "cases" }: { initialView?: Automa
 	                        <span>Manual case name</span>
 	                        <input value={caseDraft.title} onChange={(event) => setCaseDraft((current) => ({ ...current, title: event.target.value }))} />
 	                      </label>
-	                      <label className="form-field">
+	                      <label className="form-field form-field--compact-enum">
 	                        <span>Status</span>
 	                        <input value={caseDraft.status} onChange={(event) => setCaseDraft((current) => ({ ...current, status: event.target.value }))} />
 	                      </label>
-	                      <label className="form-field">
+	                      <label className="form-field form-field--compact-enum form-field--compact-number">
 	                        <span>Priority</span>
 	                        <input min={1} max={5} type="number" value={caseDraft.priority} onChange={(event) => setCaseDraft((current) => ({ ...current, priority: event.target.value }))} />
 	                      </label>
@@ -3816,7 +3827,7 @@ export function AutomationPage({ initialView = "cases" }: { initialView?: Automa
 	                      />
 	                    </section>
 	                    <div className="automation-suite-link-panel">
-                      <strong>Suite references</strong>
+                      <strong>Linked Suites</strong>
                       <span>@s values are saved against the selected linked suite, matching the manual test case workspace.</span>
                       {suites.length ? (
                         <div className="selection-chip-row">

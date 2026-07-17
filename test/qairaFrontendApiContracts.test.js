@@ -5,6 +5,8 @@ import { test } from 'node:test';
 
 const root = path.resolve(import.meta.dirname, '..');
 const apiSource = fs.readFileSync(path.join(root, 'static/qaira-ui/src/lib/api.ts'), 'utf8');
+const authContextSource = fs.readFileSync(path.join(root, 'static/qaira-ui/src/auth/AuthContext.tsx'), 'utf8');
+const requirementsPageSource = fs.readFileSync(path.join(root, 'static/qaira-ui/src/pages/RequirementsPage.tsx'), 'utf8');
 
 function sourceBetween(startMarker, endMarker) {
   const start = apiSource.indexOf(startMarker);
@@ -24,7 +26,7 @@ test('assignment helpers use the mutating methods implemented by Forge handlers'
     'removeCases: (id: string, test_case_ids: string[])'
   );
   const suiteAssignments = sourceBetween(
-    'assignTestCases: (id: string, test_case_ids: string[], expected_revision?: number)',
+    'assignTestCases: (id: string, test_case_ids: string[], expected_revision?: number, append = true)',
     'delete: (id: string) => request<{ deleted: boolean }>(`/test-suites/${id}`'
   );
 
@@ -36,6 +38,7 @@ test('assignment helpers use the mutating methods implemented by Forge handlers'
     assert.match(source, /method: "PUT"/, `${label} assignment must use PUT`);
     assert.doesNotMatch(source, /method: "POST"/, `${label} assignment must not silently use POST`);
   }
+  assert.match(suiteAssignments, /JSON\.stringify\(\{ test_case_ids, expected_revision, append \}\)/);
 });
 
 test('requirement-to-test replacement keeps its requirement-oriented public contract', () => {
@@ -87,4 +90,41 @@ test('Jira issue updates expose and accept optimistic-concurrency revisions', ()
   assert.match(apiSource, /request<\{ updated: boolean; revision: number \}>\(`\/test-cases\/\$\{id\}`/);
   assert.match(apiSource, /request<\{ updated: boolean; revision: number \}>\(`\/executions\/\$\{id\}`/);
   assert.ok((apiSource.match(/expected_revision/g) || []).length >= 8);
+});
+
+test('Forge API client refreshes expired Atlassian sessions once and shares the refreshed session', () => {
+  const requestBody = sourceBetween(
+    'async function request<T>(',
+    'async function requestBlob('
+  );
+  const blobBody = sourceBetween(
+    'async function requestBlob(',
+    'type TestCaseImportSourceValue'
+  );
+
+  assert.match(apiSource, /export const qairaAuthSessionEvents/);
+  assert.match(apiSource, /function isRecoverableAuthenticationError/);
+  assert.match(apiSource, /function cleanForgeInvocationError/);
+  assert.match(apiSource, /async function refreshQairaSession/);
+  assert.match(apiSource, /appendCurrentProjectScope\("\/auth\/session"\)/);
+  assert.match(apiSource, /window\.dispatchEvent\(new CustomEvent\(qairaAuthSessionEvents\.refresh/);
+
+  assert.match(requestBody, /isRecoverableAuthenticationError\(message\)/);
+  assert.match(requestBody, /await refreshQairaSession\(\)/);
+  assert.match(requestBody, /return executeRequest\(false\)/);
+  assert.match(blobBody, /responseType:\s*"blob"/);
+  assert.match(blobBody, /isRecoverableAuthenticationError\(message\)/);
+  assert.match(blobBody, /return executeRequest\(false\)/);
+
+  assert.match(authContextSource, /qairaAuthSessionEvents/);
+  assert.match(authContextSource, /window\.addEventListener\(qairaAuthSessionEvents\.refresh/);
+  assert.match(authContextSource, /setSession\(next\)/);
+});
+
+test('AI requirement generation modal can recover recent async jobs from persisted storage', () => {
+  assert.match(requirementsPageSource, /RECOVERABLE_REQUIREMENT_AI_JOB_WINDOW_MS/);
+  assert.match(requirementsPageSource, /isRecoverableRequirementAiJob/);
+  assert.match(requirementsPageSource, /api\.requirements\.listGenerationJobs\(\{ project_id: projectId, limit: 5 \}\)/);
+  assert.match(requirementsPageSource, /recoveredRequirementCreationJob/);
+  assert.match(requirementsPageSource, /setRequirementCreationJobId\(recoveredRequirementCreationJob\.id\)/);
 });

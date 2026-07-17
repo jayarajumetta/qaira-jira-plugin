@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 import { createContext, useContext, useEffect, useMemo, useState } from "react";
-import { api, sessionStorage } from "../lib/api";
+import { api, qairaAuthSessionEvents, sessionStorage } from "../lib/api";
 import type { SessionPayload } from "../types";
 
 type AuthContextValue = {
@@ -43,6 +43,19 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     void refreshSession();
+  }, []);
+
+  useEffect(() => {
+    const handleSessionRefresh = (event: Event) => {
+      const next = (event as CustomEvent<SessionPayload>).detail;
+      if (!next?.user) return;
+      sessionStorage.write(next);
+      setSession(next);
+      setError(null);
+    };
+
+    window.addEventListener(qairaAuthSessionEvents.refresh, handleSessionRefresh);
+    return () => window.removeEventListener(qairaAuthSessionEvents.refresh, handleSessionRefresh);
   }, []);
 
   const value = useMemo<AuthContextValue>(() => ({

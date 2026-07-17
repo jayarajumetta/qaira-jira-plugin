@@ -15,6 +15,7 @@ import { DataTable, type DataTableColumn } from "../components/DataTable";
 import { DialogCloseButton } from "../components/DialogCloseButton";
 import { DetailSectionTabs } from "../components/DetailSectionTabs";
 import { DisplayIdBadge } from "../components/DisplayIdBadge";
+import { ExternalReferencesField } from "../components/ExternalReferencesField";
 import { FormField } from "../components/FormField";
 import { InfoTooltip } from "../components/InfoTooltip";
 import { HierarchyMetricStrip } from "../components/HierarchyMetricStrip";
@@ -42,14 +43,15 @@ import { useDeleteConfirmation } from "../components/DeleteConfirmationDialog";
 import { useCurrentAppType, useCurrentProject } from "../hooks/useCurrentProject";
 import { useDomainMetadata } from "../hooks/useDomainMetadata";
 import { useFeatureFlags } from "../hooks/useFeatureFlags";
-import { api } from "../lib/api";
-import { appendUniqueImages, parseExternalLinks, readImageFiles } from "../lib/aiDesignStudio";
+import { api, type JiraCreateFieldMetadata } from "../lib/api";
+import { mergeAiReferenceImagesWithinBudget, parseExternalLinks, readImageFiles } from "../lib/aiDesignStudio";
 import { assessRequirementAiReadiness } from "../lib/aiAssurance";
 import { formatAuditTimestamp, resolveAuditUserLabel } from "../lib/auditDisplay";
 import { formatReferenceList, parseReferenceList } from "../lib/externalReferences";
 import { areFeatureFlagsEnabled } from "../lib/featureFlags";
 import { downloadCsvRecords } from "../lib/csvExport";
 import { hasPermission } from "../lib/permissions";
+import { getJiraBrowseUrl } from "../lib/jiraBrowseUrl";
 import { deriveIterationHealth } from "../lib/hierarchyHealth";
 import { parseRequirementCsv } from "../lib/requirementImport";
 import { findByRoutableId, getRoutableId } from "../lib/urlSelection";
@@ -67,10 +69,11 @@ type RequirementDraft = {
   iterationId: string;
   priority: number;
   status: string;
+  additionalFields: Record<string, unknown>;
 };
 
 type RequirementSectionKey = "details" | "library" | "defects" | "runHistory";
-type RequirementTraceabilityTab = "details" | "cases" | "defects" | "history" | "evidence";
+type RequirementTraceabilityTab = "details" | "grounding" | "cases" | "defects" | "history" | "evidence";
 type RequirementCoverageFilter = "all" | "linked" | "unlinked";
 
 type RequirementCoverageMetric = {
@@ -94,7 +97,19 @@ type RequirementRunHistoryRow = {
 };
 
 type RequirementOptimizationSuggestion = Awaited<ReturnType<typeof api.requirements.previewOptimization>>["suggestion"];
+type RequirementCreationSuggestion = Awaited<ReturnType<typeof api.requirements.previewCreation>>["requirements"][number];
+type RequirementGenerationJob = Awaited<ReturnType<typeof api.requirements.listGenerationJobs>>[number];
 type RequirementAiMode = "create" | "improve";
+
+const RECOVERABLE_REQUIREMENT_AI_JOB_WINDOW_MS = 30 * 60_000;
+
+const isRecoverableRequirementAiJob = (job: RequirementGenerationJob) => {
+  const status = String(job.status || "").toLowerCase();
+  if (!["queued", "running", "completed"].includes(status)) return false;
+  if (status === "completed" && !(job.requirements?.length || job.suggestion)) return false;
+  const createdAt = Date.parse(String(job.created_at || job.started_at || ""));
+  return Number.isNaN(createdAt) || Date.now() - createdAt <= RECOVERABLE_REQUIREMENT_AI_JOB_WINDOW_MS;
+};
 
 const createEmptyRequirementDraft = (defaultStatus = "open"): RequirementDraft => ({
   title: "",
@@ -106,7 +121,8 @@ const createEmptyRequirementDraft = (defaultStatus = "open"): RequirementDraft =
   release: "",
   iterationId: "",
   priority: 3,
-  status: defaultStatus
+  status: defaultStatus,
+  additionalFields: {}
 });
 
 const createDefaultRequirementSections = (): Record<RequirementSectionKey, boolean> => ({
@@ -115,6 +131,20 @@ const createDefaultRequirementSections = (): Record<RequirementSectionKey, boole
   defects: false,
   runHistory: false
 });
+
+const getRequirementCreationDraftId = (draft: Pick<RequirementCreationSuggestion, "client_id" | "title">, index: number) =>
+  draft.client_id || `ai-req-${index + 1}-${draft.title}`;
+
+const composeAiRequirementDescription = (suggestion: Pick<RequirementCreationSuggestion, "description" | "acceptance_criteria" | "risks" | "open_questions">) =>
+  [
+    suggestion.description,
+    suggestion.acceptance_criteria.length ? "Acceptance criteria:" : "",
+    ...suggestion.acceptance_criteria.map((item) => `- ${item}`),
+    suggestion.risks.length ? "\nRisks:" : "",
+    ...suggestion.risks.map((item) => `- ${item}`),
+    suggestion.open_questions.length ? "\nOpen questions:" : "",
+    ...suggestion.open_questions.map((item) => `- ${item}`)
+  ].filter(Boolean).join("\n");
 
 const getRequirementCoverageTone = (covered: number, total: number) => {
   if (!total) {
@@ -305,6 +335,10 @@ function ChevronDownIcon() {
   );
 }
 
+function HierarchyToggleIcon({ isExpanded }: { isExpanded: boolean }) {
+  return <span aria-hidden="true" className="hierarchy-toggle-glyph">{isExpanded ? "−" : "+"}</span>;
+}
+
 export function RequirementsPage() {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
@@ -340,7 +374,6 @@ export function RequirementsPage() {
   const [isCreateIterationModalOpen, setIsCreateIterationModalOpen] = useState(false);
   const [iterationDraftName, setIterationDraftName] = useState("");
   const [iterationDraftDescription, setIterationDraftDescription] = useState("");
-  const [iterationDraftSprintId, setIterationDraftSprintId] = useState("");
   const [iterationRequirementSearch, setIterationRequirementSearch] = useState("");
   const [collapsedIterationIds, setCollapsedIterationIds] = useState<string[]>([]);
   const [selectedIterationIds, setSelectedIterationIds] = useState<string[]>([]);
@@ -389,11 +422,14 @@ export function RequirementsPage() {
   const [requirementAiMode, setRequirementAiMode] = useState<RequirementAiMode>("improve");
   const [isRequirementImpactPreviewOpen, setIsRequirementImpactPreviewOpen] = useState(false);
   const [optimizeRequirementIds, setOptimizeRequirementIds] = useState<string[]>([]);
-  const [optimizeRequirementIndex, setOptimizeRequirementIndex] = useState(0);
   const [optimizeContext, setOptimizeContext] = useState("");
   const [optimizeExternalLinksText, setOptimizeExternalLinksText] = useState("");
   const [optimizeReferenceImages, setOptimizeReferenceImages] = useState<AiDesignImageInput[]>([]);
   const [optimizationSuggestion, setOptimizationSuggestion] = useState<RequirementOptimizationSuggestion | null>(null);
+  const [requirementCreationDrafts, setRequirementCreationDrafts] = useState<RequirementCreationSuggestion[]>([]);
+  const [selectedRequirementCreationDraftIds, setSelectedRequirementCreationDraftIds] = useState<string[]>([]);
+  const [expandedRequirementCreationDraftIds, setExpandedRequirementCreationDraftIds] = useState<string[]>([]);
+  const [requirementCreationJobId, setRequirementCreationJobId] = useState("");
   const [optimizationFields, setOptimizationFields] = useState({
     title: true,
     description: true,
@@ -421,6 +457,12 @@ export function RequirementsPage() {
     queryFn: () => api.requirements.get(selectedRequirementId, { project_id: projectId }),
     enabled: Boolean(projectId && selectedRequirementId),
     staleTime: 30_000
+  });
+  const requirementCreateMetadataQuery = useQuery({
+    queryKey: ["requirement-create-metadata", projectId],
+    queryFn: () => api.requirements.createMetadata({ project_id: projectId }),
+    enabled: Boolean(projectId && (isCreateModalOpen || (isOptimizeModalOpen && requirementAiMode === "create"))),
+    staleTime: 5 * 60_000
   });
   const requirementIterationsQuery = useQuery({
     queryKey: ["requirement-iterations", projectId],
@@ -501,11 +543,36 @@ export function RequirementsPage() {
     mutationFn: ({ requirementId, input }: { requirementId: string; input?: Parameters<typeof api.requirements.previewOptimization>[1] }) =>
       api.requirements.previewOptimization(requirementId, input)
   });
+  const rephraseRequirementDescription = useMutation({ mutationFn: api.requirements.rephraseDescription });
   const previewRequirementCreation = useMutation({ mutationFn: api.requirements.previewCreation });
+  const createRequirementGenerationJob = useMutation({ mutationFn: api.requirements.createGenerationJob });
   const previewRequirementImpact = useMutation({
     mutationFn: ({ requirementId, input }: { requirementId: string; input: Parameters<typeof api.requirements.previewImpact>[1] }) =>
       api.requirements.previewImpact(requirementId, input)
   });
+  const requirementCreationJobQuery = useQuery({
+    queryKey: ["ai-requirement-generation-job", projectId, requirementCreationJobId],
+    queryFn: () => api.requirements.getGenerationJob(requirementCreationJobId, { project_id: projectId }),
+    enabled: Boolean(projectId && requirementCreationJobId && isOptimizeModalOpen && requirementAiMode === "create"),
+    refetchInterval: (query) => {
+      const status = String(query.state.data?.status || "").toLowerCase();
+      return ["queued", "running"].includes(status) ? 3_000 : false;
+    }
+  });
+  const recentRequirementCreationJobsQuery = useQuery({
+    queryKey: ["ai-requirement-generation-jobs", projectId, "recent"],
+    queryFn: () => api.requirements.listGenerationJobs({ project_id: projectId, limit: 5 }),
+    enabled: Boolean(projectId && !requirementCreationJobId && isOptimizeModalOpen && requirementAiMode === "create"),
+    refetchInterval: (query) => (query.state.data || []).some((job) => ["queued", "running"].includes(String(job.status || "").toLowerCase())) ? 3_000 : false
+  });
+  const recoveredRequirementCreationJob = useMemo(
+    () => (!requirementCreationJobId && !requirementCreationDrafts.length
+      ? (recentRequirementCreationJobsQuery.data || []).find(isRecoverableRequirementAiJob) || null
+      : null),
+    [recentRequirementCreationJobsQuery.data, requirementCreationDrafts.length, requirementCreationJobId]
+  );
+  const requirementCreationJob = requirementCreationJobQuery.data || recoveredRequirementCreationJob || null;
+  const isRequirementCreationJobRunning = ["queued", "running"].includes(String(requirementCreationJob?.status || "").toLowerCase());
 
   const projects = projectsQuery.data || [];
   const appTypes = appTypesQuery.data || [];
@@ -519,6 +586,159 @@ export function RequirementsPage() {
   const suites = suitesQuery.data || [];
   const integrations = integrationsQuery.data || [];
   const users = (usersQuery.data || []) as User[];
+  const requiredJiraRequirementFields = requirementCreateMetadataQuery.data?.required_fields || [];
+  const updateAdditionalRequirementField = (fieldId: string, value: unknown) => {
+    setCreateDraft((current) => ({
+      ...current,
+      additionalFields: {
+        ...current.additionalFields,
+        [fieldId]: value
+      }
+    }));
+  };
+  const renderAdditionalRequirementField = (field: JiraCreateFieldMetadata) => {
+    const schemaType = String(field.schema?.type || "").toLowerCase();
+    const itemType = String(field.schema?.items || "").toLowerCase();
+    const customType = String(field.schema?.custom || "").toLowerCase();
+    const allowedValues = field.allowed_values || [];
+    const value = createDraft.additionalFields[field.id];
+
+    if (allowedValues.length && (schemaType === "array" || itemType)) {
+      const selectedValues = Array.isArray(value) ? value.map(String) : [];
+      return (
+        <FormField
+          hint={`Required by Jira Story create metadata. Field ID: ${field.id}`}
+          key={field.id}
+          label={field.name}
+          required
+        >
+          <select
+            multiple
+            onChange={(event) => updateAdditionalRequirementField(field.id, Array.from(event.currentTarget.selectedOptions, (option) => option.value))}
+            size={Math.min(6, Math.max(3, allowedValues.length))}
+            value={selectedValues}
+          >
+            {allowedValues.map((option) => (
+              <option key={option.id || option.value || option.name || option.label} value={option.id || option.value || option.name || option.label || ""}>
+                {option.label || option.name || option.value || option.id}
+              </option>
+            ))}
+          </select>
+        </FormField>
+      );
+    }
+
+    if (allowedValues.length) {
+      return (
+        <FormField
+          hint={`Required by Jira Story create metadata. Field ID: ${field.id}`}
+          key={field.id}
+          label={field.name}
+          required
+        >
+          <select value={String(value || "")} onChange={(event) => updateAdditionalRequirementField(field.id, event.target.value)}>
+            <option value="">Select {field.name}</option>
+            {allowedValues.map((option) => (
+              <option key={option.id || option.value || option.name || option.label} value={option.id || option.value || option.name || option.label || ""}>
+                {option.label || option.name || option.value || option.id}
+              </option>
+            ))}
+          </select>
+        </FormField>
+      );
+    }
+
+    if (schemaType === "array" && itemType === "user") {
+      const selectedValues = Array.isArray(value) ? value.map(String) : [];
+      return (
+        <FormField
+          hint={`Required by Jira Story create metadata. Field ID: ${field.id}`}
+          key={field.id}
+          label={field.name}
+          required
+        >
+          <select
+            multiple
+            onChange={(event) => updateAdditionalRequirementField(field.id, Array.from(event.currentTarget.selectedOptions, (option) => option.value))}
+            size={Math.min(6, Math.max(3, users.length || 3))}
+            value={selectedValues}
+          >
+            {users.map((user) => (
+              <option key={user.id} value={user.id}>{user.name || user.email || user.id}</option>
+            ))}
+          </select>
+        </FormField>
+      );
+    }
+
+    if (schemaType === "user") {
+      return (
+        <FormField
+          hint={`Required by Jira Story create metadata. Field ID: ${field.id}`}
+          key={field.id}
+          label={field.name}
+          required
+        >
+          <select value={String(value || "")} onChange={(event) => updateAdditionalRequirementField(field.id, event.target.value)}>
+            <option value="">Select user</option>
+            {users.map((user) => (
+              <option key={user.id} value={user.id}>{user.name || user.email || user.id}</option>
+            ))}
+          </select>
+        </FormField>
+      );
+    }
+
+    if (schemaType === "number") {
+      return (
+        <FormField
+          hint={`Required by Jira Story create metadata. Field ID: ${field.id}`}
+          key={field.id}
+          label={field.name}
+          required
+        >
+          <input type="number" value={String(value || "")} onChange={(event) => updateAdditionalRequirementField(field.id, event.target.value)} />
+        </FormField>
+      );
+    }
+
+    if (schemaType === "date" || schemaType === "datetime") {
+      return (
+        <FormField
+          hint={`Required by Jira Story create metadata. Field ID: ${field.id}`}
+          key={field.id}
+          label={field.name}
+          required
+        >
+          <input type={schemaType === "date" ? "date" : "datetime-local"} value={String(value || "")} onChange={(event) => updateAdditionalRequirementField(field.id, event.target.value)} />
+        </FormField>
+      );
+    }
+
+    if (customType.includes(":textarea")) {
+      return (
+        <FormField
+          hint={`Required by Jira Story create metadata. Field ID: ${field.id}`}
+          key={field.id}
+          label={field.name}
+          required
+        >
+          <textarea rows={4} value={String(value || "")} onChange={(event) => updateAdditionalRequirementField(field.id, event.target.value)} />
+        </FormField>
+      );
+    }
+
+    return (
+      <FormField
+        hint={`Required by Jira Story create metadata. Field ID: ${field.id}`}
+        key={field.id}
+        label={field.name}
+        required
+      >
+        <input value={String(value || "")} onChange={(event) => updateAdditionalRequirementField(field.id, event.target.value)} />
+      </FormField>
+    );
+  };
   const userById = useMemo(
     () =>
       users.reduce<Record<string, User>>((accumulator, user) => {
@@ -540,6 +760,66 @@ export function RequirementsPage() {
     setMessageTone("error");
     setMessage(error instanceof Error ? error.message : fallback);
   };
+
+  useEffect(() => {
+    if (!recoveredRequirementCreationJob?.id || requirementCreationJobId || requirementAiMode !== "create" || !isOptimizeModalOpen) {
+      return;
+    }
+
+    setRequirementCreationJobId(recoveredRequirementCreationJob.id);
+    setPreviewTone("success");
+    setPreviewMessage("Recovered a recent AI requirement generation job. Qaira is loading the generated drafts…");
+  }, [isOptimizeModalOpen, recoveredRequirementCreationJob?.id, requirementAiMode, requirementCreationJobId]);
+
+  useEffect(() => {
+    if (requirementAiMode !== "create" || !requirementCreationJob) {
+      return;
+    }
+
+    const status = String(requirementCreationJob.status || "").toLowerCase();
+
+    if (status === "completed") {
+      const generatedDrafts = requirementCreationJob.requirements?.length
+        ? requirementCreationJob.requirements
+        : requirementCreationJob.suggestion
+          ? [{
+              ...requirementCreationJob.suggestion,
+              client_id: requirementCreationJob.suggestion.client_id || "ai-req-1",
+              quality_score: requirementCreationJob.suggestion.quality_score || 0.72,
+              rationale: requirementCreationJob.suggestion.rationale || "AI-generated requirement draft."
+            }]
+          : [];
+
+      setOptimizationSuggestion(requirementCreationJob.suggestion || null);
+      setRequirementCreationDrafts(generatedDrafts);
+      const selectedDraftIds = generatedDrafts
+        .map((draftItem, index) => ({ id: getRequirementCreationDraftId(draftItem, index), score: Number(draftItem.quality_score || 0) }))
+        .filter((item) => item.score >= 0.8)
+        .map((item) => item.id);
+      const defaultSelectedIds = selectedDraftIds.length ? selectedDraftIds : generatedDrafts.slice(0, 1).map((draftItem, index) => getRequirementCreationDraftId(draftItem, index));
+      setSelectedRequirementCreationDraftIds(defaultSelectedIds);
+      setExpandedRequirementCreationDraftIds(generatedDrafts.slice(0, 1).map((draftItem, index) => getRequirementCreationDraftId(draftItem, index)));
+      setIsRequirementAiSidebarCollapsed(true);
+      setPreviewTone(requirementCreationJob.fallback_used ? "error" : "success");
+      setPreviewMessage(
+        requirementCreationJob.fallback_used
+          ? `AI fallback used: ${requirementCreationJob.fallback_reason || "LLM unavailable"}`
+          : `${generatedDrafts.length || requirementCreationJob.generated || 0} requirement draft${(generatedDrafts.length || requirementCreationJob.generated || 0) === 1 ? "" : "s"} generated. Review and select the strongest drafts before creating Jira requirements.`
+      );
+      return;
+    }
+
+    if (status === "failed") {
+      setPreviewTone("error");
+      setPreviewMessage(requirementCreationJob.last_error || "AI requirement generation failed. Reduce the prompt or attachments and try again.");
+      return;
+    }
+
+    if (["queued", "running"].includes(status)) {
+      setPreviewTone("success");
+      setPreviewMessage(status === "queued" ? "AI requirement generation queued…" : "AI requirement generation is running…");
+    }
+  }, [requirementAiMode, requirementCreationJob]);
 
   useEffect(() => {
     if (appTypesQuery.isPending) {
@@ -656,7 +936,17 @@ export function RequirementsPage() {
         .filter(Boolean) as Requirement[],
     [optimizeRequirementIds, requirements]
   );
-  const activeOptimizeRequirement = optimizeTargets[optimizeRequirementIndex] || selectedRequirement;
+  const activeOptimizeRequirement = requirementAiMode === "improve"
+    ? optimizeTargets[0] || selectedRequirement || requirements[0] || null
+    : null;
+  const aiCompleteRequirementOptions = useMemo(() => {
+    const byId = new Map<string, Requirement>();
+    requirements.forEach((item) => byId.set(item.id, item));
+    if (selectedRequirement) {
+      byId.set(selectedRequirement.id, selectedRequirement);
+    }
+    return Array.from(byId.values()).sort((left, right) => left.title.localeCompare(right.title));
+  }, [requirements, selectedRequirement]);
 
   const latestResultByCaseId = useMemo(() => {
     const map: Record<string, ExecutionResult> = {};
@@ -796,6 +1086,8 @@ export function RequirementsPage() {
             id: issue.id,
             title: issue.title,
             status: issue.status,
+            severity: "severity" in issue ? issue.severity : linkedDefects.find((defect) => defect.id === issue.id)?.severity,
+            priority: "priority" in issue ? issue.priority : linkedDefects.find((defect) => defect.id === issue.id)?.priority,
             link_source: "link_source" in issue ? issue.link_source : linkedDefects.find((defect) => defect.id === issue.id)?.link_source,
             created_at: issue.created_at
           } satisfies RequirementDefectLink;
@@ -1030,28 +1322,88 @@ export function RequirementsPage() {
   }, [filteredRequirements, requirementIterations]);
 
   const iterationHealth = useMemo(() => {
+    const defectFromId = (defectId: string): RequirementDefectLink => {
+      const issue = issueById.get(defectId);
+
+      if (issue) {
+        return {
+          id: issue.id,
+          title: issue.title,
+          status: issue.status,
+          severity: "severity" in issue ? issue.severity : null,
+          priority: "priority" in issue ? issue.priority : null,
+          link_source: "link_source" in issue ? issue.link_source : "automatic",
+          created_at: issue.created_at
+        };
+      }
+
+      return {
+        id: defectId,
+        title: defectId,
+        status: null,
+        link_source: "automatic"
+      };
+    };
     const derive = (items: Requirement[]) => deriveIterationHealth(items.map((item) => ({
       priority: item.priority,
       status: item.status || defaultRequirementStatus,
       linkedCaseCount: (linkedCaseIdsByRequirementId[item.id] || []).length,
       passPercent: passCoverageByRequirementId[item.id]?.percent || 0,
-      automationPercent: automationCoverageByRequirementId[item.id]?.percent || 0
+      automationPercent: automationCoverageByRequirementId[item.id]?.percent || 0,
+      linkedCases: (linkedCaseIdsByRequirementId[item.id] || []).map((testCaseId) => ({
+        id: testCaseId,
+        status: latestResultByCaseId[testCaseId]?.status || null
+      })),
+      defects: Array.from(
+        new Map([
+          ...(defectsByRequirementId[item.id] || []).map((defect) => [defect.id, defect] as const),
+          ...(linkedCaseIdsByRequirementId[item.id] || []).flatMap((testCaseId) =>
+            (latestResultByCaseId[testCaseId]?.defects || []).map((defectId) => [defectId, defectFromId(defectId)] as const)
+          )
+        ]).values()
+      )
     })), canUseAutomationWorkspace);
 
     return {
       byId: new Map(requirementIterationGroups.groups.map(({ iteration, requirements: items }) => [iteration.id, derive(items)])),
       unassigned: derive(requirementIterationGroups.unassignedRequirements)
     };
-  }, [automationCoverageByRequirementId, canUseAutomationWorkspace, defaultRequirementStatus, linkedCaseIdsByRequirementId, passCoverageByRequirementId, requirementIterationGroups]);
+  }, [automationCoverageByRequirementId, canUseAutomationWorkspace, defaultRequirementStatus, defectsByRequirementId, issueById, latestResultByCaseId, linkedCaseIdsByRequirementId, passCoverageByRequirementId, requirementIterationGroups]);
   const renderIterationMetrics = (health: ReturnType<typeof deriveIterationHealth>) => (
     <HierarchyMetricStrip
       count={health.count}
       noun="requirement"
       metrics={[
-        { label: "Coverage", value: `${health.coveragePercent}%`, tone: health.coveragePercent >= 80 ? "success" : health.coveragePercent >= 50 ? "warning" : "danger", title: "Requirements linked to at least one test case" },
-        { label: "Readiness", value: `${health.readinessPercent}%`, tone: health.readinessPercent >= 80 ? "success" : health.readinessPercent >= 60 ? "warning" : "danger", title: canUseAutomationWorkspace ? "Average pass and automation readiness" : "Average linked-test pass readiness" },
-        { label: "Done", value: `${health.completionPercent}%`, tone: health.completionPercent >= 80 ? "success" : "info", title: "Requirements in a completed Jira workflow state" },
-        { label: "Risks", value: health.riskCount, tone: health.riskCount ? "danger" : "success", title: "Uncovered requirements or high-priority requirements below 70% readiness" }
+        {
+          label: "Coverage",
+          value: `${health.coveragePercent}%`,
+          tone: health.coveragePercent >= 80 ? "success" : health.coveragePercent >= 50 ? "warning" : "danger",
+          title: `${health.count - health.zeroCoverageCount}/${health.count} requirements have at least one linked test case. Zero coverage: ${health.zeroCoverageCount}.`
+        },
+        {
+          label: "Execution",
+          value: `${health.executionPercent}%`,
+          tone: health.executionPercent >= 80 ? "success" : health.executionPercent >= 50 ? "warning" : "danger",
+          title: `${health.executedCaseCount}/${health.plannedCaseCount} planned linked test cases have a latest pass/fail/blocked result. Blocked/not-run: ${health.blockedNotRunPercent}%.`
+        },
+        {
+          label: "Pass rate",
+          value: `${health.passRatePercent}%`,
+          tone: health.passRatePercent >= 85 ? "success" : health.passRatePercent >= 65 ? "warning" : "danger",
+          title: `${health.passedCaseCount}/${health.executedCaseCount} executed cases passed. Fail rate: ${health.failRatePercent}%; blocked: ${health.blockedCaseCount}; not run: ${health.notRunCaseCount}.`
+        },
+        {
+          label: "P1/P2 bugs",
+          value: health.openHighDefectCount,
+          tone: health.openHighDefectCount ? "danger" : "success",
+          title: `Open critical/high Jira Bugs linked to this scope. Total defects: ${health.totalDefectCount}; density: ${health.defectDensityPerRequirement}/requirement, ${health.defectDensityPerTenCases}/10 test cases.`
+        },
+        {
+          label: "Req risk",
+          value: health.requirementsAtRisk,
+          tone: health.requirementsAtRisk ? "danger" : "success",
+          title: `Requirements at risk are uncovered, have failed/blocked linked cases, have open critical/high defects, or weak high-priority readiness. Passed: ${health.requirementsPassed}; failed: ${health.requirementsFailed}.`
+        }
       ]}
     />
   );
@@ -1092,37 +1444,52 @@ export function RequirementsPage() {
     Number(requirementCoverageFilter !== "all");
 
   const areAllFilteredRequirementsSelected =
-    (requirements.length > 0 || requirementIterations.length > 0)
-    && requirements.every((item) => deleteSelectedRequirementIds.includes(item.id))
-    && requirementIterations.every((iteration) => selectedIterationIds.includes(iteration.id));
+    (filteredRequirements.length > 0 || requirementIterationGroups.groups.length > 0)
+    && filteredRequirements.every((item) => deleteSelectedRequirementIds.includes(item.id))
+    && requirementIterationGroups.groups.every(({ iteration }) => selectedIterationIds.includes(iteration.id));
+
+  const selectedExportRequirements = useMemo(
+    () => requirements.filter((item) => deleteSelectedRequirementIds.includes(item.id)),
+    [deleteSelectedRequirementIds, requirements]
+  );
+
+  const getVisibleIterationRequirementIds = (iterationId: string) =>
+    requirementIterationGroups.groups.find(({ iteration }) => iteration.id === iterationId)?.requirements.map((requirement) => requirement.id) || [];
+
+  const setRequirementIdsSelected = (requirementIds: string[], checked: boolean) => {
+    const uniqueIds = [...new Set(requirementIds)];
+    setDeleteSelectedRequirementIds((current) => checked
+      ? [...new Set([...current, ...uniqueIds])]
+      : current.filter((id) => !uniqueIds.includes(id)));
+  };
 
   const setAllFilteredRequirementItemsSelected = (checked: boolean) => {
-    const requirementIds = requirements.map((item) => item.id);
-    const iterationIds = requirementIterations.map((iteration) => iteration.id);
+    const requirementIds = filteredRequirements.map((item) => item.id);
+    const iterationIds = requirementIterationGroups.groups.map(({ iteration }) => iteration.id);
 
-    setDeleteSelectedRequirementIds((current) => checked
-      ? [...new Set([...current, ...requirementIds])]
-      : current.filter((id) => !requirementIds.includes(id)));
+    setRequirementIdsSelected(requirementIds, checked);
     setSelectedIterationIds((current) => checked
       ? [...new Set([...current, ...iterationIds])]
       : current.filter((id) => !iterationIds.includes(id)));
   };
 
   const setIterationAndChildrenSelected = (iteration: RequirementIteration, checked: boolean) => {
-    const requirementIds = (iteration.requirement_ids || []).filter((id) => requirements.some((requirement) => requirement.id === id));
+    const requirementIds = getVisibleIterationRequirementIds(iteration.id);
     setSelectedIterationIds((current) => checked
       ? [...new Set([...current, iteration.id])]
       : current.filter((id) => id !== iteration.id));
-    setDeleteSelectedRequirementIds((current) => checked
-      ? [...new Set([...current, ...requirementIds])]
-      : current.filter((id) => !requirementIds.includes(id)));
+    setRequirementIdsSelected(requirementIds, checked);
   };
 
   const setUnassignedRequirementsSelected = (checked: boolean) => {
     const requirementIds = requirementIterationGroups.unassignedRequirements.map((requirement) => requirement.id);
-    setDeleteSelectedRequirementIds((current) => checked
-      ? [...new Set([...current, ...requirementIds])]
-      : current.filter((id) => !requirementIds.includes(id)));
+    setRequirementIdsSelected(requirementIds, checked);
+  };
+
+  const startDraggingRequirements = (requirementId: string) => {
+    const ids = deleteSelectedRequirementIds.includes(requirementId) ? deleteSelectedRequirementIds : [requirementId];
+    setDraggingRequirementIds(ids);
+    return ids;
   };
 
   const aiRequirement = useMemo(
@@ -1166,7 +1533,7 @@ export function RequirementsPage() {
       key: "id",
       label: "ID",
       sortValue: (item) => item.display_id || item.id,
-      render: (item) => <DisplayIdBadge value={item.display_id || item.id} />
+      render: (item) => <DisplayIdBadge value={item.display_id || item.id} href={getJiraBrowseUrl(item.display_id || item.id, item.jira_url)} />
     },
     {
       key: "title",
@@ -1326,13 +1693,22 @@ export function RequirementsPage() {
 	                onClick: () => openRequirementWorkspace(item.id)
 	              },
 	              {
-	                label: "AI test cases",
+	                label: "AI test case generation",
 	                description: "Generate or review AI-designed test cases for this requirement.",
 	                icon: <SparkIcon />,
 	                featureKeys: ["qaira.ai.requirement_design"],
 	                permissionMode: "all" as const,
 	                requiredPermissions: ["requirement.ai", "testcase.create"],
 	                onClick: () => openRequirementAiStudio(item.id)
+	              },
+	              {
+	                label: "AI Complete requirement",
+	                description: "Use AI to improve missing or weak requirement details.",
+	                icon: <SparkIcon />,
+	                featureKeys: ["qaira.ai.requirement_design"],
+	                permissionMode: "all" as const,
+	                requiredPermissions: ["requirement.ai", "requirement.update"],
+	                onClick: () => openRequirementOptimization([item.id])
 	              },
 	              {
 	                label: "Delete requirement",
@@ -1355,6 +1731,7 @@ export function RequirementsPage() {
     bugResolutionByRequirementId,
     currentAppTypeName,
     defaultRequirementStatus,
+    areAllFilteredRequirementsSelected,
     deleteSelectedRequirementIds,
     deleteRequirement.isPending,
     defectsByRequirementId,
@@ -1365,6 +1742,28 @@ export function RequirementsPage() {
     requirementIterationById,
     userById
   ]);
+
+  const getScopedRequirementListColumns = (scopeRequirementIds: string[], label: string) => {
+    const uniqueScopeIds = [...new Set(scopeRequirementIds)];
+    const areAllScopeRequirementsSelected =
+      uniqueScopeIds.length > 0 && uniqueScopeIds.every((id) => deleteSelectedRequirementIds.includes(id));
+
+    return requirementListColumns.map((column) => column.key === "select"
+      ? {
+          ...column,
+          headerRender: () => (
+            <label className="data-table-header-checkbox" onClick={(event) => event.stopPropagation()}>
+              <input
+                aria-label={label}
+                checked={areAllScopeRequirementsSelected}
+                onChange={(event) => setRequirementIdsSelected(uniqueScopeIds, event.target.checked)}
+                type="checkbox"
+              />
+            </label>
+          )
+        }
+      : column);
+  };
 
   const selectedRequirementPassCoverage = selectedRequirement
     ? passCoverageByRequirementId[selectedRequirement.id] || { total: 0, covered: 0, percent: 0 }
@@ -1472,7 +1871,8 @@ export function RequirementsPage() {
       release: selectedRequirement.release || "",
       iterationId: selectedRequirement.iteration_id || requirementIterationById.get(selectedRequirement.id)?.id || "",
       priority: selectedRequirement.priority ?? 3,
-      status: selectedRequirement.status || defaultRequirementStatus
+      status: selectedRequirement.status || defaultRequirementStatus,
+      additionalFields: {}
     });
     setSelectedTestCaseIds(selectedRequirement.test_case_ids || []);
     setSelectedDefectIds(selectedRequirement.defect_ids || []);
@@ -1628,6 +2028,11 @@ export function RequirementsPage() {
       return;
     }
 
+    if (requirementCreateMetadataQuery.isLoading) {
+      showSuccess("Checking this Jira project's Story create fields. Try again in a moment.");
+      return;
+    }
+
     try {
       const response = await createRequirement.mutateAsync({
         project_id: projectId,
@@ -1640,7 +2045,8 @@ export function RequirementsPage() {
         release: createDraft.release || undefined,
         iteration_id: createDraft.iterationId || undefined,
         priority: createDraft.priority,
-        status: createDraft.status
+        status: createDraft.status,
+        additional_fields: createDraft.additionalFields
       });
 
       syncRequirementSearchParams(response.id);
@@ -1648,7 +2054,9 @@ export function RequirementsPage() {
       setAiRequirementId(response.id);
       setIsCreateModalOpen(false);
       setCreateDraft(emptyRequirementDraft);
-      showSuccess("Requirement created.");
+      showSuccess(response.status_warning
+        ? `Requirement created. Jira kept its workflow status because ${response.status_warning.requested_status || createDraft.status} is not available from the current workflow state.`
+        : "Requirement created.");
       await refresh();
     } catch (error) {
       showError(error, "Unable to create requirement");
@@ -1672,13 +2080,10 @@ export function RequirementsPage() {
         project_id: projectId,
         name: iterationDraftName.trim(),
         description: iterationDraftDescription.trim() || undefined,
-        requirement_ids: deleteSelectedRequirementIds,
-        jira_sprint_id: iterationDraftSprintId || undefined,
-        jira_sprint_name: jiraSprints.find((sprint) => sprint.id === iterationDraftSprintId)?.name
+        requirement_ids: deleteSelectedRequirementIds
       });
       setIterationDraftName("");
       setIterationDraftDescription("");
-      setIterationDraftSprintId("");
       setIsCreateIterationModalOpen(false);
       setCollapsedIterationIds((current) => current.filter((id) => id !== response.id));
       setDeleteSelectedRequirementIds([]);
@@ -1891,18 +2296,18 @@ export function RequirementsPage() {
   };
 
   const handleExportRequirements = async () => {
-    if (!canExportRequirements || !projectId || !filteredRequirements.length) {
-      showError(null, canExportRequirements ? "No requirements match the current scope." : "Permission required: requirement.export");
+    if (!canExportRequirements || !projectId || !selectedExportRequirements.length) {
+      showError(null, canExportRequirements ? "Select at least one requirement to export." : "Permission required: requirement.export");
       return;
     }
 
     try {
       const response = await api.requirements.exportRequirements({
         project_id: projectId,
-        requirement_ids: filteredRequirements.map((requirement) => requirement.id),
+        requirement_ids: selectedExportRequirements.map((requirement) => requirement.id),
         format: "csv"
       });
-      downloadCsvRecords("qaira-requirements.csv", filteredRequirements.map((requirement) => ({
+      downloadCsvRecords("qaira-requirements.csv", selectedExportRequirements.map((requirement) => ({
         Title: requirement.title,
         Description: requirement.description || "",
         Status: requirement.status || "",
@@ -1916,9 +2321,45 @@ export function RequirementsPage() {
         "Linked Test Cases": (requirement.test_case_ids || []).join("|"),
         "Linked Bugs": (requirement.defect_ids || []).join("|")
       })));
-      showSuccess(`Exported ${filteredRequirements.length} requirement${filteredRequirements.length === 1 ? "" : "s"}. Audit ${response.transaction_id.slice(0, 8)} is available in TestOps.`);
+      const skippedCount = Array.isArray((response as { skipped?: unknown[] }).skipped) ? (response as { skipped?: unknown[] }).skipped!.length : 0;
+      showSuccess(`Exported ${selectedExportRequirements.length} selected requirement${selectedExportRequirements.length === 1 ? "" : "s"}.${skippedCount ? ` Jira skipped ${skippedCount} stale selection${skippedCount === 1 ? "" : "s"}.` : ""} Audit ${response.transaction_id.slice(0, 8)} is available in TestOps.`);
     } catch (error) {
       showError(error, "Unable to export requirements");
+    }
+  };
+
+  const rephraseRequirementDescriptionWithAi = async (html: string, plainText: string, scope: "create" | "detail") => {
+    if (!projectId || !canUseRequirementAi) {
+      showError(null, canUseRequirementAi ? "Select a project before using AI rephrase." : "Permission required: requirement.ai");
+      return undefined;
+    }
+
+    const source = scope === "detail" ? selectedRequirement : null;
+    const sourceDraft = scope === "detail" ? draft : createDraft;
+    try {
+      const response = await rephraseRequirementDescription.mutateAsync({
+        project_id: projectId,
+        integration_id: integrationId || undefined,
+        description: plainText,
+        description_html: html,
+        requirement: {
+          id: source?.id,
+          display_id: source?.display_id,
+          title: sourceDraft.title || source?.title,
+          status: sourceDraft.status || source?.status,
+          priority: sourceDraft.priority || source?.priority,
+          labels: parseReferenceList(sourceDraft.labelsText),
+          sprint: sourceDraft.sprint || source?.sprint,
+          fix_version: sourceDraft.fixVersion || source?.fix_version,
+          release: sourceDraft.release || source?.release,
+          iteration_id: sourceDraft.iterationId || source?.iteration_id,
+          external_references: parseReferenceList(sourceDraft.externalReferencesText)
+        }
+      });
+      return response.description;
+    } catch (error) {
+      showError(error, "Unable to rephrase requirement description with AI");
+      return undefined;
     }
   };
 
@@ -2049,7 +2490,16 @@ export function RequirementsPage() {
   const handleAddAiReferenceImages = async (files: FileList | null) => {
     try {
       const images = await readImageFiles(files);
-      setAiReferenceImages((current) => appendUniqueImages(current, images));
+      let budgetMessage = "";
+      setAiReferenceImages((current) => {
+        const result = mergeAiReferenceImagesWithinBudget(current, images);
+        budgetMessage = result.message;
+        return result.images;
+      });
+      if (budgetMessage) {
+        setPreviewTone("error");
+        setPreviewMessage(budgetMessage);
+      }
     } catch (error) {
       setPreviewTone("error");
       setPreviewMessage(error instanceof Error ? error.message : "Unable to attach the selected image");
@@ -2059,7 +2509,16 @@ export function RequirementsPage() {
   const handleAddOptimizeReferenceImages = async (files: FileList | null) => {
     try {
       const images = await readImageFiles(files);
-      setOptimizeReferenceImages((current) => appendUniqueImages(current, images));
+      let budgetMessage = "";
+      setOptimizeReferenceImages((current) => {
+        const result = mergeAiReferenceImagesWithinBudget(current, images);
+        budgetMessage = result.message;
+        return result.images;
+      });
+      if (budgetMessage) {
+        setPreviewTone("error");
+        setPreviewMessage(budgetMessage);
+      }
     } catch (error) {
       setPreviewTone("error");
       setPreviewMessage(error instanceof Error ? error.message : "Unable to attach the selected image");
@@ -2150,25 +2609,32 @@ export function RequirementsPage() {
     }
   };
 
-	  const openRequirementOptimization = (requirementIds?: string[]) => {
+	  function openRequirementOptimization(requirementIds?: string[]) {
 	    if (!canUseRequirementAi || !canUpdateRequirements) {
 	      showError(null, `Permission required: ${!canUseRequirementAi ? "requirement.ai" : "requirement.update"}`);
 	      return;
 	    }
 
-	    const targetIds = Array.from(
+	    const candidateIds = Array.from(
 	      new Set((requirementIds?.length ? requirementIds : selectedRequirement ? [selectedRequirement.id] : []).filter(Boolean))
 	    );
+    const preferredId = selectedRequirement && candidateIds.includes(selectedRequirement.id)
+      ? selectedRequirement.id
+      : candidateIds[0];
+    const targetIds = preferredId ? [preferredId] : [];
 
     if (!targetIds.length) {
-      showError(new Error("Select one or more requirements first."), "Unable to complete requirement");
+      showError(new Error("Select a requirement first."), "Unable to AI Complete requirement");
       return;
     }
 
     setRequirementAiMode("improve");
     setOptimizeRequirementIds(targetIds);
-    setOptimizeRequirementIndex(0);
     setOptimizationSuggestion(null);
+    setRequirementCreationDrafts([]);
+    setSelectedRequirementCreationDraftIds([]);
+    setExpandedRequirementCreationDraftIds([]);
+    setRequirementCreationJobId("");
     setOptimizationFields({
       title: true,
       description: true,
@@ -2180,7 +2646,7 @@ export function RequirementsPage() {
     setPreviewTone("success");
     setIsRequirementAiSidebarCollapsed(false);
     setIsOptimizeModalOpen(true);
-  };
+	  }
 
   const openAiRequirementCreation = () => {
     if (!canUseRequirementAi || !canCreateRequirements || !projectId) {
@@ -2190,11 +2656,14 @@ export function RequirementsPage() {
 
     setRequirementAiMode("create");
     setOptimizeRequirementIds([]);
-    setOptimizeRequirementIndex(0);
     setOptimizeContext("");
     setOptimizeExternalLinksText("");
     setOptimizeReferenceImages([]);
     setOptimizationSuggestion(null);
+    setRequirementCreationDrafts([]);
+    setSelectedRequirementCreationDraftIds([]);
+    setExpandedRequirementCreationDraftIds([]);
+    setRequirementCreationJobId("");
     setOptimizationFields({ title: true, description: true, external_references: true, priority: true, status: true });
     setPreviewMessage("");
     setPreviewTone("success");
@@ -2203,14 +2672,17 @@ export function RequirementsPage() {
   };
 
   const closeRequirementAiModal = () => {
-    if (previewRequirementOptimization.isPending || previewRequirementCreation.isPending || createRequirement.isPending || updateRequirement.isPending) {
+    if (previewRequirementOptimization.isPending || previewRequirementCreation.isPending || createRequirementGenerationJob.isPending || createRequirement.isPending || updateRequirement.isPending) {
       return;
     }
 
     setIsOptimizeModalOpen(false);
     setOptimizeRequirementIds([]);
-    setOptimizeRequirementIndex(0);
     setOptimizationSuggestion(null);
+    setRequirementCreationDrafts([]);
+    setSelectedRequirementCreationDraftIds([]);
+    setExpandedRequirementCreationDraftIds([]);
+    setRequirementCreationJobId("");
     setPreviewMessage("");
     setIsRequirementAiSidebarCollapsed(false);
   };
@@ -2224,38 +2696,68 @@ export function RequirementsPage() {
 
 	    if (requirementAiMode === "improve" && !activeOptimizeRequirement) {
 	      return;
-	    }
+    }
 
     try {
+      const selectedIntegration = integrations.find((integration) => integration.id === integrationId);
+      const selectedRequirementForAi = requirementAiMode === "improve" ? activeOptimizeRequirement : null;
       const promptInput = {
         integration_id: integrationId || undefined,
+        model: selectedIntegration?.model || undefined,
         additional_context: optimizeContext || undefined,
         external_links: parseExternalLinks(optimizeExternalLinksText),
-        images: optimizeReferenceImages
+        images: optimizeReferenceImages,
+        requirement_id: selectedRequirementForAi?.id || undefined,
+        selected_requirement_id: selectedRequirementForAi?.id || undefined,
+        single_requirement_only: requirementAiMode === "improve" || undefined,
+        requirement_context: selectedRequirementForAi ? {
+          id: selectedRequirementForAi.id,
+          display_id: selectedRequirementForAi.display_id,
+          title: selectedRequirementForAi.title,
+          description: selectedRequirementForAi.description || "",
+          status: selectedRequirementForAi.status,
+          priority: selectedRequirementForAi.priority,
+          labels: selectedRequirementForAi.labels || [],
+          external_references: selectedRequirementForAi.external_references || [],
+          iteration_id: selectedRequirementForAi.iteration_id || null,
+          sprint: selectedRequirementForAi.sprint || null,
+          release: selectedRequirementForAi.release || selectedRequirementForAi.fix_version || null
+        } : undefined
       };
-      const response = requirementAiMode === "create"
-        ? await previewRequirementCreation.mutateAsync({
+      if (requirementAiMode === "create") {
+        setRequirementCreationDrafts([]);
+        setSelectedRequirementCreationDraftIds([]);
+        setExpandedRequirementCreationDraftIds([]);
+        setRequirementCreationJobId("");
+        setPreviewTone("success");
+        setPreviewMessage("Queuing AI requirement generation…");
+        const job = await createRequirementGenerationJob.mutateAsync({
             project_id: projectId,
             ...promptInput,
             priority: 3,
-            status: defaultRequirementStatus
-          })
-        : await previewRequirementOptimization.mutateAsync({
-            requirementId: activeOptimizeRequirement!.id,
-            input: promptInput
+            status: defaultRequirementStatus,
+            max_requirements: 4
           });
+        setRequirementCreationJobId(job.id || job.job_id || "");
+        setPreviewTone("success");
+        setPreviewMessage("AI requirement generation queued. Qaira will poll until the drafts are ready.");
+        return;
+      }
+
+      const response = await previewRequirementOptimization.mutateAsync({
+        requirementId: selectedRequirementForAi!.id,
+        input: promptInput
+      });
       setOptimizationSuggestion(response.suggestion);
       setPreviewTone(response.fallback_used ? "error" : "success");
       setPreviewMessage(
         response.fallback_used
           ? `AI fallback used: ${response.fallback_reason || "LLM unavailable"}`
-          : requirementAiMode === "create"
-            ? `Requirement draft created using ${response.integration?.name || "AI"}.`
-            : `Requirement optimized using ${response.integration?.name || "AI"}.`
+          : `Requirement optimized using ${response.integration?.name || "AI"}.`
       );
     } catch (error) {
       setPreviewTone("error");
-      setPreviewMessage(error instanceof Error ? error.message : "Unable to optimize requirement");
+      setPreviewMessage(error instanceof Error ? error.message : requirementAiMode === "create" ? "Unable to generate requirement drafts" : "Unable to optimize requirement");
     }
   };
 
@@ -2266,7 +2768,69 @@ export function RequirementsPage() {
 	      return;
 	    }
 
-	    if ((requirementAiMode === "improve" && !activeOptimizeRequirement) || !optimizationSuggestion) {
+    if (requirementAiMode === "create") {
+      if (!requirementCreationDrafts.length) {
+        setPreviewTone("error");
+        setPreviewMessage("Generate requirement drafts first, then select the best ones to create.");
+        return;
+      }
+
+      const selectedDrafts = requirementCreationDrafts.filter((candidate, index) =>
+        selectedRequirementCreationDraftIds.includes(getRequirementCreationDraftId(candidate, index))
+      );
+
+      if (!selectedDrafts.length) {
+        setPreviewTone("error");
+        setPreviewMessage("Select at least one generated requirement draft.");
+        return;
+      }
+
+      if (requirementCreateMetadataQuery.isLoading) {
+        setPreviewTone("success");
+        setPreviewMessage("Checking this Jira project's Story create fields. Try again in a moment.");
+        return;
+      }
+
+      try {
+        const createdIds: string[] = [];
+        let statusWarningCount = 0;
+        for (const candidate of selectedDrafts) {
+          const response = await createRequirement.mutateAsync({
+            project_id: projectId,
+            title: candidate.title,
+            description: composeAiRequirementDescription(candidate),
+            external_references: candidate.external_references,
+            labels: ["ai-drafted"],
+            priority: candidate.priority,
+            status: candidate.status,
+            additional_fields: createDraft.additionalFields
+          });
+          createdIds.push(response.id);
+          if (response.status_warning) {
+            statusWarningCount += 1;
+          }
+        }
+
+        const firstCreatedId = createdIds[0];
+        if (firstCreatedId) {
+          syncRequirementSearchParams(firstCreatedId);
+          setSelectedRequirementId(firstCreatedId);
+          setAiRequirementId(firstCreatedId);
+        }
+        setIsOptimizeModalOpen(false);
+        setOptimizationSuggestion(null);
+        setRequirementCreationDrafts([]);
+        setSelectedRequirementCreationDraftIds([]);
+        setExpandedRequirementCreationDraftIds([]);
+        showSuccess(`${createdIds.length} AI-assisted requirement${createdIds.length === 1 ? "" : "s"} created.${statusWarningCount ? ` Jira kept workflow status on ${statusWarningCount} item${statusWarningCount === 1 ? "" : "s"} because the requested AI draft status was not transitionable.` : ""} Review the saved Jira requirement${createdIds.length === 1 ? "" : "s"} before using downstream.`);
+        await refresh();
+      } catch (error) {
+        showError(error, "Unable to create AI requirements");
+      }
+      return;
+    }
+
+	    if (!activeOptimizeRequirement || !optimizationSuggestion) {
 	      return;
 	    }
 
@@ -2279,9 +2843,7 @@ export function RequirementsPage() {
       ...optimizationSuggestion.open_questions.map((item) => `- ${item}`)
     ].filter(Boolean).join("\n");
 
-    const baseDraft = requirementAiMode === "create"
-      ? emptyRequirementDraft
-      : activeOptimizeRequirement!.id === selectedRequirement?.id
+    const baseDraft = activeOptimizeRequirement!.id === selectedRequirement?.id
       ? draft
       : {
           title: activeOptimizeRequirement!.title,
@@ -2293,7 +2855,8 @@ export function RequirementsPage() {
 	          release: activeOptimizeRequirement!.release || "",
 	          iterationId: activeOptimizeRequirement!.iteration_id || requirementIterationById.get(activeOptimizeRequirement!.id)?.id || "",
 	          priority: activeOptimizeRequirement!.priority ?? 3,
-          status: activeOptimizeRequirement!.status || defaultRequirementStatus
+          status: activeOptimizeRequirement!.status || defaultRequirementStatus,
+          additionalFields: {}
         };
 
     const nextDescription = optimizationFields.description
@@ -2310,7 +2873,8 @@ export function RequirementsPage() {
 	      release: baseDraft.release,
 	      iterationId: baseDraft.iterationId,
 	      priority: optimizationFields.priority ? optimizationSuggestion.priority : baseDraft.priority,
-      status: optimizationFields.status ? optimizationSuggestion.status : baseDraft.status
+      status: optimizationFields.status ? optimizationSuggestion.status : baseDraft.status,
+      additionalFields: {}
     };
 
     if (requirementAiMode === "improve" && activeOptimizeRequirement!.id === selectedRequirement?.id) {
@@ -2318,26 +2882,6 @@ export function RequirementsPage() {
     }
 
     try {
-      if (requirementAiMode === "create") {
-        const response = await createRequirement.mutateAsync({
-          project_id: projectId,
-          title: nextDraft.title,
-          description: nextDraft.description,
-          external_references: parseReferenceList(nextDraft.externalReferencesText),
-          labels: parseReferenceList(nextDraft.labelsText),
-          priority: nextDraft.priority,
-          status: nextDraft.status
-        });
-        syncRequirementSearchParams(response.id);
-        setSelectedRequirementId(response.id);
-        setAiRequirementId(response.id);
-        setIsOptimizeModalOpen(false);
-        setOptimizationSuggestion(null);
-        showSuccess("AI-assisted requirement created. Review the saved Jira requirement before using it downstream.");
-        await refresh();
-        return;
-      }
-
       await updateRequirement.mutateAsync({
         id: activeOptimizeRequirement!.id,
         input: {
@@ -2355,30 +2899,25 @@ export function RequirementsPage() {
       });
       setOptimizationSuggestion(null);
       setPreviewMessage("");
-      const hasNextRequirement = optimizeRequirementIndex + 1 < optimizeTargets.length;
-
-      if (hasNextRequirement) {
-        setOptimizeRequirementIndex((current) => current + 1);
-        setOptimizationFields({
-          title: true,
-          description: true,
-          external_references: true,
-          priority: true,
-          status: true
-        });
-        showSuccess(`AI changes applied to "${activeOptimizeRequirement!.title}". Review the next selected requirement.`);
-      } else {
-        setIsOptimizeModalOpen(false);
-        setOptimizeRequirementIds([]);
-        setOptimizeRequirementIndex(0);
-        setDeleteSelectedRequirementIds([]);
-        showSuccess(`AI requirement changes applied to ${optimizeTargets.length || 1} requirement${(optimizeTargets.length || 1) === 1 ? "" : "s"}.`);
-      }
+      setIsOptimizeModalOpen(false);
+      setOptimizeRequirementIds([]);
+        setDeleteSelectedRequirementIds((current) => current.filter((id) => id !== activeOptimizeRequirement!.id));
+      showSuccess(`AI requirement changes applied to "${activeOptimizeRequirement!.title}".`);
       await refresh();
     } catch (error) {
       showError(error, "Unable to apply AI requirement changes");
     }
   };
+
+  const selectedRequirementCreationDrafts = useMemo(
+    () => requirementCreationDrafts.filter((candidate, index) =>
+      selectedRequirementCreationDraftIds.includes(getRequirementCreationDraftId(candidate, index))
+    ),
+    [requirementCreationDrafts, selectedRequirementCreationDraftIds]
+  );
+  const selectedRequirementCreationDraftCount = selectedRequirementCreationDrafts.length;
+  const areAllRequirementCreationDraftsSelected = Boolean(requirementCreationDrafts.length)
+    && selectedRequirementCreationDraftCount === requirementCreationDrafts.length;
 
   const metrics = useMemo(() => {
     const mapped = requirements.filter((item) => (item.test_case_ids || []).length).length;
@@ -2647,15 +3186,16 @@ export function RequirementsPage() {
                   </div>
                 </div>
               </CatalogSearchFilter>
-              <button
-                className="ghost-button catalog-selection-button"
-                disabled={(!requirements.length && !requirementIterations.length) || areAllFilteredRequirementsSelected}
-                onClick={() => setAllFilteredRequirementItemsSelected(true)}
-                type="button"
-              >
-                <SelectAllIcon />
-                <span>Select all</span>
-              </button>
+              {(filteredRequirements.length || requirementIterationGroups.groups.length) && !areAllFilteredRequirementsSelected ? (
+                <button
+                  className="ghost-button catalog-selection-button"
+                  onClick={() => setAllFilteredRequirementItemsSelected(true)}
+                  type="button"
+                >
+                  <SelectAllIcon />
+                  <span>Select all</span>
+                </button>
+              ) : null}
               {deleteSelectedRequirementIds.length || selectedIterationIds.length ? (
                 <button
                   className="ghost-button catalog-selection-button"
@@ -2669,6 +3209,18 @@ export function RequirementsPage() {
                   <span>Clear</span>
                 </button>
               ) : null}
+              <button
+                className="ghost-button catalog-selection-button"
+                disabled={!canCreateRequirementIterations || !projectId}
+                onClick={() => {
+                  setIterationRequirementSearch("");
+                  setIsCreateIterationModalOpen(true);
+                }}
+                type="button"
+              >
+                <IterationIcon />
+                <span>Create iteration</span>
+              </button>
               <RequirementSplitActionButton
                 disabled={!canCreateRequirements || !projectId}
                 icon={<AddIcon />}
@@ -2692,31 +3244,22 @@ export function RequirementsPage() {
                   }
                 ]}
               />
-              <button
-                className="ghost-button catalog-selection-button"
-                disabled={!canExportRequirements || !filteredRequirements.length || !projectId}
-                onClick={() => void handleExportRequirements()}
-                type="button"
-              >
-                <ExportIcon />
-                <span>Export</span>
-              </button>
-              <RequirementSplitActionButton
+              {deleteSelectedRequirementIds.length ? <RequirementSplitActionButton
                 disabled={!canUseRequirementAi || !canUpdateRequirements || !deleteSelectedRequirementIds.length}
                 icon={<SparkIcon />}
-                label="Optimize Requirement"
-                menuLabel="Open selected requirement optimization options"
+                label="AI Complete requirement"
+                menuLabel="Open selected requirement AI options"
                 onClick={() => openRequirementOptimization(deleteSelectedRequirementIds)}
                 actions={[
                   {
-                    label: "AI Improve Requirement",
-                    description: "Improve selected requirement details.",
+                    label: "AI Complete requirement",
+                    description: "Complete one selected requirement with focused AI context.",
                     icon: <SparkIcon />,
                     disabled: !canUseRequirementAi || !canUpdateRequirements || !deleteSelectedRequirementIds.length,
                     onClick: () => openRequirementOptimization(deleteSelectedRequirementIds)
                   },
                   {
-                    label: "AI Test Case Generation",
+                    label: "AI test case generation",
                     description: "Generate test cases from the first selected requirement.",
                     icon: <SparkIcon />,
                     disabled: !canUseRequirementAi || !canCreateTestCases || !deleteSelectedRequirementIds.length || !appTypeId,
@@ -2729,19 +3272,7 @@ export function RequirementsPage() {
                     }
                   }
                 ]}
-              />
-              <button
-                className="ghost-button catalog-selection-button"
-                disabled={!canCreateRequirementIterations || !projectId}
-                onClick={() => {
-                  setIterationRequirementSearch("");
-                  setIsCreateIterationModalOpen(true);
-                }}
-                type="button"
-              >
-                <IterationIcon />
-                <span>Create iteration</span>
-              </button>
+              /> : null}
               {deleteSelectedRequirementIds.length || selectedIterationIds.length ? (
                 <button
                   className="ghost-button danger catalog-selection-button"
@@ -2761,14 +3292,18 @@ export function RequirementsPage() {
                   </span>
                 </button>
               ) : null}
+              {selectedExportRequirements.length ? (
+                <button
+                  className="ghost-button catalog-selection-button requirement-export-button"
+                  disabled={!canExportRequirements || !projectId}
+                  onClick={() => void handleExportRequirements()}
+                  type="button"
+                >
+                  <ExportIcon />
+                  <span>Export requirement</span>
+                </button>
+              ) : null}
             </div>
-
-            {deleteSelectedRequirementIds.length ? (
-              <div className="detail-summary requirement-selection-summary">
-                <strong>{deleteSelectedRequirementIds.length} requirement{deleteSelectedRequirementIds.length === 1 ? "" : "s"} selected</strong>
-                <span>Use the selection to complete requirements with AI or bulk delete. Open any tile to continue editing one requirement in a full-page workspace.</span>
-              </div>
-            ) : null}
 
             <TileBrowserPane className="requirement-card-list">
               {isRequirementCatalogLoading ? <TileCardSkeletonGrid /> : null}
@@ -2778,7 +3313,7 @@ export function RequirementsPage() {
 	                  {iterationTileEntries.map((entry) => {
                     if (entry.kind === "iteration") {
                       const isCollapsed = collapsedIterationIds.includes(entry.iteration.id);
-                      const iterationChildIds = (entry.iteration.requirement_ids || []).filter((id) => requirements.some((requirement) => requirement.id === id));
+                      const iterationChildIds = getVisibleIterationRequirementIds(entry.iteration.id);
                       const isSelected = selectedIterationIds.includes(entry.iteration.id)
                         && iterationChildIds.every((id) => deleteSelectedRequirementIds.includes(id));
 
@@ -2812,7 +3347,7 @@ export function RequirementsPage() {
                             }
                             type="button"
                           >
-                            <ChevronDownIcon />
+                            <HierarchyToggleIcon isExpanded={!isCollapsed} />
                           </button>
                           <span className="module-folder-icon"><IterationIcon /></span>
                           <strong>{entry.iteration.name}</strong>
@@ -2864,20 +3399,20 @@ export function RequirementsPage() {
 	                        requiredPermissions: ["requirement.view"],
 	                        onClick: () => openRequirementWorkspace(item.id)
 	                      },
-	                      {
-	                        label: "AI test cases",
-	                        description: "Generate or review AI-designed test cases for this requirement.",
-	                        icon: <SparkIcon />,
-	                        featureKeys: ["qaira.ai.requirement_design"],
-	                        permissionMode: "all" as const,
-	                        requiredPermissions: ["requirement.ai", "testcase.create"],
-	                        onClick: () => openRequirementAiStudio(item.id)
-	                      },
-	                      {
-	                        label: "Complete with AI",
-	                        description: "Use AI to improve missing or weak requirement details.",
-	                        icon: <SparkIcon />,
-	                        featureKeys: ["qaira.ai.requirement_design"],
+		                      {
+		                        label: "AI test case generation",
+		                        description: "Generate or review AI-designed test cases for this requirement.",
+		                        icon: <SparkIcon />,
+		                        featureKeys: ["qaira.ai.requirement_design"],
+		                        permissionMode: "all" as const,
+		                        requiredPermissions: ["requirement.ai", "testcase.create"],
+		                        onClick: () => openRequirementAiStudio(item.id)
+		                      },
+		                      {
+		                        label: "AI Complete requirement",
+		                        description: "Use AI to improve missing or weak requirement details.",
+		                        icon: <SparkIcon />,
+		                        featureKeys: ["qaira.ai.requirement_design"],
 	                        permissionMode: "all" as const,
 	                        requiredPermissions: ["requirement.ai", "requirement.update"],
 	                        onClick: () => openRequirementOptimization([item.id])
@@ -2905,8 +3440,7 @@ export function RequirementsPage() {
                         ].filter(Boolean).join(" ")}
                         onDragEnd={() => setDraggingRequirementIds([])}
                         onDragStart={(event) => {
-                          const ids = deleteSelectedRequirementIds.includes(item.id) ? deleteSelectedRequirementIds : [item.id];
-                          setDraggingRequirementIds(ids);
+                          const ids = startDraggingRequirements(item.id);
                           event.dataTransfer.effectAllowed = "move";
                           event.dataTransfer.setData("text/plain", ids.join(","));
                         }}
@@ -2937,7 +3471,7 @@ export function RequirementsPage() {
 		                                type="checkbox"
 		                              />
 		                            </label>
-                            <DisplayIdBadge value={item.display_id || item.id} />
+                            <DisplayIdBadge value={item.display_id || item.id} href={getJiraBrowseUrl(item.display_id || item.id, item.jira_url)} />
 		                            <div className="catalog-inline-actions requirement-top-actions" onClick={(event) => event.stopPropagation()}>
 		                              <StatusBadge value={formatTileCardLabel(item.status || defaultRequirementStatus, "Open")} />
 		                              <CatalogActionMenu actions={tileActions} label={`${item.title} actions`} />
@@ -2988,12 +3522,20 @@ export function RequirementsPage() {
                 <>
                   {requirementIterationGroups.groups.map(({ iteration, requirements: groupRequirements }) => {
                     const isCollapsed = collapsedIterationIds.includes(iteration.id);
-                    const iterationChildIds = (iteration.requirement_ids || []).filter((id) => requirements.some((requirement) => requirement.id === id));
+                    const iterationChildIds = groupRequirements.map((requirement) => requirement.id);
                     const isSelected = selectedIterationIds.includes(iteration.id)
                       && iterationChildIds.every((id) => deleteSelectedRequirementIds.includes(id));
                     return (
                       <Fragment key={iteration.id}>
-                        <div className="test-case-module-header requirement-iteration-header requirement-iteration-list-header">
+                        <div
+                          className={draggingRequirementIds.length ? "test-case-module-header requirement-iteration-header requirement-iteration-list-header is-drop-ready" : "test-case-module-header requirement-iteration-header requirement-iteration-list-header"}
+                          onDragOver={(event) => {
+                            if (draggingRequirementIds.length) {
+                              event.preventDefault();
+                            }
+                          }}
+                          onDrop={() => void handleDropRequirementOnIteration(iteration.id)}
+                        >
                           <label className="checkbox-field" onClick={(event) => event.stopPropagation()}>
                             <input
                               checked={isSelected}
@@ -3013,7 +3555,7 @@ export function RequirementsPage() {
                             }
                             type="button"
                           >
-                            <ChevronDownIcon />
+                            <HierarchyToggleIcon isExpanded={!isCollapsed} />
                           </button>
                           <span className="module-folder-icon"><IterationIcon /></span>
                           <strong>{iteration.name}</strong>
@@ -3021,11 +3563,14 @@ export function RequirementsPage() {
                         </div>
                         {!isCollapsed ? (
                           <DataTable
-                            columns={requirementListColumns}
+                            columns={getScopedRequirementListColumns(iterationChildIds, `Select all requirements in ${iteration.name}`)}
                             enableColumnResize
                             emptyMessage="No requirements match this iteration."
+                            getRowDraggable={() => true}
                             getRowClassName={(item) => (selectedRequirement?.id === item.id ? "is-active-row" : "")}
                             getRowKey={(item) => item.id}
+                            onRowDragEnd={() => setDraggingRequirementIds([])}
+                            onRowDragStart={(item) => startDraggingRequirements(item.id)}
                             onRowClick={(item) => openRequirementWorkspace(item.id)}
                             rows={groupRequirements}
                             storageKey={`qaira:requirements:list-columns:${iteration.id}`}
@@ -3049,11 +3594,14 @@ export function RequirementsPage() {
                         {renderIterationMetrics(iterationHealth.unassigned)}
                       </div>
                       <DataTable
-                        columns={requirementListColumns}
+                        columns={getScopedRequirementListColumns(requirementIterationGroups.unassignedRequirements.map((requirement) => requirement.id), "Select all unassigned requirements")}
                         enableColumnResize
                         emptyMessage="No unassigned requirements match the current search."
+                        getRowDraggable={() => true}
                         getRowClassName={(item) => (selectedRequirement?.id === item.id ? "is-active-row" : "")}
                         getRowKey={(item) => item.id}
+                        onRowDragEnd={() => setDraggingRequirementIds([])}
+                        onRowDragStart={(item) => startDraggingRequirements(item.id)}
                         onRowClick={(item) => openRequirementWorkspace(item.id)}
                         rows={requirementIterationGroups.unassignedRequirements}
                         storageKey="qaira:requirements:list-columns:unassigned"
@@ -3078,10 +3626,25 @@ export function RequirementsPage() {
               <div className="panel-head-actions-row">
                 <WorkspaceBackButton label="Back to requirement tiles" onClick={closeRequirementDetail} />
                 {selectedRequirement ? (
-	                  <button className="primary-button" disabled={!canCreateTestCases || !appTypeId} onClick={() => openNewTestCase(selectedRequirement)} type="button">
-                    <AddIcon />
-                    <span>New Test Case</span>
-                  </button>
+                  <>
+		                  <button className="primary-button" disabled={!canCreateTestCases || !appTypeId} onClick={() => openNewTestCase(selectedRequirement)} type="button">
+                      <AddIcon />
+                      <span>New Test Case</span>
+                    </button>
+                    <button
+                      className="ghost-button"
+                      disabled={!canUseRequirementAi || !canUpdateRequirements || previewRequirementOptimization.isPending}
+                      onClick={() => openRequirementOptimization([selectedRequirement.id])}
+                      type="button"
+                    >
+                      <SparkIcon />
+                      <span>AI Complete requirement</span>
+                    </button>
+                    <button className="ghost-button danger" disabled={!canDeleteRequirements || deleteRequirement.isPending} onClick={() => void handleDeleteRequirement()} type="button">
+                      <TrashIcon />
+                      <span>Delete Requirement</span>
+                    </button>
+                  </>
                 ) : null}
               </div>
             )}
@@ -3095,6 +3658,7 @@ export function RequirementsPage() {
                   ariaLabel="Requirement detail sections"
                   items={[
                     { value: "details", label: "Details", icon: <PencilIcon /> },
+                    { value: "grounding", label: "AI Assurance", icon: <SparkIcon /> },
                     { value: "cases", label: "Linked test cases", icon: <LayersIcon />, count: selectedTestCaseIds.length },
                     { value: "defects", label: "Linked bugs", icon: <BugIcon />, count: selectedDefectIds.length },
                     { value: "history", label: "Historical runs", icon: <ActivityIcon /> },
@@ -3130,43 +3694,28 @@ export function RequirementsPage() {
                     </span>
                   </div>
                 </div>
-                <AiAssurancePanel
-                  compact
-                  gaps={selectedRequirementAiReadiness.gaps}
-                  provenance="Local completeness rules over the current draft, linked cases, references, labels, and delivery context"
-                  reviewState="review-required"
-                  score={selectedRequirementAiReadiness.score}
-                  scoreLabel={selectedRequirementAiReadiness.scoreLabel}
-                  signals={selectedRequirementAiReadiness.signals}
-                  summary={selectedRequirementAiReadiness.summary}
-                  title="Requirement grounding"
-                />
-                <div className="action-row">
-                  <button
-                    className="ghost-button compact"
-                    disabled={!canUseRequirementAi || !projectId || previewRequirementImpact.isPending}
-                    onClick={openRequirementImpactPreview}
-                    type="button"
-                  >
-                    <SparkIcon />
-                    <span>{previewRequirementImpact.isPending ? "Reviewing impact…" : "Preview change impact"}</span>
-                  </button>
-                  <span className="form-help">Read-only Jira traceability review; no requirement or linked record is changed.</span>
-                </div>
                 <div className="requirement-accordion">
                   <RequirementAccordionSection
                     countLabel={`${selectedTestCaseIds.length} linked`}
                     isExpanded={expandedSections.details}
                     onToggle={() => setExpandedSections((current) => ({ ...current, details: !current.details }))}
-                    summary="Review the requirement header details, update the draft, then save or delete from one focused section."
-                    title="Requirement header details"
+                    title="Requirement details"
                   >
-                    <form className="form-grid" onSubmit={(event) => void handleSaveRequirement(event)}>
-                      <div className="record-grid requirement-detail-metadata-grid">
+                    <div className="requirement-detail-id-row">
+                      <span>Requirement ID</span>
+                      <DisplayIdBadge value={selectedRequirement.display_id || selectedRequirement.id} href={getJiraBrowseUrl(selectedRequirement.display_id || selectedRequirement.id, selectedRequirement.jira_url)} />
+                    </div>
+                    <form className="form-grid requirement-details-form" onSubmit={(event) => void handleSaveRequirement(event)}>
+                      <div className="record-grid requirement-detail-metadata-grid requirement-detail-metadata-grid--compact">
                         <FormField label="Title" required>
                           <input required value={draft.title} onChange={(event) => setDraft((current) => ({ ...current, title: event.target.value }))} />
                         </FormField>
-                        <FormField label="Status">
+                        <RequirementLabelsField
+                          options={requirementLabelOptions}
+                          value={draft.labelsText}
+                          onChange={(labelsText) => setDraft((current) => ({ ...current, labelsText }))}
+                        />
+                        <FormField className="form-field--compact-enum" label="Status">
                           <select value={draft.status} onChange={(event) => setDraft((current) => ({ ...current, status: event.target.value }))}>
                             {requirementStatusOptions.map((status) => (
                               <option key={status} value={status}>
@@ -3175,31 +3724,17 @@ export function RequirementsPage() {
                             ))}
                           </select>
                         </FormField>
-	                        <FormField label="Priority">
-	                          <input min="1" max="5" type="number" value={draft.priority} onChange={(event) => setDraft((current) => ({ ...current, priority: Number(event.target.value) || 3 }))} />
-	                        </FormField>
-	                        <FormField label="Iteration">
-	                          <select value={draft.iterationId} onChange={(event) => setDraft((current) => ({ ...current, iterationId: event.target.value }))}>
-	                            <option value="">No iteration</option>
-	                            {requirementIterations.map((iteration) => (
-	                              <option key={iteration.id} value={iteration.id}>{iteration.name}</option>
-	                            ))}
-	                          </select>
-	                        </FormField>
-	                      </div>
-                      <FormField label="Description">
-                        <RichTextEditor
-                          rows={4}
-                          value={draft.description}
-                          onChange={(description) => setDraft((current) => ({ ...current, description }))}
-                        />
-                      </FormField>
-                      <div className="record-grid requirement-compact-metadata-grid">
-                        <RequirementLabelsField
-                          options={requirementLabelOptions}
-                          value={draft.labelsText}
-                          onChange={(labelsText) => setDraft((current) => ({ ...current, labelsText }))}
-                        />
+                        <FormField className="form-field--compact-enum form-field--compact-number" label="Priority">
+                          <input min="1" max="5" type="number" value={draft.priority} onChange={(event) => setDraft((current) => ({ ...current, priority: Number(event.target.value) || 3 }))} />
+                        </FormField>
+                        <FormField label="Iteration">
+                          <select value={draft.iterationId} onChange={(event) => setDraft((current) => ({ ...current, iterationId: event.target.value }))}>
+                            <option value="">No iteration</option>
+                            {requirementIterations.map((iteration) => (
+                              <option key={iteration.id} value={iteration.id}>{iteration.name}</option>
+                            ))}
+                          </select>
+                        </FormField>
                         <FormField label="Sprint">
                           <select value={draft.sprint} onChange={(event) => setDraft((current) => ({ ...current, sprint: event.target.value }))}>
                             <option value="">No sprint</option>
@@ -3216,38 +3751,66 @@ export function RequirementsPage() {
                           </select>
                         </FormField>
                       </div>
-                      <FormField label="External references" hint="Ticket links or IDs, separated with commas.">
-                        <input value={draft.externalReferencesText} onChange={(event) => setDraft((current) => ({ ...current, externalReferencesText: event.target.value }))} />
+                      <FormField label="Description">
+                        <RichTextEditor
+                          aiRephraseTitle="Rephrase requirement description with AI"
+                          onAiRephrase={(html, plainText) => rephraseRequirementDescriptionWithAi(html, plainText, "detail")}
+                          rows={4}
+                          value={draft.description}
+                          onChange={(description) => setDraft((current) => ({ ...current, description }))}
+                        />
                       </FormField>
+                      <ExternalReferencesField
+                        value={draft.externalReferencesText}
+                        onChange={(externalReferencesText) => setDraft((current) => ({ ...current, externalReferencesText }))}
+                      />
 
                       <div className="action-row">
-	                        <button
-	                          className="ghost-button"
-	                          disabled={!canUseRequirementAi || !canUpdateRequirements || previewRequirementOptimization.isPending}
-                          onClick={() => openRequirementOptimization([selectedRequirement.id])}
-                          type="button"
-                        >
-                          <SparkIcon />
-                          AI complete
-                        </button>
-	                        <button className="primary-button" disabled={!canUpdateRequirements || updateRequirement.isPending || replaceMappings.isPending || replaceDefectMappings.isPending} type="submit">
+                        <button className="primary-button" disabled={!canUpdateRequirements || updateRequirement.isPending || replaceMappings.isPending || replaceDefectMappings.isPending} type="submit">
                           {updateRequirement.isPending || replaceMappings.isPending || replaceDefectMappings.isPending ? "Saving…" : "Save requirement"}
                         </button>
-	                        <button className="ghost-button danger" disabled={!canDeleteRequirements || deleteRequirement.isPending} onClick={() => void handleDeleteRequirement()} type="button">
-                          Delete requirement
-                        </button>
                       </div>
-	                    </form>
+                    </form>
                   </RequirementAccordionSection>
                   </div>
                   </div>
                 ) : null}
+                {activeTraceabilityTab === "grounding" ? (
+                  <div className="detail-section-panel requirement-detail-wide-panel" role="tabpanel">
+                    <div className="requirement-grounding-header">
+                      <div>
+                        <strong>AI Assurance Requirement grounding</strong>
+                        <span>Quality signals, evidence gaps, and change-impact review for this Jira requirement.</span>
+                      </div>
+                      <button
+                        className="ghost-button compact"
+                        disabled={!canUseRequirementAi || !projectId || previewRequirementImpact.isPending}
+                        onClick={openRequirementImpactPreview}
+                        type="button"
+                      >
+                        <SparkIcon />
+                        <span>{previewRequirementImpact.isPending ? "Reviewing impact…" : "Preview change impact"}</span>
+                      </button>
+                    </div>
+                    <AiAssurancePanel
+                      gaps={selectedRequirementAiReadiness.gaps}
+                      provenance="Local completeness rules over the current draft, linked cases, references, labels, and delivery context"
+                      reviewState="review-required"
+                      score={selectedRequirementAiReadiness.score}
+                      scoreLabel={selectedRequirementAiReadiness.scoreLabel}
+                      signals={selectedRequirementAiReadiness.signals}
+                      summary={selectedRequirementAiReadiness.summary}
+                      title="Requirement grounding"
+                    />
+                  </div>
+                ) : null}
                 {activeTraceabilityTab === "cases" ? (
-                  <div className="detail-section-panel" role="tabpanel">
+                  <div className="detail-section-panel requirement-detail-wide-panel" role="tabpanel">
                     <RequirementTestCasePicker
                       compactTitlesOnly
                       emptyText={appTypeId ? "No reusable test cases are available for this app type." : "Select an app type first to link reusable test cases."}
                       isSearchActive={isDetailTestCaseSearchActive}
+                      onClearSearch={() => setIsDetailTestCaseSearchActive(false)}
                       onSearch={() => setIsDetailTestCaseSearchActive(true)}
                       runHistoryByTestCaseId={selectedRunHistoryByTestCaseId}
                       onView={openTestCaseWorkspace}
@@ -3262,7 +3825,7 @@ export function RequirementsPage() {
                   </div>
                 ) : null}
                 {activeTraceabilityTab === "defects" ? (
-                  <div className="detail-section-panel" role="tabpanel">
+                  <div className="detail-section-panel requirement-detail-wide-panel" role="tabpanel">
                     <LinkedDefectsPanel
                       canUpdate={canUpdateRequirements}
                       initialDefects={selectedRequirementDefects}
@@ -3274,7 +3837,7 @@ export function RequirementsPage() {
                   </div>
                 ) : null}
                 {activeTraceabilityTab === "history" ? (
-                  <div className="detail-section-panel" role="tabpanel">
+                  <div className="detail-section-panel requirement-detail-wide-panel" role="tabpanel">
                     <TraceabilityRunHistory
                       appTypeId={appTypeId || undefined}
                       projectId={projectId}
@@ -3283,7 +3846,7 @@ export function RequirementsPage() {
                   </div>
                 ) : null}
                 {activeTraceabilityTab === "evidence" ? (
-                  <div className="detail-section-panel" role="tabpanel">
+                  <div className="detail-section-panel requirement-detail-wide-panel" role="tabpanel">
                     <JiraAttachmentPanel
                       canDelete={canDeleteAttachments}
                       canUpload={canCreateAttachments}
@@ -3336,7 +3899,7 @@ export function RequirementsPage() {
                         onChange={(event) => setCreateDraft((current) => ({ ...current, title: event.target.value }))}
                       />
                     </FormField>
-                    <FormField label="Status">
+                    <FormField className="form-field--compact-enum" label="Status">
                       <select
                         value={createDraft.status}
                         onChange={(event) => setCreateDraft((current) => ({ ...current, status: event.target.value }))}
@@ -3348,7 +3911,7 @@ export function RequirementsPage() {
                         ))}
                       </select>
                     </FormField>
-	                    <FormField label="Priority">
+	                    <FormField className="form-field--compact-enum form-field--compact-number" label="Priority">
 	                      <input
                         min="1"
                         max="5"
@@ -3372,6 +3935,8 @@ export function RequirementsPage() {
                   <FormField label="Description" inputId="create-requirement-description-input">
                     <RichTextEditor
                       id="create-requirement-description-input"
+                      aiRephraseTitle="Rephrase requirement description with AI"
+                      onAiRephrase={(html, plainText) => rephraseRequirementDescriptionWithAi(html, plainText, "create")}
                       rows={4}
                       value={createDraft.description}
                       onChange={(description) => setCreateDraft((current) => ({ ...current, description }))}
@@ -3402,12 +3967,27 @@ export function RequirementsPage() {
                       </select>
                     </FormField>
                   </div>
-                  <FormField label="External references" hint="Ticket links or IDs, separated with commas.">
-                    <input
-                      value={createDraft.externalReferencesText}
-                      onChange={(event) => setCreateDraft((current) => ({ ...current, externalReferencesText: event.target.value }))}
-                    />
-                  </FormField>
+                  <ExternalReferencesField
+                    value={createDraft.externalReferencesText}
+                    onChange={(externalReferencesText) => setCreateDraft((current) => ({ ...current, externalReferencesText }))}
+                  />
+                  {requirementCreateMetadataQuery.isLoading || requiredJiraRequirementFields.length ? (
+                    <section className="issue-form-section">
+                      <div className="issue-form-section-head">
+                        <strong>Jira required fields</strong>
+                        <span>
+                          These fields come from this project’s Jira Story create screen. Qaira collects them before creating the Story so Jira validation stays aligned with your project configuration.
+                        </span>
+                      </div>
+                      {requirementCreateMetadataQuery.isLoading ? (
+                        <LoadingState label="Checking Jira Story create fields" />
+                      ) : (
+                        <div className="issue-form-grid issue-form-grid--triple">
+                          {requiredJiraRequirementFields.map(renderAdditionalRequirementField)}
+                        </div>
+                      )}
+                    </section>
+                  ) : null}
                 </div>
 
               </div>
@@ -3416,8 +3996,8 @@ export function RequirementsPage() {
                 <button className="ghost-button" disabled={createRequirement.isPending} onClick={closeCreateRequirementModal} type="button">
                   Cancel
                 </button>
-	                <button className="primary-button" disabled={!canCreateRequirements || createRequirement.isPending} type="submit">
-	                  {createRequirement.isPending ? "Creating…" : "Create requirement"}
+	                <button className="primary-button" disabled={!canCreateRequirements || createRequirement.isPending || requirementCreateMetadataQuery.isLoading} type="submit">
+	                  {createRequirement.isPending ? "Creating…" : requirementCreateMetadataQuery.isLoading ? "Checking Jira fields…" : "Create requirement"}
 	                </button>
               </div>
             </form>
@@ -3435,33 +4015,26 @@ export function RequirementsPage() {
             onSubmit={(event) => void handleCreateIteration(event)}
             role="dialog"
           >
-            <div className="requirement-create-header">
-              <div className="requirement-create-title">
-                <h2 className="dialog-title" id="create-requirement-iteration-title">Create iteration</h2>
-                <p>Group requirements into a delivery iteration and drag additional requirements into it from the catalog.</p>
-              </div>
-              <DialogCloseButton label="Close create iteration" onClick={() => setIsCreateIterationModalOpen(false)} />
-            </div>
-            <div className="requirement-create-modal-body requirement-create-modal-body--stacked">
-              <FormField label="Iteration name" required>
-                <input autoFocus required value={iterationDraftName} onChange={(event) => setIterationDraftName(event.target.value)} />
-              </FormField>
-              <FormField label="Description">
-                <RichTextEditor value={iterationDraftDescription} onChange={setIterationDraftDescription} />
-              </FormField>
-              <FormField label="Jira Sprint">
-                <select value={iterationDraftSprintId} onChange={(event) => {
-                  const sprint = jiraSprints.find((item) => item.id === event.target.value);
-                  setIterationDraftSprintId(event.target.value);
-                  if (sprint && !iterationDraftName.trim()) setIterationDraftName(sprint.name);
-                }}>
-                  <option value="">No Jira Sprint mapping</option>
-                  {jiraSprints.map((sprint) => <option key={sprint.id} value={sprint.id}>{sprint.name}{sprint.state ? ` · ${sprint.state}` : ""}</option>)}
-                </select>
-              </FormField>
-              <div className="iteration-requirement-picker">
-                <div className="iteration-requirement-picker-toolbar">
-                  <FormField label="Requirements">
+	            <div className="requirement-create-header">
+	              <div className="requirement-create-title">
+	                <h2 className="dialog-title" id="create-requirement-iteration-title">Create iteration</h2>
+	                <p>Group requirements into a focused delivery scope. Select the requirements to include now; more can be dragged into the iteration later.</p>
+	              </div>
+	              <DialogCloseButton label="Close create iteration" onClick={() => setIsCreateIterationModalOpen(false)} />
+	            </div>
+	            <div className="requirement-create-modal-body requirement-create-modal-body--stacked">
+	              <div className="iteration-create-layout">
+	                <section className="iteration-create-details-card">
+	                  <FormField label="Iteration name" required>
+	                    <input autoFocus required value={iterationDraftName} onChange={(event) => setIterationDraftName(event.target.value)} />
+	                  </FormField>
+	                  <FormField label="Description">
+	                    <RichTextEditor value={iterationDraftDescription} onChange={setIterationDraftDescription} />
+	                  </FormField>
+	                </section>
+	              <div className="iteration-requirement-picker">
+	                <div className="iteration-requirement-picker-toolbar">
+	                  <FormField label="Requirements">
                     <div className="search-input-with-icon">
                       <SearchIcon />
                       <input
@@ -3526,16 +4099,13 @@ export function RequirementsPage() {
                       </label>
                     );
                   })}
-                  {!iterationRequirementOptions.length ? (
-                    <div className="empty-state compact">No requirements match this search.</div>
-                  ) : null}
-                </div>
-                <div className="detail-summary">
-                  <strong>{deleteSelectedRequirementIds.length} selected requirement{deleteSelectedRequirementIds.length === 1 ? "" : "s"}</strong>
-                  <span>Selected requirements are moved into this iteration after creation.</span>
-                </div>
-              </div>
-            </div>
+	                  {!iterationRequirementOptions.length ? (
+	                    <div className="empty-state compact">No requirements match this search.</div>
+	                  ) : null}
+	                </div>
+	              </div>
+	              </div>
+	            </div>
             <div className="action-row requirement-create-modal-actions">
               <button className="ghost-button" onClick={() => setIsCreateIterationModalOpen(false)} type="button">Cancel</button>
               <button className="primary-button" disabled={!canCreateRequirementIterations || createRequirementIteration.isPending || !iterationDraftName.trim()} type="submit">
@@ -3659,26 +4229,38 @@ export function RequirementsPage() {
           <div
             aria-labelledby="ai-improve-requirement-title"
             aria-modal="true"
-            className="modal-card requirement-create-modal ai-design-modal ai-design-modal--requirements ai-requirement-improve-modal"
+            className={requirementAiMode === "create" ? "modal-card requirement-create-modal ai-design-modal ai-design-modal--requirements ai-requirement-improve-modal ai-requirement-create-ai-modal" : "modal-card requirement-create-modal ai-design-modal ai-design-modal--requirements ai-requirement-improve-modal"}
             onClick={(event) => event.stopPropagation()}
             role="dialog"
           >
             <div className="ai-studio-header">
-              <div className="ai-studio-header-copy">
+              <div className="ai-studio-header-copy ai-requirement-ai-header-copy">
                 <p className="dialog-context-label">Requirements</p>
-                <h2 className="dialog-title" id="ai-improve-requirement-title">
-                  {requirementAiMode === "create" ? "Create requirements using AI" : "AI improve requirement"}
-                </h2>
+                <div className="ai-requirement-title-row">
+                  <h2 className="dialog-title" id="ai-improve-requirement-title">
+                    {requirementAiMode === "create" ? "Create requirements using AI" : "AI Complete requirement"}
+                  </h2>
+                  <button className="primary-button ai-studio-primary-action ai-requirement-title-action" disabled={!canUseRequirementAi || previewRequirementOptimization.isPending || previewRequirementCreation.isPending || createRequirementGenerationJob.isPending || isRequirementCreationJobRunning} onClick={() => void handlePreviewRequirementOptimization()} type="button">
+                    <SparkIcon />
+                    {createRequirementGenerationJob.isPending
+                      ? "Queuing…"
+                      : isRequirementCreationJobRunning
+                        ? "Generating…"
+                        : previewRequirementOptimization.isPending || previewRequirementCreation.isPending
+                      ? "Thinking…"
+                      : requirementAiMode === "create" ? "Generate requirement drafts" : "Complete requirement"}
+                  </button>
+                </div>
                 <p>
                   {requirementAiMode === "create"
-                    ? "Shape a testable requirement with the same prompt context used by AI test case generation, then review every field before creating it in Jira."
-                    : optimizeTargets.length > 1
-                      ? `Reviewing ${optimizeRequirementIndex + 1} of ${optimizeTargets.length}: ${activeOptimizeRequirement?.title || "Requirement"}`
-                      : "Generate a testable requirement upgrade, then accept all changes, decline, or apply only selected fields."}
+                    ? "Generate multiple testable requirement candidates from prompt context, external references, and compressed attachments, then select only the strongest drafts for Jira."
+                    : activeOptimizeRequirement
+                      ? `Complete one requirement: ${activeOptimizeRequirement.title}`
+                      : "Select one requirement, add context if needed, then generate a focused completion draft."}
                 </p>
               </div>
               <DialogCloseButton
-                disabled={previewRequirementOptimization.isPending || previewRequirementCreation.isPending || createRequirement.isPending || updateRequirement.isPending}
+                disabled={previewRequirementOptimization.isPending || previewRequirementCreation.isPending || createRequirementGenerationJob.isPending || createRequirement.isPending || updateRequirement.isPending}
                 label={requirementAiMode === "create" ? "Close AI requirement creation" : "Close AI requirement improvement"}
                 onClick={closeRequirementAiModal}
               />
@@ -3700,6 +4282,27 @@ export function RequirementsPage() {
                           ))}
                         </select>
                       </FormField>
+                      {requirementAiMode === "improve" ? (
+                        <FormField label="Requirement">
+                          <select
+                            value={activeOptimizeRequirement?.id || ""}
+                            onChange={(event) => {
+                              const nextRequirementId = event.target.value;
+                              setOptimizeRequirementIds(nextRequirementId ? [nextRequirementId] : []);
+                                                        setOptimizationSuggestion(null);
+                              setPreviewMessage("");
+                            }}
+                            disabled={previewRequirementOptimization.isPending || updateRequirement.isPending}
+                          >
+                            <option value="" disabled>Select requirement</option>
+                            {aiCompleteRequirementOptions.map((requirement) => (
+                              <option key={requirement.id} value={requirement.id}>
+                                {requirement.display_id ? `${requirement.display_id} · ` : ""}{requirement.title}
+                              </option>
+                            ))}
+                          </select>
+                        </FormField>
+                      ) : null}
                     </div>
                   </section>
 
@@ -3710,7 +4313,7 @@ export function RequirementsPage() {
                   <AiPromptContextPanel
                     additionalContext={optimizeContext}
                     appTypeId={appTypeId}
-                    disabled={previewRequirementOptimization.isPending || previewRequirementCreation.isPending || createRequirement.isPending || updateRequirement.isPending}
+                    disabled={previewRequirementOptimization.isPending || previewRequirementCreation.isPending || createRequirementGenerationJob.isPending || isRequirementCreationJobRunning || createRequirement.isPending || updateRequirement.isPending}
                     externalLinksText={optimizeExternalLinksText}
                     onAddImages={(files) => void handleAddOptimizeReferenceImages(files)}
                     onAdditionalContextChange={setOptimizeContext}
@@ -3729,18 +4332,138 @@ export function RequirementsPage() {
               </div>
 
               <div className="ai-studio-main">
-                <div className="action-row ai-studio-actions">
-		                  <button className="primary-button ai-studio-primary-action" disabled={!canUseRequirementAi || previewRequirementOptimization.isPending || previewRequirementCreation.isPending} onClick={() => void handlePreviewRequirementOptimization()} type="button">
-                    <SparkIcon />
-                    {previewRequirementOptimization.isPending || previewRequirementCreation.isPending
-                      ? "Thinking…"
-                      : requirementAiMode === "create" ? "Generate requirement draft" : "Suggest improvements"}
-                  </button>
-                </div>
-
                 {previewMessage ? <ToastMessage message={previewMessage} onDismiss={() => setPreviewMessage("")} tone={previewTone} /> : null}
 
-                {optimizationSuggestion ? (
+                {requirementAiMode === "create" && (requirementCreateMetadataQuery.isLoading || requiredJiraRequirementFields.length) ? (
+                  <section className="issue-form-section">
+                    <div className="issue-form-section-head">
+                      <strong>Jira required fields</strong>
+                      <span>
+                        These project-specific Jira Story fields will be applied to every selected AI draft created from this batch.
+                      </span>
+                    </div>
+                    {requirementCreateMetadataQuery.isLoading ? (
+                      <LoadingState label="Checking Jira Story create fields" />
+                    ) : (
+                      <div className="issue-form-grid issue-form-grid--triple">
+                        {requiredJiraRequirementFields.map(renderAdditionalRequirementField)}
+                      </div>
+                    )}
+                  </section>
+                ) : null}
+
+                {requirementAiMode === "create" ? (
+                  requirementCreationDrafts.length ? (
+                    <div className="ai-requirement-draft-workbench">
+                      <div className="ai-requirement-generation-toolbar">
+                        <div>
+                          <strong>{selectedRequirementCreationDraftCount} of {requirementCreationDrafts.length} selected</strong>
+                          <span>Review title, description, priority, acceptance criteria, risks, and questions before creating Jira requirements.</span>
+                        </div>
+                        <div className="action-row">
+                          <button
+                            className="ghost-button compact"
+                            onClick={() => {
+                              if (areAllRequirementCreationDraftsSelected) {
+                                setSelectedRequirementCreationDraftIds([]);
+                                return;
+                              }
+                              setSelectedRequirementCreationDraftIds(requirementCreationDrafts.map((candidate, index) => getRequirementCreationDraftId(candidate, index)));
+                            }}
+                            type="button"
+                          >
+                            {areAllRequirementCreationDraftsSelected ? "Clear selection" : "Select all drafts"}
+                          </button>
+                          <button
+                            className="ghost-button compact"
+                            onClick={() => setIsRequirementAiSidebarCollapsed((current) => !current)}
+                            type="button"
+                          >
+                            {isRequirementAiSidebarCollapsed ? "Expand prompt panel" : "Collapse prompt panel"}
+                          </button>
+                        </div>
+                      </div>
+
+                      <div className="ai-requirement-draft-list">
+                        {requirementCreationDrafts.map((candidate, index) => {
+                          const draftId = getRequirementCreationDraftId(candidate, index);
+                          const isSelected = selectedRequirementCreationDraftIds.includes(draftId);
+                          const isExpanded = expandedRequirementCreationDraftIds.includes(draftId);
+                          const qualityPercent = Math.round(Number(candidate.quality_score || 0.72) * 100);
+
+                          return (
+                            <article className={isSelected ? "ai-requirement-draft-card is-selected" : "ai-requirement-draft-card"} key={draftId}>
+                              <div className="ai-requirement-draft-card-head">
+                                <label className="ai-requirement-draft-selector">
+                                  <input
+                                    checked={isSelected}
+                                    onChange={(event) => setSelectedRequirementCreationDraftIds((current) =>
+                                      event.target.checked
+                                        ? [...new Set([...current, draftId])]
+                                        : current.filter((id) => id !== draftId)
+                                    )}
+                                    type="checkbox"
+                                  />
+                                  <span>
+                                    <strong>{candidate.title}</strong>
+                                    <small>Priority P{candidate.priority} · {candidate.status || defaultRequirementStatus} · Quality {qualityPercent}%</small>
+                                  </span>
+                                </label>
+                                <button
+                                  aria-expanded={isExpanded}
+                                  className="ghost-button compact"
+                                  onClick={() => setExpandedRequirementCreationDraftIds((current) =>
+                                    current.includes(draftId)
+                                      ? current.filter((id) => id !== draftId)
+                                      : [...current, draftId]
+                                  )}
+                                  type="button"
+                                >
+                                  {isExpanded ? "Collapse" : "Expand"}
+                                </button>
+                              </div>
+
+                              <p className={isExpanded ? "ai-requirement-draft-description" : "ai-requirement-draft-description is-clamped"}>
+                                {candidate.description || "No description returned."}
+                              </p>
+
+                              {isExpanded ? (
+                                <div className="ai-requirement-draft-details">
+                                  <div className="detail-summary">
+                                    <strong>Acceptance criteria</strong>
+                                    <span>{candidate.acceptance_criteria.join(" ") || "No acceptance criteria returned."}</span>
+                                  </div>
+                                  <div className="detail-summary">
+                                    <strong>Risks</strong>
+                                    <span>{candidate.risks.join(" ") || "No risks returned."}</span>
+                                  </div>
+                                  <div className="detail-summary">
+                                    <strong>Open questions</strong>
+                                    <span>{candidate.open_questions.join(" ") || "No open questions returned."}</span>
+                                  </div>
+                                  <div className="detail-summary">
+                                    <strong>Why this draft</strong>
+                                    <span>{candidate.rationale || candidate.change_summary.join(" ") || "Drafted from the provided AI context."}</span>
+                                  </div>
+                                  {candidate.external_references.length ? (
+                                    <div className="detail-summary">
+                                      <strong>References</strong>
+                                      <span>{formatReferenceList(candidate.external_references)}</span>
+                                    </div>
+                                  ) : null}
+                                </div>
+                              ) : null}
+                            </article>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="empty-state compact ai-requirement-empty-state">
+                      Add prompt context, screenshots, files, or references, then generate requirement drafts. The prompt panel can collapse after generation so the review area gets the room.
+                    </div>
+                  )
+                ) : optimizationSuggestion ? (
                   <div className="ai-requirement-review">
                   {([
                     ["title", "Title", optimizationSuggestion.title],
@@ -3787,32 +4510,37 @@ export function RequirementsPage() {
               >
                 Decline
               </button>
-              {requirementAiMode === "improve" && optimizeTargets.length > 1 && optimizeRequirementIndex + 1 < optimizeTargets.length ? (
+              {requirementAiMode === "improve" ? (
+                <button className="ghost-button" disabled={!optimizationSuggestion} onClick={() => setOptimizationFields({ title: false, description: false, external_references: false, priority: false, status: false })} type="button">
+                  Clear fields
+                </button>
+              ) : (
                 <button
                   className="ghost-button"
-                  disabled={previewRequirementOptimization.isPending || updateRequirement.isPending}
+                  disabled={!requirementCreationDrafts.length || createRequirement.isPending}
                   onClick={() => {
-                    setOptimizationSuggestion(null);
-                    setPreviewMessage("");
-                    setOptimizeRequirementIndex((current) => current + 1);
+                    if (areAllRequirementCreationDraftsSelected) {
+                      setSelectedRequirementCreationDraftIds([]);
+                      return;
+                    }
+                    setSelectedRequirementCreationDraftIds(requirementCreationDrafts.map((candidate, index) => getRequirementCreationDraftId(candidate, index)));
                   }}
                   type="button"
                 >
-                  Skip current
+                  {areAllRequirementCreationDraftsSelected ? "Clear selected drafts" : "Select all drafts"}
                 </button>
-              ) : null}
-              <button className="ghost-button" disabled={!optimizationSuggestion} onClick={() => setOptimizationFields({ title: false, description: false, external_references: false, priority: false, status: false })} type="button">
-                Clear fields
-              </button>
+              )}
 		              <button
                   className="primary-button"
-                  disabled={(requirementAiMode === "create" ? !canCreateRequirements : !canUpdateRequirements) || !optimizationSuggestion || !Object.values(optimizationFields).some(Boolean) || updateRequirement.isPending || createRequirement.isPending}
+                  disabled={requirementAiMode === "create"
+                    ? !canCreateRequirements || !selectedRequirementCreationDraftCount || previewRequirementCreation.isPending || createRequirementGenerationJob.isPending || isRequirementCreationJobRunning || createRequirement.isPending || requirementCreateMetadataQuery.isLoading
+                    : !canUpdateRequirements || !optimizationSuggestion || !Object.values(optimizationFields).some(Boolean) || updateRequirement.isPending}
                   onClick={() => void handleApplyRequirementOptimization()}
                   type="button"
                 >
 	                {updateRequirement.isPending || createRequirement.isPending
                     ? requirementAiMode === "create" ? "Creating…" : "Applying…"
-                    : requirementAiMode === "create" ? "Create requirement" : "Apply selected"}
+                    : requirementAiMode === "create" && requirementCreateMetadataQuery.isLoading ? "Checking Jira fields…" : requirementAiMode === "create" ? `Create selected requirements${selectedRequirementCreationDraftCount ? ` (${selectedRequirementCreationDraftCount})` : ""}` : "Apply selected"}
               </button>
             </div>
           </div>
@@ -4082,7 +4810,8 @@ function RequirementTestCasePicker({
   searchTerm,
   onSearchTermChange,
   isSearchActive,
-  onSearch
+  onSearch,
+  onClearSearch
 }: {
   testCases: TestCase[];
   selectedIds: string[];
@@ -4097,21 +4826,30 @@ function RequirementTestCasePicker({
   onSearchTermChange: (value: string) => void;
   isSearchActive: boolean;
   onSearch: () => void;
+  onClearSearch?: () => void;
 }) {
+  const [statusFilter, setStatusFilter] = useState("all");
+  const [priorityFilter, setPriorityFilter] = useState("all");
   const selectedSet = new Set(selectedIds);
   const normalizedSearch = searchTerm.trim().toLowerCase();
-  const linkedTestCases = testCases.filter((testCase) => selectedSet.has(testCase.id));
+  const statusOptions = Array.from(new Set(testCases.map((testCase) => testCase.status || "draft").filter(Boolean))).sort((left, right) => left.localeCompare(right));
+  const priorityOptions = Array.from(new Set(testCases.map((testCase) => String(testCase.priority ?? 3)))).sort((left, right) => Number(left) - Number(right));
+  const matchesStatusFilter = (testCase: TestCase) => statusFilter === "all" || String(testCase.status || "draft") === statusFilter;
+  const matchesPriorityFilter = (testCase: TestCase) => priorityFilter === "all" || String(testCase.priority ?? 3) === priorityFilter;
+  const linkedTestCases = testCases.filter((testCase) => selectedSet.has(testCase.id) && matchesStatusFilter(testCase) && matchesPriorityFilter(testCase));
   const searchedTestCases = isSearchActive
     ? testCases.filter((testCase) =>
-        !normalizedSearch ||
-        [
-          testCase.display_id || "",
-          testCase.id,
-          testCase.title,
-          richTextToPlainText(testCase.description),
-          testCase.status || "",
-          `p${testCase.priority ?? 3}`
-        ].some((value) => value.toLowerCase().includes(normalizedSearch))
+        matchesStatusFilter(testCase) && matchesPriorityFilter(testCase) && (
+          !normalizedSearch ||
+          [
+            testCase.display_id || "",
+            testCase.id,
+            testCase.title,
+            richTextToPlainText(testCase.description),
+            testCase.status || "",
+            `p${testCase.priority ?? 3}`
+          ].some((value) => value.toLowerCase().includes(normalizedSearch))
+        )
       )
     : [];
   const optionMap = new Map<string, TestCase>();
@@ -4130,7 +4868,10 @@ function RequirementTestCasePicker({
   linkedFirst.forEach((testCase) => optionMap.set(testCase.id, testCase));
   searchedOrdered.forEach((testCase) => optionMap.set(testCase.id, testCase));
 
-  const orderedTestCases = Array.from(optionMap.values());
+	  const orderedTestCases = Array.from(optionMap.values());
+  const visibleTestCaseIds = orderedTestCases.map((testCase) => testCase.id);
+  const areAllVisibleTestCasesSelected = visibleTestCaseIds.length > 0 && visibleTestCaseIds.every((testCaseId) => selectedIds.includes(testCaseId));
+  const hasActiveFilters = statusFilter !== "all" || priorityFilter !== "all" || searchTerm.trim().length > 0 || isSearchActive;
   const shouldShowEmpty =
     !orderedTestCases.length ||
     (isSearchActive && !searchedTestCases.length && !linkedTestCases.length);
@@ -4138,22 +4879,89 @@ function RequirementTestCasePicker({
   return (
     <div className={pickerClassName ? `requirement-link-picker-shell ${pickerClassName}` : "requirement-link-picker-shell"}>
       <div className="requirement-link-search-row">
-        <input
-          placeholder="Search test cases"
-          value={searchTerm}
-          onChange={(event) => onSearchTermChange(event.target.value)}
-          onKeyDown={(event) => {
-            if (event.key === "Enter") {
-              event.preventDefault();
-              onSearch();
-            }
-          }}
-        />
-        <button className="ghost-button" onClick={onSearch} type="button">
+        <label className="requirement-link-search-input">
           <SearchIcon />
-          <span>Search</span>
+          <input
+            placeholder="Search title, description, requirement, status, or priority"
+            value={searchTerm}
+            onChange={(event) => onSearchTermChange(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") {
+                event.preventDefault();
+                onSearch();
+              }
+            }}
+          />
+        </label>
+        <label className="requirement-link-filter-field">
+          <span>Status</span>
+          <select
+            aria-label="Filter linked test cases by status"
+            value={statusFilter}
+            onChange={(event) => setStatusFilter(event.target.value)}
+          >
+            <option value="all">All statuses</option>
+            {statusOptions.map((status) => (
+              <option key={status} value={status}>
+                {formatTileCardLabel(status, "Draft")}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="requirement-link-filter-field">
+          <span>Priority</span>
+          <select
+            aria-label="Filter linked test cases by priority"
+            value={priorityFilter}
+            onChange={(event) => setPriorityFilter(event.target.value)}
+          >
+            <option value="all">All priorities</option>
+            {priorityOptions.map((priority) => (
+              <option key={priority} value={priority}>
+                P{priority}
+              </option>
+            ))}
+          </select>
+        </label>
+	        <button className="ghost-button" onClick={onSearch} type="button">
+	          <SearchIcon />
+	          <span>Search</span>
+	        </button>
+        <button
+          className="ghost-button"
+          disabled={!visibleTestCaseIds.length || areAllVisibleTestCasesSelected}
+          onClick={() => visibleTestCaseIds.forEach((testCaseId) => {
+            if (!selectedIds.includes(testCaseId)) onToggle(testCaseId, true);
+          })}
+          type="button"
+        >
+          <SelectAllIcon />
+          <span>Select all</span>
         </button>
-      </div>
+        <button
+          className="ghost-button"
+          disabled={!selectedIds.length}
+          onClick={() => selectedIds.forEach((testCaseId) => onToggle(testCaseId, false))}
+          type="button"
+        >
+          <ClearSelectionIcon />
+          <span>Clear</span>
+        </button>
+        <button
+          className="ghost-button"
+          disabled={!hasActiveFilters}
+          onClick={() => {
+            setStatusFilter("all");
+            setPriorityFilter("all");
+            onSearchTermChange("");
+            onClearSearch?.();
+          }}
+          type="button"
+        >
+          <ClearSelectionIcon />
+          <span>Clear filters</span>
+        </button>
+	      </div>
 
       {!isSearchActive && !linkedTestCases.length ? (
         <div className="empty-state compact">Search to load reusable test cases.</div>
@@ -4453,7 +5261,7 @@ function RequirementAccordionSection({
   children
 }: {
   title: string;
-  summary: string;
+  summary?: string;
   countLabel: string;
   isExpanded: boolean;
   onToggle: () => void;
@@ -4473,7 +5281,7 @@ function RequirementAccordionSection({
           </span>
           <div className="requirement-accordion-toggle-copy">
             <strong>{title}</strong>
-            <span>{summary}</span>
+            {summary ? <span>{summary}</span> : null}
           </div>
         </div>
         <div className="requirement-accordion-toggle-meta">

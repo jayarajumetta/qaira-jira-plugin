@@ -1,1 +1,0 @@
-import{j as e}from"./query-vendor-BUUiaIgG.js";function i({children:r,className:s=""}){return e.jsx("div",{className:["tile-browser-pane",s].filter(Boolean).join(" "),children:e.jsx("div",{className:"tile-browser-pane-scroll",children:r})})}export{i as T};

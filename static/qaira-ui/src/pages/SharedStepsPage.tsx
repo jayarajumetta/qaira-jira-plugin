@@ -1,6 +1,7 @@
 import { Fragment, FormEvent, useDeferredValue, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useSearchParams } from "react-router-dom";
+import { useAuth } from "../auth/AuthContext";
 import { AddIcon, LayersIcon, OpenIcon, TrashIcon } from "../components/AppIcons";
 import { CatalogActionMenu } from "../components/CatalogActionMenu";
 import { CatalogSelectionControls } from "../components/CatalogSelectionControls";
@@ -33,9 +34,12 @@ import { ToastMessage } from "../components/ToastMessage";
 import { WorkspaceBackButton, WorkspaceMasterDetail } from "../components/WorkspaceMasterDetail";
 import { useDeleteConfirmation } from "../components/DeleteConfirmationDialog";
 import { useCurrentAppType, useCurrentProject } from "../hooks/useCurrentProject";
+import { useFeatureFlags } from "../hooks/useFeatureFlags";
 import { api } from "../lib/api";
 import { formatAuditTimestamp, resolveAuditUserLabel } from "../lib/auditDisplay";
 import { readDefaultCatalogViewMode } from "../lib/viewPreferences";
+import { areFeatureFlagsEnabled } from "../lib/featureFlags";
+import { hasPermission } from "../lib/permissions";
 import { removeSharedStepGroupFromCache, upsertSharedStepGroupInCache } from "../lib/sharedStepGroupCache";
 import { findByRoutableId, getRoutableId } from "../lib/urlSelection";
 import {
@@ -172,6 +176,15 @@ export function SharedStepsPage() {
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const queryClient = useQueryClient();
+  const { session } = useAuth();
+  const featureFlagsQuery = useFeatureFlags(Boolean(session));
+  const canUseAutomationWorkspace = areFeatureFlagsEnabled(featureFlagsQuery.data, ["qaira.automation.workspace"]);
+  const canViewSharedStepAutomation = hasPermission(session, "automation.code.view")
+    && canUseAutomationWorkspace
+    && areFeatureFlagsEnabled(featureFlagsQuery.data, ["qaira.automation.step_code"]);
+  const canEditSharedStepAutomation = canViewSharedStepAutomation
+    && hasPermission(session, "automation.build")
+    && areFeatureFlagsEnabled(featureFlagsQuery.data, ["qaira.automation.builder"]);
   const { confirmDelete, confirmationDialog } = useDeleteConfirmation();
   const [projectId] = useCurrentProject();
   const [appTypeId, setAppTypeId] = useCurrentAppType(projectId);
@@ -330,6 +343,15 @@ export function SharedStepsPage() {
     setEditingAutomationStepId("");
     setCodePreviewState(null);
   }, [isCreating, selectedGroupId]);
+
+  useEffect(() => {
+    if (!canEditSharedStepAutomation) {
+      setEditingAutomationStepId("");
+    }
+    if (!canViewSharedStepAutomation) {
+      setCodePreviewState(null);
+    }
+  }, [canEditSharedStepAutomation, canViewSharedStepAutomation]);
 
   useEffect(() => {
     setExpandedWorkspaceSections({
@@ -949,6 +971,12 @@ export function SharedStepsPage() {
     stepId: string,
     input: { step_type: SharedGroupDraftStep["step_type"]; automation_code: string; api_request: SharedGroupDraftStep["api_request"] }
   ) => {
+    if (!canEditSharedStepAutomation) {
+      showError(new Error("Permission required: automation.build"), "Unable to edit shared step automation");
+      setEditingAutomationStepId("");
+      return;
+    }
+
     if (!input.step_type) {
       return;
     }
@@ -963,6 +991,11 @@ export function SharedStepsPage() {
   };
 
   const openSharedGroupAutomationPreview = () => {
+    if (!canViewSharedStepAutomation) {
+      showError(new Error("Permission required: automation.code.view"), "Unable to open shared step automation");
+      return;
+    }
+
     setCodePreviewState({
       title: `${groupDraft.name.trim() || "Shared group"} automation`,
       subtitle: "This consolidated view is read-only. Edit automation from the individual shared steps.",
@@ -1370,12 +1403,16 @@ export function SharedStepsPage() {
                   </SharedStepAccordionSection>
 
                   <SharedStepAccordionSection
-                    actions={(
-                      <button className="ghost-button" disabled={!groupDraft.steps.length} onClick={openSharedGroupAutomationPreview} type="button">
+                    actions={canViewSharedStepAutomation ? (
+                      <SharedGroupStepIconButton
+                        ariaLabel="Preview shared group automation code"
+                        disabled={!groupDraft.steps.length}
+                        onClick={openSharedGroupAutomationPreview}
+                        title="Preview shared group automation code"
+                      >
                         <AutomationCodeIcon />
-                        <span>Automation code</span>
-                      </button>
-                    )}
+                      </SharedGroupStepIconButton>
+                    ) : undefined}
                     countLabel={`${groupDraft.steps.length} step${groupDraft.steps.length === 1 ? "" : "s"}`}
                     isExpanded={expandedWorkspaceSections.steps}
                     onToggle={() =>
@@ -1397,12 +1434,6 @@ export function SharedStepsPage() {
                               ? "Editing this shared group updates every linked test case while preserving execution history snapshots."
                               : "Once this group is inserted into a test case, linked case usage will appear here."}
                           </span>
-                          {selectedGroup.usage_count ? (
-                            <button className="ghost-button inline-button" onClick={() => setIsUsageDialogOpen(true)} type="button">
-                              <LinkedCasesIcon />
-                              <span>View linked cases</span>
-                            </button>
-                          ) : null}
                         </div>
                       ) : null}
 
@@ -1415,7 +1446,7 @@ export function SharedStepsPage() {
                         </div>
                       ) : null}
 
-                      <div className="action-row step-editor-toolbar">
+                      <div className="action-row step-editor-toolbar shared-step-editor-toolbar">
                         <label className="checkbox-field step-select-all">
                           <input
                             checked={allStepsSelected}
@@ -1427,25 +1458,40 @@ export function SharedStepsPage() {
                           />
                           Select all steps
                         </label>
-                        <button className="ghost-button" onClick={() => setIsParameterDialogOpen(true)} type="button">
-                          <SharedGroupParameterIcon />
-                          <span>{detectedSharedParameters.length ? `Params · ${detectedSharedParameters.length}` : "Params"}</span>
-                        </button>
-                        <SharedGroupStepActionMenu
-                          actions={sharedEditorActions}
-                          className="step-card-menu--inline step-card-menu--inline-right"
-                          label="Shared step actions"
-                          openOnHover
-                          previewActions={sharedEditorActions}
-                        />
-                        <SharedGroupStepIconButton
-                          ariaLabel="Add shared step"
-                          onClick={() => activateStepInsert(groupDraft.steps.length)}
-                          title="Add shared step"
-                          type="button"
-                        >
-                          <SharedGroupStepInsertIcon />
-                        </SharedGroupStepIconButton>
+                        <div className="shared-step-editor-toolbar-actions">
+                          <SharedGroupStepActionMenu
+                            actions={sharedEditorActions}
+                            className="step-card-menu--inline step-card-menu--inline-right"
+                            label="Shared step actions"
+                            openOnHover
+                            previewActions={sharedEditorActions}
+                          />
+                          <SharedGroupStepIconButton
+                            ariaLabel="Add shared step"
+                            onClick={() => activateStepInsert(groupDraft.steps.length)}
+                            title="Add shared step"
+                            type="button"
+                          >
+                            <SharedGroupStepInsertIcon />
+                          </SharedGroupStepIconButton>
+                          <SharedGroupStepIconButton
+                            ariaLabel={detectedSharedParameters.length ? `Edit ${detectedSharedParameters.length} shared step parameters` : "Edit shared step parameters"}
+                            onClick={() => setIsParameterDialogOpen(true)}
+                            title={detectedSharedParameters.length ? `Parameters (${detectedSharedParameters.length})` : "Parameters"}
+                          >
+                            <SharedGroupParameterIcon />
+                          </SharedGroupStepIconButton>
+                          {!isCreating && selectedGroup ? (
+                            <SharedGroupStepIconButton
+                              ariaLabel={selectedGroup.usage_count ? `Show ${selectedGroup.usage_count} test cases using this shared group` : "No test cases use this shared group yet"}
+                              disabled={!selectedGroup.usage_count}
+                              onClick={() => setIsUsageDialogOpen(true)}
+                              title={selectedGroup.usage_count ? `Used in ${selectedGroup.usage_count} test case${selectedGroup.usage_count === 1 ? "" : "s"}` : "Not used in test cases yet"}
+                            >
+                              <LinkedCasesIcon />
+                            </SharedGroupStepIconButton>
+                          ) : null}
+                        </div>
                       </div>
 
                       <div className="step-list">
@@ -1498,6 +1544,7 @@ export function SharedStepsPage() {
                               onToggleSelect={(checked) => toggleDraftStepSelected(step.id, checked)}
                               step={step}
                               stepNumber={index + 1}
+                              showAutomationTools={canEditSharedStepAutomation}
                             />
                             {index === groupDraft.steps.length - 1 ? (
                               <InlineSharedGroupStepInsertSlot
@@ -1562,7 +1609,7 @@ export function SharedStepsPage() {
         />
       ) : null}
 
-      {editingAutomationStepId ? (
+      {canEditSharedStepAutomation && editingAutomationStepId ? (
         <StepAutomationDialog
           onClose={() => setEditingAutomationStepId("")}
           onSave={(input) => handleSaveDraftStepAutomation(editingAutomationStepId, input)}
@@ -1572,7 +1619,7 @@ export function SharedStepsPage() {
         />
       ) : null}
 
-      {codePreviewState ? (
+      {canViewSharedStepAutomation && codePreviewState ? (
         <CodePreviewDialog
           code={codePreviewState.code}
           onClose={() => setCodePreviewState(null)}
@@ -2105,7 +2152,8 @@ function SharedGroupDraftStepCard({
   onToggle,
   onToggleSelect,
   onChangeStepType,
-  onEditAutomation
+  onEditAutomation,
+  showAutomationTools
 }: {
   step: SharedGroupDraftStep;
   stepNumber: number;
@@ -2129,6 +2177,7 @@ function SharedGroupDraftStepCard({
   onToggleSelect: (checked: boolean) => void;
   onChangeStepType: (nextType: SharedGroupDraftStep["step_type"]) => void;
   onEditAutomation: () => void;
+  showAutomationTools: boolean;
 }) {
   const stepLabel = "Shared group step";
   const stepActions: SharedGroupStepActionMenuAction[] = [
@@ -2228,18 +2277,23 @@ function SharedGroupDraftStepCard({
         </button>
         <div className="step-inline-tools">
           <StepTypePickerButton value={step.step_type} onChange={onChangeStepType} />
-          <InlineStepToolButton
-            ariaLabel={`Edit automation for shared step ${stepNumber}`}
-            className={stepHasAutomation(step) ? "is-active" : ""}
-            onClick={onEditAutomation}
-            title="Edit step automation"
-          >
-            <AutomationCodeIcon />
-          </InlineStepToolButton>
+          {showAutomationTools ? (
+            <InlineStepToolButton
+              ariaLabel={`Edit automation for shared step ${stepNumber}`}
+              className={stepHasAutomation(step) ? "is-active" : ""}
+              onClick={onEditAutomation}
+              title="Edit step automation"
+            >
+              <AutomationCodeIcon />
+            </InlineStepToolButton>
+          ) : null}
         </div>
         <SharedGroupStepActionMenu
           actions={stepActions}
+          className="step-card-menu--floating"
           label={`Shared step ${stepNumber} actions`}
+          openOnHover
+          previewActions={stepActions}
         />
       </div>
 

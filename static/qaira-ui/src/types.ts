@@ -113,6 +113,7 @@ export type QualityDashboardGadget = {
   jql: string;
   group_by: "status" | "statusCategory" | "priority" | "issuetype" | "assignee" | "reporter" | "components" | "fixVersion" | "labels" | "sprint" | "resolution" | "createdWeek" | "updatedWeek" | "createdMonth" | "updatedMonth";
   metric?: "count" | "resolved" | "unresolved" | "highPriority" | "unassigned" | "overdue" | "stale30d" | "created30d" | "resolved30d" | "resolutionRate" | "averageAgeDays" | "averageResolutionDays";
+  accent?: "blue" | "green" | "purple" | "orange" | "red" | "teal" | "slate";
 };
 
 export type QualityDashboard = {
@@ -191,8 +192,10 @@ export type AppNotification = {
   run_id?: string | null;
   target_url?: string | null;
   type: string;
+  preference?: string | null;
   title: string;
   message: string;
+  tone?: "error" | "warning" | "success" | "info" | "neutral" | string;
   status: "unread" | "read" | string;
   created_at?: string;
 };
@@ -230,6 +233,7 @@ export type AppType = {
 export type Requirement = {
   id: string;
   display_id?: string | null;
+  jira_url?: string | null;
   project_id: string;
   iteration_id?: string | null;
   title: string;
@@ -270,6 +274,8 @@ export type RequirementDefectLink = {
   id: string;
   title: string;
   status: string | null;
+  severity?: string | null;
+  priority?: string | null;
   link_source?: "manual" | "automatic" | string;
   created_at?: string;
 };
@@ -278,6 +284,8 @@ export type TestCaseDefectLink = {
   id: string;
   title: string;
   status: string | null;
+  severity?: string | null;
+  priority?: string | null;
   link_source?: "manual" | "automatic" | string;
   created_at?: string;
 };
@@ -294,6 +302,7 @@ export type TestCaseReviewEvent = {
 
 export type Issue = {
   id: string;
+  jira_url?: string | null;
   user_id: string;
   user_name?: string | null;
   user_email?: string | null;
@@ -762,6 +771,32 @@ export type AiStepRephraseResponse = {
   };
 };
 
+export type AiRequirementDescriptionRephraseResponse = {
+  integration: {
+    id: string;
+    name: string;
+    type: string;
+    model?: string | null;
+  };
+  requirement: {
+    id?: string | null;
+    display_id?: string | null;
+    title?: string | null;
+  };
+  description: string;
+};
+
+export type AiRichTextRephraseResponse = {
+  content: string;
+  integration: {
+    id: string;
+    name: string;
+    type: string;
+    model?: string | null;
+  };
+  provenance?: Record<string, unknown>;
+};
+
 export type AiTestCaseGenerationJob = {
   id: string;
   project_id: string;
@@ -776,8 +811,12 @@ export type AiTestCaseGenerationJob = {
   status: "queued" | "running" | "completed" | "failed" | string;
   total_requirements: number;
   processed_requirements: number;
+  generated_preview_count?: number;
   generated_cases_count: number;
   error?: string | null;
+  last_error?: string | null;
+  candidate_cases?: AiDesignedTestCaseCandidate[];
+  created_cases?: Array<{ id: string; title: string; step_count: number; requirement_ids: string[]; source_client_id?: string | null; created_at?: string }>;
   created_by: string;
   created_at?: string;
   started_at?: string | null;
@@ -876,6 +915,7 @@ export type TestSuite = {
   updated_by?: string | null;
   created_at?: string;
   updated_at?: string;
+  revision?: number;
 };
 
 export type TestCase = {
@@ -1261,6 +1301,21 @@ export type TestDataSetMode = "key_value" | "table";
 
 export type TestDataSetRow = Record<string, string>;
 
+export type AiTestDataGenerationPreviewResponse = {
+  prompt: string;
+  field_context: string | null;
+  summary: string;
+  suggestions: Array<{ id: string; value: string }>;
+  randomized_template: string;
+  randomization_strategy: "reviewed-value-pool";
+  runtime_llm_invocation: false;
+  generation_mode: "llm" | "deterministic";
+  fallback_used: boolean;
+  fallback_reason?: string | null;
+  generated_at: string;
+  requires_human_review: boolean;
+};
+
 export type TestDataSet = {
   id: string;
   project_id: string;
@@ -1270,6 +1325,7 @@ export type TestDataSet = {
   mode: TestDataSetMode;
   columns: string[];
   rows: TestDataSetRow[];
+  template_rows?: TestDataSetRow[];
   created_at?: string;
 };
 
@@ -1313,9 +1369,13 @@ export type Execution = {
   project_id: string;
   app_type_id: string | null;
   suite_ids: string[];
-  suite_snapshots?: Array<{ id: string; name: string; parameter_values?: Record<string, string> }>;
+  suite_snapshots?: Array<{ id: string; display_id?: string | null; name: string; parameter_values?: Record<string, string>; revision?: number }>;
   case_snapshots?: ExecutionCaseSnapshot[];
   step_snapshots?: ExecutionStepSnapshot[];
+  requirement_snapshots?: Array<{ id: string; display_id?: string | null; title: string; priority?: number | null; status?: string | null }>;
+  direct_test_case_ids?: string[];
+  scope_source?: string | null;
+  scope_fingerprint?: string | null;
   name: string | null;
   trigger: "manual" | "ci" | "local" | null;
   status: ExecutionStatus | null;
@@ -1482,6 +1542,8 @@ export type ExecutionCaseSnapshot = {
   test_case_title: string;
   test_case_description: string | null;
   external_references?: string[];
+  requirement_ids?: string[];
+  defect_ids?: string[];
   suite_id: string | null;
   suite_name: string | null;
   priority: number | null;

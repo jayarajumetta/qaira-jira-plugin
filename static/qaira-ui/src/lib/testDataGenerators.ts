@@ -10,7 +10,7 @@ export const TEST_DATA_GENERATOR_TEMPLATES = {
   timestamp: "{{date:ISO}}"
 } as const;
 
-const GENERATOR_TOKEN_PATTERN = /\{\{\s*(randomNumber|randomString|aiData|yopmail|date)(?::([^}]+))?\s*\}\}/gi;
+const GENERATOR_TOKEN_PATTERN = /\{\{\s*(randomNumber|randomString|aiData|oneOf|yopmail|date)(?::([^}]+))?\s*\}\}/gi;
 const GENERATOR_ALIAS_PATTERN = /(?<![A-Za-z0-9_])@(?:t\.)?(random|string|randomString|randomNumber|yopmail|today|timestamp)\b/gi;
 const GENERATOR_ALIAS_TEMPLATES: Record<string, string> = {
   random: "{{randomString:3}}",
@@ -96,6 +96,18 @@ function generateAiData(rawPrompt: string | undefined, now: Date) {
   return `ai-${suffix}`;
 }
 
+function decodeGeneratedValuePool(rawValue: string | undefined) {
+  try {
+    const base64 = String(rawValue || "").replace(/-/g, "+").replace(/_/g, "/");
+    const padded = base64.padEnd(Math.ceil(base64.length / 4) * 4, "=");
+    const bytes = Uint8Array.from(atob(padded), (character) => character.charCodeAt(0));
+    const values = JSON.parse(new TextDecoder().decode(bytes));
+    return Array.isArray(values) ? values.map((value) => String(value ?? "").trim()).filter(Boolean).slice(0, 20) : [];
+  } catch {
+    return [];
+  }
+}
+
 export function hasTestDataGeneratorTemplate(value: unknown) {
   GENERATOR_TOKEN_PATTERN.lastIndex = 0;
   GENERATOR_ALIAS_PATTERN.lastIndex = 0;
@@ -124,6 +136,11 @@ export function evaluateTestDataTemplate(value: unknown, now = new Date()): stri
 
     if (kind === "aidata") {
       return generateAiData(option, now);
+    }
+
+    if (kind === "oneof") {
+      const pool = decodeGeneratedValuePool(option);
+      return pool.length ? pool[Math.floor(Math.random() * pool.length)] : "";
     }
 
     return resolveDate(option || "YYYY-MM-DD", now);

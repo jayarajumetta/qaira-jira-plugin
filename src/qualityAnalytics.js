@@ -1,6 +1,7 @@
 const SUPPORTED_GADGETS = new Set(['metric', 'donut', 'bar', 'stacked-bar', 'line', 'table']);
 const SUPPORTED_GROUPS = new Set(['status', 'statusCategory', 'priority', 'issuetype', 'assignee', 'reporter', 'components', 'fixVersion', 'labels', 'sprint', 'resolution', 'createdWeek', 'updatedWeek', 'createdMonth', 'updatedMonth']);
 const SUPPORTED_METRICS = new Set(['count', 'resolved', 'unresolved', 'highPriority', 'unassigned', 'overdue', 'stale30d', 'created30d', 'resolved30d', 'resolutionRate', 'averageAgeDays', 'averageResolutionDays']);
+const SUPPORTED_ACCENTS = new Set(['blue', 'green', 'purple', 'orange', 'red', 'teal', 'slate']);
 
 function text(value, fallback = '') {
   return String(value ?? fallback).trim();
@@ -74,7 +75,8 @@ export function normalizeDashboardGadget(input = {}, index = 0) {
     type,
     jql: text(input.jql).slice(0, 1800),
     group_by: groupBy,
-    metric: SUPPORTED_METRICS.has(input.metric) ? input.metric : 'count'
+    metric: SUPPORTED_METRICS.has(input.metric) ? input.metric : 'count',
+    accent: SUPPORTED_ACCENTS.has(input.accent) ? input.accent : 'blue'
   };
 }
 

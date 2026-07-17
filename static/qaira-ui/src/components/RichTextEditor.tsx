@@ -1,4 +1,10 @@
 import { type CSSProperties, type ElementType, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useAuth } from "../auth/AuthContext";
+import { useCurrentProject } from "../hooks/useCurrentProject";
+import { useFeatureFlags } from "../hooks/useFeatureFlags";
+import { api } from "../lib/api";
+import { areFeatureFlagsEnabled } from "../lib/featureFlags";
+import { hasPermission } from "../lib/permissions";
 
 type RichTextEditorProps = {
   id?: string;
@@ -12,6 +18,11 @@ type RichTextEditorProps = {
   className?: string;
   onAiRephrase?: (html: string, plainText: string) => Promise<string | void> | string | void;
   aiRephraseTitle?: string;
+  aiRephraseContext?: {
+    entityType?: string;
+    entityTitle?: string;
+    fieldLabel?: string;
+  };
   "aria-label"?: string;
 };
 
@@ -155,17 +166,43 @@ function isLikelyHtml(value: string) {
   return /<\/?[a-z][\s\S]*>/i.test(value);
 }
 
+function decodeEscapedHtmlMarkup(value: string) {
+  if (!/&lt;\/?[a-z][\s\S]*?&gt;/i.test(value)) {
+    return value;
+  }
+
+  if (typeof document === "undefined") {
+    return value
+      .replace(/&lt;/gi, "<")
+      .replace(/&gt;/gi, ">")
+      .replace(/&quot;/gi, "\"")
+      .replace(/&#39;/g, "'")
+      .replace(/&amp;/gi, "&");
+  }
+
+  const textarea = document.createElement("textarea");
+  textarea.innerHTML = value;
+  return textarea.value;
+}
+
 export function sanitizeRichTextHtml(value: string) {
-  if (!value.trim()) {
+  const normalizedValue = decodeEscapedHtmlMarkup(value);
+
+  if (!normalizedValue.trim()) {
     return "";
   }
 
   if (typeof document === "undefined") {
-    return escapeHtml(value);
+    return escapeHtml(
+      normalizedValue
+        .replace(/<[^>]+>/g, " ")
+        .replace(/\s+/g, " ")
+        .trim()
+    );
   }
 
   const template = document.createElement("template");
-  template.innerHTML = isLikelyHtml(value) ? value : markdownToHtml(value);
+  template.innerHTML = isLikelyHtml(normalizedValue) ? normalizedValue : markdownToHtml(normalizedValue);
 
   const cleanNode = (node: Node): Node | null => {
     if (node.nodeType === Node.TEXT_NODE) {
@@ -235,7 +272,7 @@ export function richTextToPlainText(value?: string | null) {
   }
 
   if (typeof document === "undefined") {
-    return value
+    return decodeEscapedHtmlMarkup(value)
       .replace(/<[^>]+>/g, " ")
       .replace(/\[([^\]]+)]\([^)]+\)/g, "$1")
       .replace(/[*_`#>]/g, "")
@@ -246,7 +283,10 @@ export function richTextToPlainText(value?: string | null) {
 
   const container = document.createElement("div");
   container.innerHTML = normalizeRichTextHtml(value);
-  return (container.textContent || "").replace(/\s+/g, " ").trim();
+  return (container.textContent || "")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 function isSelectionInside(root: HTMLElement) {
@@ -257,28 +297,6 @@ function isSelectionInside(root: HTMLElement) {
 
   const node = selection.anchorNode;
   return Boolean(node && root.contains(node.nodeType === Node.ELEMENT_NODE ? node : node.parentNode));
-}
-
-function rephrasePlainTextFallback(plainText: string) {
-  const normalized = plainText
-    .replace(/\s+/g, " ")
-    .trim();
-
-  if (!normalized) {
-    return "";
-  }
-
-  const sentences = normalized
-    .split(/(?<=[.!?])\s+/)
-    .map((sentence) => sentence.trim())
-    .filter(Boolean)
-    .map((sentence) => {
-      const withCapital = sentence.charAt(0).toUpperCase() + sentence.slice(1);
-      return /[.!?]$/.test(withCapital) ? withCapital : `${withCapital}.`;
-    });
-
-  const rephrased = sentences.join(" ");
-  return rephrased === normalized ? `Refined: ${rephrased}` : rephrased;
 }
 
 export function RichTextContent({ value, fallback = "", className = "", as: Component = "div", title }: RichTextContentProps) {
@@ -309,12 +327,19 @@ export function RichTextEditor({
   className = "",
   onAiRephrase,
   aiRephraseTitle = "Rephrase description with AI",
+  aiRephraseContext,
   "aria-label": ariaLabel
 }: RichTextEditorProps) {
+  const { session } = useAuth();
+  const [projectId] = useCurrentProject();
+  const featureFlagsQuery = useFeatureFlags(Boolean(session));
   const editorRef = useRef<HTMLDivElement | null>(null);
   const lastHtmlRef = useRef("");
   const [isRephrasing, setIsRephrasing] = useState(false);
   const isEmpty = !richTextToPlainText(value);
+  const canUseDefaultAiRephrase = Boolean(projectId)
+    && hasPermission(session, "content.ai")
+    && areFeatureFlagsEnabled(featureFlagsQuery.data, ["qaira.ai.content_rephrase"]);
 
   useEffect(() => {
     const editor = editorRef.current;
@@ -437,10 +462,18 @@ export function RichTextEditor({
 
     setIsRephrasing(true);
     try {
-      const aiValue = onAiRephrase ? await onAiRephrase(currentHtml, plainText) : undefined;
-      const nextValue = typeof aiValue === "string" && richTextToPlainText(aiValue) !== plainText
-        ? aiValue
-        : rephrasePlainTextFallback(plainText);
+      const aiValue = onAiRephrase
+        ? await onAiRephrase(currentHtml, plainText)
+        : (await api.ai.rephraseRichText({
+            project_id: projectId,
+            content: plainText,
+            content_html: currentHtml,
+            entity_type: aiRephraseContext?.entityType || "rich-text authoring field",
+            entity_title: aiRephraseContext?.entityTitle,
+            field_label: aiRephraseContext?.fieldLabel || aiRephraseTitle.replace(/^Rephrase\s+/i, "").replace(/\s+with AI$/i, ""),
+            aria_label: ariaLabel
+          })).content;
+      const nextValue = typeof aiValue === "string" ? aiValue : "";
       if (nextValue) {
         const nextHtml = sanitizeRichTextHtml(nextValue);
         lastHtmlRef.current = nextHtml;
@@ -449,10 +482,12 @@ export function RichTextEditor({
           editor.innerHTML = nextHtml;
         }
       }
+    } catch (error) {
+      console.warn("Rich text AI rephrase failed; the original content was preserved.", error);
     } finally {
       setIsRephrasing(false);
     }
-  }, [disabled, isRephrasing, onAiRephrase, onChange, value]);
+  }, [aiRephraseContext?.entityTitle, aiRephraseContext?.entityType, aiRephraseContext?.fieldLabel, aiRephraseTitle, ariaLabel, disabled, isRephrasing, onAiRephrase, onChange, projectId, value]);
 
   const controls: Array<{ group: "format" | "insert" | "list" | "ai"; label: ReactNode; title: string; action: () => void; disabled?: boolean }> = [
     { group: "format", label: <strong className="rich-text-tool-glyph">B</strong>, title: "Bold", action: () => runCommand("bold") },
@@ -464,7 +499,7 @@ export function RichTextEditor({
     { group: "list", label: <RichTextBulletedListIcon />, title: "Bulleted list", action: () => runCommand("insertUnorderedList") },
     { group: "list", label: <RichTextNumberedListIcon />, title: "Numbered list", action: () => runCommand("insertOrderedList") },
     { group: "list", label: <RichTextIndentIcon />, title: "Indent list item", action: () => runCommand("indent") },
-    { group: "ai", label: <RichTextAiRephraseIcon />, title: aiRephraseTitle, action: handleAiRephrase, disabled: isEmpty || isRephrasing }
+    { group: "ai", label: <RichTextAiRephraseIcon />, title: aiRephraseTitle, action: handleAiRephrase, disabled: isEmpty || isRephrasing || (!onAiRephrase && !canUseDefaultAiRephrase) }
   ];
 
   const editorStyle = {

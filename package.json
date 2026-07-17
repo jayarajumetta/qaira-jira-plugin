@@ -19,6 +19,7 @@
     "@forge/api": "8.0.1",
     "@forge/events": "3.0.1",
     "@forge/llm": "1.0.1",
+    "@forge/realtime": "^1.0.0",
     "@forge/resolver": "2.0.0"
   },
   "devDependencies": {

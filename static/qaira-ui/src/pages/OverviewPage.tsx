@@ -4,7 +4,7 @@ import { useNavigate, useSearchParams } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
 import { AiInsightPreviewDialog, type AiPreviewFinding } from "../components/AiInsightPreviewDialog";
 import { CustomQualityDashboard } from "../components/CustomQualityDashboard";
-import { FolderIcon, LayersIcon, PlayIcon, SparkIcon } from "../components/AppIcons";
+import { SparkIcon } from "../components/AppIcons";
 import { Panel } from "../components/Panel";
 import { ProgressMeter } from "../components/ProgressMeter";
 import { StatusBadge } from "../components/StatusBadge";
@@ -795,9 +795,6 @@ function QualityAnalyticsDashboard() {
       : "Not ready for production";
   const healthMeterStyle = (value: number) => ({ width: `${Math.max(0, Math.min(100, value))}%` });
   const releaseRingStyle = { "--score": releaseReadinessScore } as CSSProperties;
-  const canManageProjects = hasPermission(session, "project.view");
-  const canOpenSuites = hasPermission(session, "suite.view");
-  const canOpenRuns = hasPermission(session, "run.view");
   const canViewQualityInsights = hasPermission(session, "quality_insight.view")
     && areFeatureFlagsEnabled(featureFlagsQuery.data, ["qaira.ai.quality_insights"]);
   const qualityInsightFindings = useMemo<AiPreviewFinding[]>(
@@ -831,26 +828,6 @@ function QualityAnalyticsDashboard() {
           </p>
         </div>
 
-        <div className="page-actions">
-          {canManageProjects ? (
-            <button className="ghost-button" onClick={() => navigate("/projects")} type="button">
-              <FolderIcon />
-              Manage Scope
-            </button>
-          ) : null}
-          {canOpenSuites ? (
-            <button className="ghost-button" onClick={() => navigate("/design")} type="button">
-              <LayersIcon />
-              Open Suite Studio
-            </button>
-          ) : null}
-          {canOpenRuns ? (
-            <button className="primary-button" onClick={() => navigate("/executions")} type="button">
-              <PlayIcon />
-              Open Execution Hub
-            </button>
-          ) : null}
-        </div>
       </header>
 
       <section className="health-grid" aria-label="Project health overview">

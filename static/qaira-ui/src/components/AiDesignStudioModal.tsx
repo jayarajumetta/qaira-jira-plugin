@@ -212,6 +212,10 @@ export function AiDesignStudioModal({
         : { knowledge: [] };
       const knowledgeSection = buildKnowledgeContextSection(knowledgePackage.knowledge || []);
       const fileContext = await buildFileContextSection(contextFileSelection);
+      if (fileContext.overLimit) {
+        setSmartContextMessage(`Attachment limit exceeded. ${fileContext.blocked.join(" ")}`);
+        return;
+      }
       const sections = [
         "QAira smart context pack: use this as supporting evidence only; generated test cases must still map to the selected requirements.",
         requirementSection,
@@ -223,7 +227,7 @@ export function AiDesignStudioModal({
       setSmartContextMessage([
         `Added ${selectedRequirements.length} requirement${selectedRequirements.length === 1 ? "" : "s"}`,
         `${(knowledgePackage.knowledge || []).length} knowledge item${(knowledgePackage.knowledge || []).length === 1 ? "" : "s"}`,
-        fileContext.section ? "file context" : "",
+        fileContext.section ? `file context compressed ${fileContext.totalOriginalChars.toLocaleString()}→${fileContext.totalPackedChars.toLocaleString()} chars` : "",
         fileContext.skipped.length ? `Skipped: ${fileContext.skipped.join(", ")}` : ""
       ].filter(Boolean).join(" · "));
     } catch (error) {

@@ -2,7 +2,7 @@ import { Fragment, FormEvent, useDeferredValue, useEffect, useMemo, useRef, useS
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
-import { AddIcon, LayersIcon, OpenIcon, TrashIcon } from "../components/AppIcons";
+import { AddIcon, CollapseExpandIcon, LayersIcon, OpenIcon, TrashIcon } from "../components/AppIcons";
 import { CatalogActionMenu } from "../components/CatalogActionMenu";
 import { CatalogSelectionControls } from "../components/CatalogSelectionControls";
 import { CatalogSearchFilter } from "../components/CatalogSearchFilter";
@@ -2374,8 +2374,14 @@ function SharedStepAccordionSection({
         <div className="editor-accordion-toggle-meta">
           <span className="editor-accordion-toggle-count">{countLabel}</span>
           {actions ? <div className="editor-accordion-actions">{actions}</div> : null}
-          <button className="editor-accordion-toggle-state" onClick={onToggle} type="button">
-            {isExpanded ? "Collapse" : "Expand"}
+          <button
+            aria-label={isExpanded ? `Collapse ${title}` : `Expand ${title}`}
+            className="editor-accordion-toggle-state explorer-icon-button"
+            onClick={onToggle}
+            title={isExpanded ? "Collapse section" : "Expand section"}
+            type="button"
+          >
+            <CollapseExpandIcon isExpanded={isExpanded} />
           </button>
         </div>
       </div>

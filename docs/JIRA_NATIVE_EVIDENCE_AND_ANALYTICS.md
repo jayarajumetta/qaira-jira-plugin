@@ -1,6 +1,6 @@
 # Jira-native evidence, delivery metadata, and quality analytics
 
-Last reviewed: 15 July 2026
+Last reviewed: 20 July 2026
 
 ## Decisions
 
@@ -13,7 +13,7 @@ Requirement and Bug mappings are canonical Jira mappings:
 | Title | `summary` |
 | Description | `description` in Atlassian Document Format |
 | Labels | `labels` |
-| Iteration delivery scope | Jira Software Sprint custom field; Qaira iteration groups may hold a reviewed Sprint ID binding |
+| Sprint delivery scope | Jira Software Sprint custom field and Jira Agile Sprint APIs; Qaira project properties retain only compatibility metadata |
 | Release | `fixVersions` |
 | Priority | Jira `priority` |
 | Status | Jira workflow transitions |
@@ -57,12 +57,14 @@ Blank gadget JQL is valid and means the entire authorized project. `ORDER BY` is
 
 ## Hierarchy decision signals
 
-Iteration and module bars are decision surfaces rather than decorative folders. Their name, icon, record count, and metrics remain on one horizontal line in tile and list modes; narrow canvases scroll that line instead of wrapping it into a tall card.
+Sprint and module bars are decision surfaces rather than decorative folders. Sprint identity, Jira lifecycle state, `MM/DD` start/end dates, board, optional goal, story count, and QA metrics stay compact in tile and list modes.
 
-- Requirement iteration: linked-test coverage, weighted pass/automation readiness, Jira workflow completion, and uncovered/high-priority risk count.
+- Requirement Sprint: Jira workflow completion, linked-test coverage, latest executed-case pass rate, and at-risk story count; tooltips retain execution and high-severity bug detail without crowding the strip.
 - Test-case module: requirement traceability, executable-step coverage, automation coverage when enabled, recent finalized-result stability, and unlinked/step-less/failed/high-priority-manual risk count.
-- Unassigned iteration/module uses the same iconography and metrics, so orphan scope is measurable rather than hidden in a secondary bucket.
+- Backlog/no-Sprint and unassigned-module scope use the same iconography and metrics, so orphan scope is measurable rather than hidden in a secondary bucket.
 - Every value is derived from the already loaded, active-project workspace projection. The UI does not issue a query per hierarchy bar.
+
+Sprint creation requires a Jira board, name, start date, end date, lifecycle state, and optional goal. Selected stories are moved through Jira’s Sprint issue-assignment API in batches of at most 50. Closed Sprints remain visible when they contain current scope but do not accept new story drops.
 
 Jira's dashboard model uses configurable gadgets, layouts, refresh, and saved-filter/JQL inputs. Qaira adopts those interaction principles while keeping quality-engineering defaults. See Atlassian's [custom dashboard](https://support.atlassian.com/jira-cloud-administration/docs/configure-custom-dashboards/) and [dashboard gadget](https://support.atlassian.com/jira-cloud-administration/docs/use-dashboard-gadgets/) documentation.
 

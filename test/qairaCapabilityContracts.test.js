@@ -8,6 +8,7 @@ const read = (relativePath) => fs.readFileSync(path.join(root, relativePath), 'u
 const apiSource = read('src/qairaApi.js');
 const accessSource = read('src/qairaAccess.js');
 const createRunSource = read('static/qaira-ui/src/components/CreateRunActionButton.tsx');
+const reportBugSource = read('static/qaira-ui/src/components/ReportBugSplitActionButton.tsx');
 const designSource = read('static/qaira-ui/src/pages/DesignPage.tsx');
 const testCasesSource = read('static/qaira-ui/src/pages/TestCasesPage.tsx');
 const executionsSource = read('static/qaira-ui/src/pages/ExecutionsPage.tsx');
@@ -92,7 +93,8 @@ test('run split actions use one compact menu without explanatory copy', () => {
   assert.match(createRunSource, /<strong>Remote Run<\/strong>/);
   assert.doesNotMatch(createRunSource, /InfoTooltip/);
   assert.doesNotMatch(createRunSource, /ready for run creation/);
-  assert.match(executionsSource, /run-action-main issue-report-split-main/);
+  assert.match(reportBugSource, /run-action-main issue-report-split-main/);
+  assert.match(executionsSource, /<ReportBugSplitActionButton/);
   assert.match(testCasesSource, /run-action-main issue-report-split-main/);
 });
 

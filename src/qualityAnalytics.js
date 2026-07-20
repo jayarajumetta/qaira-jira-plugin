@@ -1,6 +1,7 @@
 const SUPPORTED_GADGETS = new Set(['metric', 'donut', 'bar', 'stacked-bar', 'line', 'table']);
-const SUPPORTED_GROUPS = new Set(['status', 'statusCategory', 'priority', 'issuetype', 'assignee', 'reporter', 'components', 'fixVersion', 'labels', 'sprint', 'resolution', 'createdWeek', 'updatedWeek', 'createdMonth', 'updatedMonth']);
-const SUPPORTED_METRICS = new Set(['count', 'resolved', 'unresolved', 'highPriority', 'unassigned', 'overdue', 'stale30d', 'created30d', 'resolved30d', 'resolutionRate', 'averageAgeDays', 'averageResolutionDays']);
+const SUPPORTED_GROUPS = new Set(['status', 'statusCategory', 'priority', 'issuetype', 'assignee', 'reporter', 'components', 'fixVersion', 'labels', 'sprint', 'resolution', 'module', 'createdWeek', 'updatedWeek', 'createdMonth', 'updatedMonth']);
+const SUPPORTED_METRICS = new Set(['count', 'resolved', 'unresolved', 'highPriority', 'unassigned', 'overdue', 'stale30d', 'created30d', 'resolved30d', 'resolutionRate', 'averageAgeDays', 'averageResolutionDays', 'releaseConfidence', 'requirementCoverage', 'coverageGaps', 'automationCoverage', 'openDefects', 'failedRuns', 'executionCycleHours', 'completedRuns30d', 'testCases', 'testSuites', 'testRuns', 'moduleCaseCount']);
+const DERIVED_METRICS = new Set(['count', 'releaseConfidence', 'requirementCoverage', 'coverageGaps', 'automationCoverage', 'openDefects', 'failedRuns', 'executionCycleHours', 'completedRuns30d', 'testCases', 'testSuites', 'testRuns', 'moduleCaseCount']);
 const SUPPORTED_ACCENTS = new Set(['blue', 'green', 'purple', 'orange', 'red', 'teal', 'slate']);
 
 function text(value, fallback = '') {
@@ -69,13 +70,17 @@ export function scopedDashboardJql(projectKey, userJql = '') {
 export function normalizeDashboardGadget(input = {}, index = 0) {
   const type = SUPPORTED_GADGETS.has(input.type) ? input.type : 'metric';
   const groupBy = SUPPORTED_GROUPS.has(input.group_by) ? input.group_by : 'status';
+  const dataSource = input.data_source === 'qaira' ? 'qaira' : 'jira';
+  const metric = SUPPORTED_METRICS.has(input.metric) ? input.metric : 'count';
   return {
     id: text(input.id) || `gadget-${index + 1}`,
     title: text(input.title, `Quality signal ${index + 1}`).slice(0, 120),
+    data_source: dataSource,
     type,
     jql: text(input.jql).slice(0, 1800),
+    release: text(input.release).slice(0, 120) || undefined,
     group_by: groupBy,
-    metric: SUPPORTED_METRICS.has(input.metric) ? input.metric : 'count',
+    metric: dataSource === 'qaira' && !DERIVED_METRICS.has(metric) ? 'count' : metric,
     accent: SUPPORTED_ACCENTS.has(input.accent) ? input.accent : 'blue'
   };
 }
@@ -153,7 +158,7 @@ function metricValue(rows, metric, total) {
   return rows.length;
 }
 
-function metricLabel(metric) {
+export function qualityDashboardMetricLabel(metric) {
   return ({
     count: 'matching Jira items',
     resolved: 'resolved items inspected',
@@ -166,7 +171,19 @@ function metricLabel(metric) {
     resolved30d: 'items resolved in the last 30 days',
     resolutionRate: 'percent resolved in the inspected set',
     averageAgeDays: 'average age in days',
-    averageResolutionDays: 'average resolution time in days'
+    averageResolutionDays: 'average resolution time in days',
+    releaseConfidence: 'release confidence index',
+    requirementCoverage: 'percent of requirements linked to tests',
+    coverageGaps: 'requirements without linked tests',
+    automationCoverage: 'percent of test cases automated',
+    openDefects: 'open Jira bugs in QAira scope',
+    failedRuns: 'failed test runs',
+    executionCycleHours: 'average completed run cycle in hours',
+    completedRuns30d: 'completed test runs in the last 30 days',
+    testCases: 'test cases in the inspected portfolio',
+    testSuites: 'test suites in the inspected portfolio',
+    testRuns: 'test runs in the inspected portfolio',
+    moduleCaseCount: 'test cases distributed across modules'
   })[metric] || 'matching Jira items';
 }
 
@@ -190,7 +207,7 @@ export function buildDashboardGadgetResult(issues, gadget, total = null) {
     gadget: normalized,
     total: Number.isFinite(Number(total)) ? Number(total) : rows.length,
     value,
-    value_label: metricLabel(normalized.metric),
+    value_label: qualityDashboardMetricLabel(normalized.metric),
     returned: rows.length,
     truncated: Number(total || rows.length) > rows.length,
     series,
@@ -243,18 +260,22 @@ const DASHBOARD_TEMPLATES = {
     ]
   },
   quality: {
-    name: 'Quality engineering operations',
-    description: 'Execution scope, defect triage, test ownership, automation visibility, and operational trend.',
+    name: 'Quality engineering command center',
+    description: 'Release confidence, traceability, automation, defect trend, QA throughput, real execution cycle time, modules, and requirement flow.',
     layout: 'three-column',
     gadgets: [
-      { title: 'Open test defects', type: 'metric', jql: 'issuetype = Bug AND resolution = Unresolved', metric: 'count' },
-      { title: 'Critical test risk', type: 'metric', jql: 'issuetype in (Bug, "Qaira Test Case", "Qaira Test Run") AND resolution = Unresolved AND priority in (Highest, High)', metric: 'count' },
-      { title: 'Mean defect resolution', type: 'metric', jql: 'issuetype = Bug AND resolved >= -90d', metric: 'averageResolutionDays' },
-      { title: 'Test portfolio', type: 'donut', jql: 'issuetype in ("Qaira Test Case", "Qaira Test Run", Bug)', group_by: 'issuetype' },
-      { title: 'Execution workflow', type: 'bar', jql: 'issuetype = "Qaira Test Run"', group_by: 'status' },
-      { title: 'Quality work by owner', type: 'stacked-bar', jql: 'issuetype in ("Qaira Test Case", "Qaira Test Run", Bug) AND resolution = Unresolved', group_by: 'assignee' },
-      { title: 'Quality activity trend', type: 'line', jql: 'issuetype in ("Qaira Test Case", "Qaira Test Run", Bug) AND updated >= -90d', group_by: 'updatedMonth' },
-      { title: 'Stale quality work', type: 'table', jql: 'issuetype in ("Qaira Test Case", "Qaira Test Run", Bug) AND resolution = Unresolved AND updated <= -30d ORDER BY priority DESC, updated ASC', group_by: 'priority' }
+      { title: 'Release confidence', type: 'metric', data_source: 'qaira', jql: '', metric: 'releaseConfidence', accent: 'blue' },
+      { title: 'Requirement traceability', type: 'metric', data_source: 'qaira', jql: '', metric: 'requirementCoverage', accent: 'green' },
+      { title: 'Effective automation', type: 'metric', data_source: 'qaira', jql: '', metric: 'automationCoverage', accent: 'purple' },
+      { title: 'Open test defects', type: 'metric', data_source: 'qaira', jql: '', metric: 'openDefects', accent: 'red' },
+      { title: 'Execution cycle time', type: 'metric', data_source: 'qaira', jql: '', metric: 'executionCycleHours', accent: 'teal' },
+      { title: 'QA throughput · 30 days', type: 'metric', data_source: 'qaira', jql: '', metric: 'completedRuns30d', accent: 'green' },
+      { title: 'Bug creation trend', type: 'line', jql: 'issuetype = Bug AND created >= -90d', group_by: 'createdMonth', accent: 'red' },
+      { title: 'QA closure by owner', type: 'bar', jql: 'issuetype in (Bug, "Qaira Test Case", "Qaira Test Run") AND resolved >= -30d', group_by: 'assignee', metric: 'resolved30d', accent: 'blue' },
+      { title: 'Test distribution by module', type: 'bar', data_source: 'qaira', jql: '', group_by: 'module', metric: 'moduleCaseCount', accent: 'purple' },
+      { title: 'Requirement flow', type: 'donut', jql: 'issuetype in (Story, Epic)', group_by: 'statusCategory', accent: 'blue' },
+      { title: 'Execution workflow', type: 'stacked-bar', data_source: 'qaira', jql: '', group_by: 'status', metric: 'testRuns', accent: 'teal' },
+      { title: 'Critical work requiring action', type: 'table', jql: 'issuetype in (Bug, Story, "Qaira Test Case", "Qaira Test Run") AND resolution = Unresolved AND priority in (Highest, High) ORDER BY priority DESC, updated ASC', group_by: 'priority', accent: 'orange' }
     ]
   },
   automation: {
@@ -287,7 +308,8 @@ export function qualityDashboardTemplate(stakeholder = 'quality', options = {}) 
     gadgets: source.gadgets.map((gadget, index) => ({
       ...gadget,
       id: `${key}-${index + 1}`,
-      jql: [releaseClause, gadget.jql].filter(Boolean).join(' AND ')
+      release: release || undefined,
+      jql: gadget.data_source === 'qaira' ? '' : [releaseClause, gadget.jql].filter(Boolean).join(' AND ')
     }))
   });
 }

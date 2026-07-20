@@ -1,0 +1,1 @@
+import{j as e}from"./query-vendor-M9fUNh3D.js";function c({title:n,titleVariant:a="heading",subtitle:s,actions:t,className:i="",children:l}){return e.jsxs("section",{className:`panel card ${i}`.trim(),children:[t?e.jsx("div",{className:"panel-actions-inline",children:t}):null,l]})}export{c as P};

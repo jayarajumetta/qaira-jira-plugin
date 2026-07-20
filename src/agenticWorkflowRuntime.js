@@ -1,4 +1,17 @@
 const SECRET_KEY_PATTERN = /(authorization|credential|password|secret|access.?token|refresh.?token|api.?key)/i;
+const EMAIL_PATTERN = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi;
+const PHONE_PATTERN = /(?:\+?\d[\d\s().-]{7,}\d)/g;
+const BEARER_PATTERN = /\b(?:bearer|basic)\s+[a-z0-9._~+/=-]{12,}\b/gi;
+const PRIVATE_TOKEN_PATTERN = /\b(?:sk|pat|ghp|xox[baprs])[-_][a-z0-9_-]{12,}\b/gi;
+
+function redactAgenticString(value) {
+  const bounded = value.length > 12000 ? `${value.slice(0, 12000)}…` : value;
+  return bounded
+    .replace(BEARER_PATTERN, '[redacted credential]')
+    .replace(PRIVATE_TOKEN_PATTERN, '[redacted credential]')
+    .replace(EMAIL_PATTERN, '[redacted email]')
+    .replace(PHONE_PATTERN, (candidate) => candidate.replace(/\D/g, '').length >= 9 ? '[redacted phone]' : candidate);
+}
 
 export function boundedJson(value, maxChars = 16000) {
   const serialized = JSON.stringify(value ?? null, (_key, candidate) => {
@@ -12,7 +25,7 @@ export function boundedJson(value, maxChars = 16000) {
 export function redactAgenticValue(value, depth = 0) {
   if (depth > 8) return '[depth limited]';
   if (Array.isArray(value)) return value.slice(0, 100).map((entry) => redactAgenticValue(entry, depth + 1));
-  if (!value || typeof value !== 'object') return typeof value === 'string' && value.length > 12000 ? `${value.slice(0, 12000)}…` : value;
+  if (!value || typeof value !== 'object') return typeof value === 'string' ? redactAgenticString(value) : value;
   return Object.fromEntries(Object.entries(value).slice(0, 200).map(([key, entry]) => [
     key,
     SECRET_KEY_PATTERN.test(key) ? '[redacted]' : redactAgenticValue(entry, depth + 1)

@@ -109,10 +109,12 @@ export type JiraAttachment = {
 export type QualityDashboardGadget = {
   id: string;
   title: string;
+  data_source?: "jira" | "qaira";
+  release?: string;
   type: "metric" | "donut" | "bar" | "stacked-bar" | "line" | "table";
   jql: string;
-  group_by: "status" | "statusCategory" | "priority" | "issuetype" | "assignee" | "reporter" | "components" | "fixVersion" | "labels" | "sprint" | "resolution" | "createdWeek" | "updatedWeek" | "createdMonth" | "updatedMonth";
-  metric?: "count" | "resolved" | "unresolved" | "highPriority" | "unassigned" | "overdue" | "stale30d" | "created30d" | "resolved30d" | "resolutionRate" | "averageAgeDays" | "averageResolutionDays";
+  group_by: "status" | "statusCategory" | "priority" | "issuetype" | "assignee" | "reporter" | "components" | "fixVersion" | "labels" | "sprint" | "resolution" | "module" | "createdWeek" | "updatedWeek" | "createdMonth" | "updatedMonth";
+  metric?: "count" | "resolved" | "unresolved" | "highPriority" | "unassigned" | "overdue" | "stale30d" | "created30d" | "resolved30d" | "resolutionRate" | "averageAgeDays" | "averageResolutionDays" | "releaseConfidence" | "requirementCoverage" | "coverageGaps" | "automationCoverage" | "openDefects" | "failedRuns" | "executionCycleHours" | "completedRuns30d" | "testCases" | "testSuites" | "testRuns" | "moduleCaseCount";
   accent?: "blue" | "green" | "purple" | "orange" | "red" | "teal" | "slate";
 };
 
@@ -140,6 +142,8 @@ export type QualityDashboardGadgetResult = {
   truncated: boolean;
   series: Array<{ label: string; value: number }>;
   rows: Array<{ id: string; key: string; title: string; status: string | null; priority: string | null; type: string | null; assignee: string | null; updated: string | null }>;
+  drilldown_target?: string;
+  methodology?: string;
 };
 
 export type QualityDashboardBatchResponse = {
@@ -241,17 +245,41 @@ export type Requirement = {
   external_references?: string[];
   labels?: string[];
   sprint?: string | null;
+  sprint_id?: string | null;
+  sprint_state?: string | null;
+  sprint_start_date?: string | null;
+  sprint_end_date?: string | null;
+  sprint_complete_date?: string | null;
   fix_version?: string | null;
   release?: string | null;
   priority: number | null;
   status: string | null;
+  status_category?: string | null;
   test_case_ids?: string[];
   defect_ids?: string[];
   defects?: RequirementDefectLink[];
+  related_items?: RequirementRelatedItem[];
   created_by?: string | null;
   updated_by?: string | null;
   created_at?: string;
   updated_at?: string;
+  revision?: number;
+};
+
+export type RequirementRelatedItem = {
+  id: string;
+  display_id?: string | null;
+  title: string;
+  issue_type: string;
+  relation: string;
+  direction: "inward" | "outward";
+  status?: string | null;
+  status_category?: string | null;
+  priority?: string | null;
+  assignee_id?: string | null;
+  assignee_name?: string | null;
+  jira_url?: string | null;
+  qaira_kind?: "test-case" | "test-suite" | "test-run" | "bug" | "requirement" | null;
 };
 
 export type RequirementIteration = {
@@ -260,8 +288,17 @@ export type RequirementIteration = {
   project_id: string;
   name: string;
   description?: string | null;
+  goal?: string | null;
   jira_sprint_id?: string | null;
   jira_sprint_name?: string | null;
+  source?: "jira" | "qaira" | string;
+  state?: string | null;
+  status?: string | null;
+  board_id?: string | null;
+  board_name?: string | null;
+  start_date?: string | null;
+  end_date?: string | null;
+  complete_date?: string | null;
   requirement_count?: number;
   requirement_ids?: string[];
   created_by?: string | null;
@@ -274,6 +311,7 @@ export type RequirementDefectLink = {
   id: string;
   title: string;
   status: string | null;
+  status_category?: string | null;
   severity?: string | null;
   priority?: string | null;
   link_source?: "manual" | "automatic" | string;
@@ -322,12 +360,16 @@ export type Issue = {
   jira_bug_key?: string | null;
   linked_test_run_id?: string | null;
   linked_test_case_ids?: string[];
+  linked_test_suite_ids?: string[];
+  linked_module_ids?: string[];
   linked_requirement_ids?: string[];
+  traceability_truncated?: boolean;
   assignee_id?: string | null;
   assignee_name?: string | null;
   assignee_email?: string | null;
   root_cause?: string | null;
   status: string | null;
+  status_category?: string | null;
   revision?: number;
   created_at?: string;
   updated_at?: string;
@@ -382,11 +424,18 @@ export type Integration = {
 };
 
 export type DomainOption = {
+  id?: string | null;
   value: string;
   label: string;
   description?: string;
   icon?: string;
   defaults?: Record<string, unknown>;
+  category_key?: string | null;
+  category_name?: string | null;
+  category_color?: string | null;
+  current?: boolean;
+  can_transition?: boolean;
+  transition_id?: string | null;
 };
 
 export type DomainMetadata = {
@@ -401,6 +450,7 @@ export type DomainMetadata = {
   requirements: {
     default_status: string;
     statuses: DomainOption[];
+    workflow_source?: string;
     priority_scale: number[];
   };
   test_cases: {
@@ -431,10 +481,12 @@ export type DomainMetadata = {
   issues: {
     default_status: string;
     statuses: DomainOption[];
+    workflow_source?: string;
   };
   feedback?: {
     default_status: string;
     statuses: DomainOption[];
+    workflow_source?: string;
   };
   access?: {
     default_permissions?: string[];
@@ -466,7 +518,10 @@ export type DomainMetadata = {
   }>;
   jira?: {
     sprint_field_id: string | null;
-    sprints: Array<{ id: string; name: string; state?: string | null; board_id?: string | null; board_name?: string | null; start_date?: string | null; end_date?: string | null }>;
+    board_lookup_unavailable?: boolean;
+    sprint_lookup_unavailable?: boolean;
+    boards: Array<{ id: string; name: string; type?: string | null; location?: unknown }>;
+    sprints: Array<{ id: string; name: string; state?: string | null; board_id?: string | null; board_name?: string | null; start_date?: string | null; end_date?: string | null; complete_date?: string | null; goal?: string | null }>;
     versions: Array<{ id: string; name: string; released: boolean; archived: boolean; release_date?: string | null }>;
   };
 };
@@ -907,6 +962,7 @@ export type TestSuite = {
   app_type_id: string;
   name: string;
   parent_id: string | null;
+  test_case_ids?: string[];
   labels?: string[];
   parameter_values?: Record<string, string>;
   parallel_enabled?: boolean | null;
@@ -936,6 +992,9 @@ export type TestCase = {
   automation_status?: "not_automated" | "ready" | "incomplete" | null;
   priority: number | null;
   status: string | null;
+  assignee_id?: string | null;
+  assignee_name?: string | null;
+  assignee_email?: string | null;
   requirement_id: string | null;
   reviewer_id?: string | null;
   review_status?: TestCaseReviewStatus | null;
@@ -954,6 +1013,18 @@ export type TestCase = {
   created_at?: string;
   updated_at?: string;
   revision?: number;
+};
+
+export type JiraComment = {
+  id: string;
+  body: string;
+  created: string | null;
+  updated: string | null;
+  author: {
+    accountId?: string;
+    displayName?: string;
+    avatarUrls?: Record<string, string>;
+  } | null;
 };
 
 export type TestCaseVersionSummary = {
@@ -1363,16 +1434,43 @@ export type ExecutionDataSetSnapshot = {
 
 export type ExecutionStatus = "queued" | "running" | "completed" | "failed" | "aborted";
 
+export type ExecutionScopeUser = {
+  id: string;
+  email: string;
+  name: string | null;
+  avatar_data_url?: string | null;
+};
+
+export type ExecutionScopeSnapshot = {
+  id: string;
+  display_id?: string | null;
+  name: string;
+  parameter_values?: Record<string, string>;
+  revision?: number;
+  suite_ids?: string[];
+  test_case_count?: number;
+  assigned_to?: string | null;
+  assigned_to_ids?: string[];
+  assigned_user?: ExecutionScopeUser | null;
+  assigned_users?: ExecutionScopeUser[];
+};
+
 export type Execution = {
   id: string;
   display_id?: string | null;
   project_id: string;
   app_type_id: string | null;
+  test_case_ids: string[];
   suite_ids: string[];
-  suite_snapshots?: Array<{ id: string; display_id?: string | null; name: string; parameter_values?: Record<string, string>; revision?: number }>;
+  suite_snapshots?: ExecutionScopeSnapshot[];
+  module_snapshots?: ExecutionScopeSnapshot[];
   case_snapshots?: ExecutionCaseSnapshot[];
   step_snapshots?: ExecutionStepSnapshot[];
   requirement_snapshots?: Array<{ id: string; display_id?: string | null; title: string; priority?: number | null; status?: string | null }>;
+  scope_case_count?: number;
+  scope_step_count?: number;
+  scope_requirement_count?: number;
+  requirement_snapshots_truncated?: boolean;
   direct_test_case_ids?: string[];
   scope_source?: string | null;
   scope_fingerprint?: string | null;
@@ -1413,6 +1511,9 @@ export type Execution = {
     name: string | null;
     avatar_data_url?: string | null;
   }>;
+  suite_assignments?: Record<string, string[]>;
+  module_assignments?: Record<string, string[]>;
+  case_assignments?: Record<string, string[]>;
   created_by: string | null;
   created_at?: string;
   updated_at?: string;
@@ -1546,6 +1647,8 @@ export type ExecutionCaseSnapshot = {
   defect_ids?: string[];
   suite_id: string | null;
   suite_name: string | null;
+  module_id?: string | null;
+  module_name?: string | null;
   priority: number | null;
   status: string | null;
   parameter_values?: Record<string, string>;
@@ -1554,12 +1657,15 @@ export type ExecutionCaseSnapshot = {
   suite_parameter_template_values?: Record<string, string>;
   sort_order: number;
   assigned_to?: string | null;
+  assigned_to_ids?: string[];
+  assignment_source?: "run" | "suite" | "module" | "case" | null;
   assigned_user?: {
     id: string;
     email: string;
     name: string | null;
     avatar_data_url?: string | null;
   } | null;
+  assigned_users?: ExecutionScopeUser[];
 };
 
 export type ExecutionStepSnapshot = {

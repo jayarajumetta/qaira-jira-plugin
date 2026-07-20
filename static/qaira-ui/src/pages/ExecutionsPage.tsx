@@ -1,8 +1,8 @@
 import { FormEvent, Fragment, useDeferredValue, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useNavigate, useSearchParams } from "react-router-dom";
+import { useLocation, useNavigate, useSearchParams } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
-import { ActivityIcon, AddIcon, ArchiveIcon, BugIcon, CalendarIcon, ClearSelectionIcon, EyeIcon, ExportIcon, GithubIcon, GoogleDriveIcon, ImportIcon, MailIcon, OpenIcon, PlayIcon, SearchIcon, SelectAllIcon, SparkIcon, TrashIcon, UsersIcon } from "../components/AppIcons";
+import { ActivityIcon, AddIcon, ArchiveIcon, CalendarIcon, ClearSelectionIcon, CollapseExpandIcon, EyeIcon, ExportIcon, GithubIcon, GoogleDriveIcon, ImportIcon, LayersIcon, MailIcon, OpenIcon, PlayIcon, SearchIcon, SelectAllIcon, SparkIcon, TrashIcon, UsersIcon } from "../components/AppIcons";
 import { AppTypeDropdown } from "../components/AppTypeDropdown";
 import { AiAssurancePanel } from "../components/AiAssurancePanel";
 import { AiInsightPreviewDialog, type AiPreviewFinding } from "../components/AiInsightPreviewDialog";
@@ -15,6 +15,7 @@ import { DisplayIdBadge } from "../components/DisplayIdBadge";
 import { FormField } from "../components/FormField";
 import { ExecutionContextSelector } from "../components/ExecutionContextSelector";
 import { InfoTooltip } from "../components/InfoTooltip";
+import { HierarchyMetricStrip } from "../components/HierarchyMetricStrip";
 import { JiraAttachmentPanel } from "../components/JiraAttachmentPanel";
 import { LoadingState } from "../components/LoadingState";
 import { MultiAssigneePicker } from "../components/MultiAssigneePicker";
@@ -32,6 +33,7 @@ import {
 } from "../components/StepAutomationEditor";
 import { ProjectDropdown } from "../components/ProjectDropdown";
 import { ProgressMeter } from "../components/ProgressMeter";
+import { ReportBugSplitActionButton } from "../components/ReportBugSplitActionButton";
 import { richTextToPlainText } from "../components/RichTextEditor";
 import { RunHooksBuilder, type RunHookSelection, type RunHookType } from "../components/RunHooksBuilder";
 import { RunTypeSelector } from "../components/RunTypeSelector";
@@ -52,6 +54,7 @@ import { formatReferenceList, parseReferenceList } from "../lib/externalReferenc
 import { areFeatureFlagsEnabled } from "../lib/featureFlags";
 import { summarizeExecutionStart } from "../lib/executionStartSummary";
 import { buildBrowserUrl } from "../lib/integrationUrls";
+import { buildBugReportPath } from "../lib/bugReportNavigation";
 import { hasPermission } from "../lib/permissions";
 import { readDefaultCatalogViewMode } from "../lib/viewPreferences";
 import { buildGroupAutomationCode, resolveStepAutomationCode } from "../lib/stepAutomation";
@@ -108,9 +111,13 @@ type ExecutionCaseView = {
   parameter_values: Record<string, string>;
   suite_id: string | null;
   suite_name: string | null;
+  module_id: string | null;
+  module_name: string | null;
   suite_ids: string[];
   sort_order: number;
   assigned_to: string | null;
+  assigned_to_ids: string[];
+  assignment_source: "run" | "suite" | "module" | "case" | null;
   assigned_user: Execution["assigned_user"];
 };
 
@@ -189,23 +196,6 @@ type TestRunsView = "test-case-runs" | "suite-runs" | "local-runs" | "scheduled-
 type CatalogViewMode = "tile" | "list";
 
 type ExecutionAssigneeOption = AssigneeOption;
-
-function ReportBugSplitActionButton({
-  disabled,
-  onReportBug
-}: {
-  disabled?: boolean;
-  onReportBug: () => void;
-}) {
-  return (
-    <div className="create-run-action-button report-bug-split-action-button issue-report-split is-single">
-      <button className="run-action-main issue-report-split-main" disabled={disabled} onClick={onReportBug} type="button">
-        <BugIcon />
-        <span>Report Bug</span>
-      </button>
-    </div>
-  );
-}
 
 type ExecutionEvidencePreviewState = {
   attachmentId?: string;
@@ -288,6 +278,14 @@ const EMPTY_EXECUTION_RUN_IMPACT_SUMMARY: ExecutionRunImpactSummary = {
   failedRequirementCount: 0,
   failureRate: 0
 };
+
+function executionScopeCaseCount(execution: Execution) {
+  return Math.max(
+    Number(execution.scope_case_count || 0),
+    execution.case_snapshots?.length || 0,
+    execution.test_case_ids?.length || 0
+  );
+}
 
 function getExecutionRiskTone(summary: ExecutionRunSummary, impactSummary: ExecutionRunImpactSummary): "success" | "info" | "warning" | "danger" {
   if (summary.failed > 0 || impactSummary.failureRate >= 30 || impactSummary.failedRequirementCount >= 3) {
@@ -493,9 +491,13 @@ function toCaseView(snapshot: ExecutionCaseSnapshot): ExecutionCaseView {
     parameter_values: snapshot.parameter_values || {},
     suite_id: snapshot.suite_id,
     suite_name: snapshot.suite_name,
+    module_id: snapshot.module_id || null,
+    module_name: snapshot.module_name || null,
     suite_ids: snapshot.suite_id ? [snapshot.suite_id] : [],
     sort_order: snapshot.sort_order,
     assigned_to: snapshot.assigned_to || null,
+    assigned_to_ids: snapshot.assigned_to_ids || (snapshot.assigned_to ? [snapshot.assigned_to] : []),
+    assignment_source: snapshot.assignment_source || null,
     assigned_user: snapshot.assigned_user || null
   };
 }
@@ -1297,6 +1299,7 @@ function isBatchProcessTransaction(transaction: WorkspaceTransaction) {
 
 export function ExecutionsPage() {
   const queryClient = useQueryClient();
+  const location = useLocation();
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const { session } = useAuth();
@@ -1314,8 +1317,14 @@ export function ExecutionsPage() {
     && areFeatureFlagsEnabled(featureFlagsQuery.data, ["qaira.automation.workspace", "qaira.automation.parallel_execution"]);
   const canUseRunAi = hasPermission(session, "run.ai")
     && areFeatureFlagsEnabled(featureFlagsQuery.data, ["qaira.ai.execution_analysis"]);
+  const canReportBugs = hasPermission(session, "feedback.manage")
+    && areFeatureFlagsEnabled(featureFlagsQuery.data, ["qaira.manual.bugs"]);
+  const canUseAiBugTriage = canReportBugs
+    && areFeatureFlagsEnabled(featureFlagsQuery.data, ["qaira.ai.bug_triage"]);
   const canViewRunAutomationCode = hasPermission(session, "automation.code.view")
     && areFeatureFlagsEnabled(featureFlagsQuery.data, ["qaira.automation.workspace", "qaira.automation.step_code"]);
+  const canPreviewRunAutomation = hasPermission(session, "automation.preview")
+    && areFeatureFlagsEnabled(featureFlagsQuery.data, ["qaira.automation.workspace", "qaira.automation.preview"]);
   const canExportRunReports = hasPermission(session, "run.report.export");
   const canShareRunReports = hasPermission(session, "run.report.share");
   const canViewRunEvidence = hasPermission(session, "result.view")
@@ -1576,6 +1585,10 @@ export function ExecutionsPage() {
   const updateExecutionCaseAssignment = useMutation({
     mutationFn: ({ executionId, testCaseId, assigned_to }: { executionId: string; testCaseId: string; assigned_to?: string }) =>
       api.executions.updateCaseAssignment(executionId, testCaseId, { assigned_to })
+  });
+  const updateExecutionScopeAssignment = useMutation({
+    mutationFn: ({ executionId, level, scopeId, assignedToIds }: { executionId: string; level: "suites" | "modules"; scopeId: string; assignedToIds: string[] }) =>
+      api.executions.updateScopeAssignment(executionId, level, scopeId, { assigned_to_ids: assignedToIds })
   });
   const createExecutionSchedule = useMutation({ mutationFn: api.executionSchedules.create });
   const updateExecutionSchedule = useMutation({
@@ -2446,6 +2459,13 @@ export function ExecutionsPage() {
   }, [executionSuites]);
 
   useEffect(() => {
+    const requestedSuiteId = searchParams.get("suite") || "";
+    if (!requestedSuiteId || !executionSuites.some((suite) => suite.id === requestedSuiteId)) return;
+    setFocusedSuiteId(requestedSuiteId);
+    setExpandedExecutionSuiteIds((current) => current.includes(requestedSuiteId) ? current : [...current, requestedSuiteId]);
+  }, [executionSuites, searchParams]);
+
+  useEffect(() => {
     const validGroupIds = new Set(executionStepGroupIds);
     setExpandedExecutionStepGroupIds((current) => {
       const validCurrent = current.filter((groupId) => validGroupIds.has(groupId));
@@ -2642,29 +2662,34 @@ export function ExecutionsPage() {
       const requirementStats = new Map<string, { totalCases: Set<string>; failedCases: Set<string> }>();
       const failedCases: ExecutionRunImpactSummary["failedCases"] = [];
 
-      (execution.case_snapshots || []).forEach((snapshot) => {
-        const linkedCase = smartExecutionLibraryCaseById.get(snapshot.test_case_id);
+      const scopeCaseIds = execution.case_snapshots?.length
+        ? execution.case_snapshots.map((snapshot) => snapshot.test_case_id)
+        : execution.test_case_ids || [];
+
+      scopeCaseIds.forEach((testCaseId) => {
+        const snapshot = execution.case_snapshots?.find((candidate) => candidate.test_case_id === testCaseId);
+        const linkedCase = smartExecutionLibraryCaseById.get(testCaseId);
         const requirementIds = [...new Set([...(linkedCase?.requirement_ids || []), linkedCase?.requirement_id].filter(Boolean))] as string[];
-        const result = resultByExecutionCaseId.get(`${execution.id}:${snapshot.test_case_id}`);
+        const result = resultByExecutionCaseId.get(`${execution.id}:${testCaseId}`);
         const status = result?.status || "queued";
 
         requirementIds.forEach((requirementId) => {
           const stats = requirementStats.get(requirementId) || { totalCases: new Set<string>(), failedCases: new Set<string>() };
-          stats.totalCases.add(snapshot.test_case_id);
+          stats.totalCases.add(testCaseId);
           if (["failed", "blocked"].includes(status)) {
-            stats.failedCases.add(snapshot.test_case_id);
+            stats.failedCases.add(testCaseId);
           }
           requirementStats.set(requirementId, stats);
         });
 
         if (["failed", "blocked"].includes(status)) {
           failedCases.push({
-            id: snapshot.test_case_id,
-            title: snapshot.test_case_title,
+            id: testCaseId,
+            title: snapshot?.test_case_title || linkedCase?.title || testCaseId,
             status,
-            priority: snapshot.priority,
-            suiteId: snapshot.suite_id,
-            suiteName: snapshot.suite_name,
+            priority: snapshot?.priority ?? linkedCase?.priority ?? null,
+            suiteId: snapshot?.suite_id || linkedCase?.suite_id || linkedCase?.suite_ids?.[0] || null,
+            suiteName: snapshot?.suite_name || null,
             requirementIds,
             requirementTitles: requirementIds.map((requirementId) => requirementById.get(requirementId)?.title || requirementId),
             error: result?.error || null
@@ -2691,7 +2716,7 @@ export function ExecutionsPage() {
           return left.title.localeCompare(right.title);
         });
 
-      const totalCases = execution.case_snapshots?.length || 0;
+      const totalCases = executionScopeCaseCount(execution);
       summary[execution.id] = {
         failedCases,
         impactedRequirements,
@@ -2896,6 +2921,22 @@ export function ExecutionsPage() {
       );
     } catch (error) {
       showError(error, "Unable to update test case assignee");
+    }
+  };
+
+  const handleScopeAssignmentChange = async (level: "suites" | "modules", scopeId: string, assignedToIds: string[]) => {
+    if (!selectedExecution || scopeId === "unassigned-module") return;
+    try {
+      await updateExecutionScopeAssignment.mutateAsync({
+        executionId: selectedExecution.id,
+        level,
+        scopeId,
+        assignedToIds
+      });
+      await refreshExecutionScope(selectedExecution.id);
+      showSuccess(`${level === "suites" ? "Suite" : "Module"} responsibility updated.`);
+    } catch (error) {
+      showError(error, `Unable to update ${level === "suites" ? "suite" : "module"} responsibility`);
     }
   };
 
@@ -3370,46 +3411,50 @@ export function ExecutionsPage() {
     setIsReportEmailModalOpen(true);
   };
 
-  const handleReportSelectedExecutionIssue = (scope: "run" | "case" = "run") => {
+  const handleReportSelectedExecutionIssue = (
+    scope: "run" | "case" | "suite" | "module" = "run",
+    scopedContext: { suiteId?: string; suiteName?: string; moduleId?: string; moduleName?: string } = {},
+    mode: "manual" | "ai" = "manual"
+  ) => {
     if (!selectedExecution) {
       return;
     }
 
     const scopedCase = scope === "case" ? selectedExecutionCase : null;
     const scopedCaseTitle = scopedCase ? selectedExecutionCaseReadableTitle || scopedCase.title : "";
-    const params = new URLSearchParams();
-    params.set("create", "1");
-    params.set("run", selectedExecution.id);
-    params.set("status", currentExecutionStatus);
-    params.set("title", scopedCase
+    const suiteId = scopedContext.suiteId || scopedCase?.suite_id || "";
+    const suiteName = scopedContext.suiteName || scopedCase?.suite_name || "";
+    const moduleId = scopedContext.moduleId || scopedCase?.module_id || "";
+    const moduleName = scopedContext.moduleName || scopedCase?.module_name || "";
+    const linkedLibraryCase = scopedCase ? smartExecutionLibraryCaseById.get(scopedCase.id) : null;
+    const requirementIds = scopedCase
+      ? [...new Set([...(linkedLibraryCase?.requirement_ids || []), linkedLibraryCase?.requirement_id].filter(Boolean))] as string[]
+      : [];
+    const returnParams = new URLSearchParams(searchParams);
+    returnParams.set("view", testRunsView);
+    returnParams.set("execution", selectedExecution.id);
+    if (scopedCase) returnParams.set("testCase", scopedCase.id);
+    else returnParams.delete("testCase");
+    if (suiteId) returnParams.set("suite", suiteId);
+    else returnParams.delete("suite");
+    if (moduleId) returnParams.set("module", moduleId);
+    else returnParams.delete("module");
+    const returnTo = `${location.pathname}?${returnParams.toString()}`;
+    const title = scopedCase
       ? `Case bug: ${scopedCaseTitle || scopedCase.id}`
-      : `Run bug: ${selectedExecution.name || selectedExecution.id}`);
-
-    if (selectedExecution.name) {
-      params.set("runName", selectedExecution.name);
-    }
-    if (scopedCase) {
-      const linkedLibraryCase = smartExecutionLibraryCaseById.get(scopedCase.id);
-      const requirementIds = [...new Set([...(linkedLibraryCase?.requirement_ids || []), linkedLibraryCase?.requirement_id].filter(Boolean))] as string[];
-      params.set("testCase", scopedCase.id);
-      params.set("linked_test_case_ids", scopedCase.id);
-      params.set("testCaseTitle", scopedCaseTitle || scopedCase.title);
-      if (requirementIds.length) {
-        params.set("linked_requirement_ids", requirementIds.join(","));
-      }
-      if (scopedCase.suite_name) params.set("suiteName", scopedCase.suite_name);
-    }
-
-    if (selectedExecution.test_environment?.name) {
-      params.set("environment", selectedExecution.test_environment.name);
-    }
-
-    if (selectedExecution.build) {
-      params.set("build", selectedExecution.build);
-    }
-
-    params.set("message", [
-      scopedCase ? "Reported from a test case run." : "Reported from run details.",
+      : scope === "module"
+        ? `Module bug: ${moduleName || moduleId}`
+        : scope === "suite"
+          ? `Suite bug: ${suiteName || suiteId}`
+          : `Run bug: ${selectedExecution.name || selectedExecution.id}`;
+    const message = [
+      scopedCase
+        ? "Reported from a test case run."
+        : scope === "module"
+          ? "Reported from a module within a test run."
+          : scope === "suite"
+            ? "Reported from a suite within a test run."
+            : "Reported from run details.",
       "",
       `Run ID: ${selectedExecution.id}`,
       selectedExecution.name ? `Run name: ${selectedExecution.name}` : "",
@@ -3417,15 +3462,33 @@ export function ExecutionsPage() {
       `Run trigger: ${selectedExecution.trigger || "manual"}`,
       scopedCase ? `Test case ID: ${scopedCase.id}` : "",
       scopedCase ? `Test case title: ${scopedCaseTitle || scopedCase.title}` : "",
-      scopedCase?.suite_name ? `Suite: ${scopedCase.suite_name}` : "",
+      suiteName ? `Suite: ${suiteName}` : "",
+      moduleName ? `Module: ${moduleName}` : "",
       selectedExecution.test_environment?.name ? `Environment: ${selectedExecution.test_environment.name}` : "",
       selectedExecution.build ? `Build: ${selectedExecution.build}` : "",
       `Run totals: ${executionProgress.totalCases} cases, ${executionStatusCounts.failed} failed, ${executionStatusCounts.blocked} blocked`,
       "",
       "Bug details:"
-    ].filter(Boolean).join("\n"));
+    ].filter(Boolean).join("\n");
 
-    navigate(`/issues?${params.toString()}`);
+    navigate(buildBugReportPath({
+      runId: selectedExecution.id,
+      runName: selectedExecution.name,
+      runStatus: currentExecutionStatus,
+      testCaseIds: scopedCase ? [scopedCase.id] : [],
+      testCaseTitle: scopedCaseTitle || scopedCase?.title,
+      suiteIds: scope === "suite" && suiteId ? [suiteId] : [],
+      suiteName,
+      moduleIds: scope === "module" && moduleId ? [moduleId] : [],
+      moduleName,
+      requirementIds,
+      environment: selectedExecution.test_environment?.name,
+      build: selectedExecution.build,
+      title,
+      message,
+      returnTo,
+      returnLabel: scopedCase ? "test case run" : scope === "module" ? "run module" : scope === "suite" ? "run suite" : "test run"
+    }, mode));
   };
 
   const handleShareExecutionReport = async (event: FormEvent<HTMLFormElement>) => {
@@ -3906,6 +3969,7 @@ export function ExecutionsPage() {
   }, [selectedExecutionCaseDefectText, selectedExecutionCaseReferenceText, selectedExecution?.id, selectedExecutionCase?.id]);
 
   const openExecutionGroupAutomationPreview = (groupName: string, steps: TestStep[]) => {
+    if (!canPreviewRunAutomation) return;
     setCodePreviewState({
       title: `${groupName} automation`,
       subtitle: "This is the snapped automation for the selected run.",
@@ -3914,6 +3978,7 @@ export function ExecutionsPage() {
   };
 
   const openExecutionStepAutomationPreview = (step: TestStep) => {
+    if (!canPreviewRunAutomation) return;
     setCodePreviewState({
       title: `Step ${step.step_order} automation`,
       subtitle: "Run snapshots are read-only. This preview reflects the preserved step automation for this run.",
@@ -4563,6 +4628,7 @@ export function ExecutionsPage() {
         execution.sprint || "",
         execution.build || "",
         ...(execution.suite_ids || []),
+        ...(execution.test_case_ids || []),
         ...(execution.case_snapshots || []).flatMap((snapshot) => [snapshot.test_case_id, snapshot.test_case_title, snapshot.suite_id || "", snapshot.suite_name || ""]),
         ...(execution.step_snapshots || []).flatMap((snapshot) => [snapshot.snapshot_step_id, snapshot.test_case_id, snapshot.group_id || "", snapshot.reusable_group_id || ""])
       ].some((value) => String(value || "").toLowerCase().includes(search));
@@ -4814,6 +4880,12 @@ export function ExecutionsPage() {
       render: (testCase) => testCase.suite_name || "Test case run"
     },
     {
+      key: "module",
+      label: "Module",
+      render: (testCase) => testCase.module_name || "Unassigned module",
+      sortValue: (testCase) => testCase.module_name || "Unassigned module"
+    },
+    {
       key: "priority",
       label: "Priority",
       render: (testCase) => `P${testCase.priority || 3}`
@@ -4931,7 +5003,7 @@ export function ExecutionsPage() {
       label: "Touched",
       render: (execution) => {
         const summary = executionSummaryById[execution.id] || EMPTY_EXECUTION_RUN_SUMMARY;
-        const totalCases = (execution.case_snapshots || []).length;
+        const totalCases = executionScopeCaseCount(execution);
         return totalCases ? `${summary.total}/${totalCases}` : summary.total;
       }
     },
@@ -5382,6 +5454,28 @@ export function ExecutionsPage() {
     suiteName: string;
   }) => {
     const resolvedEmptyMessage = executionCaseSearch.trim() ? "No cases match the current search." : emptyMessage;
+    const moduleGroups = suiteId
+      ? Object.values(cases.reduce<Record<string, { id: string; name: string; cases: ExecutionCaseView[] }>>((groups, testCase) => {
+          const moduleId = testCase.module_id || "unassigned-module";
+          groups[moduleId] = groups[moduleId] || { id: moduleId, name: testCase.module_name || "Unassigned module", cases: [] };
+          groups[moduleId].cases.push(testCase);
+          return groups;
+        }, {}))
+      : [];
+    const renderCaseCards = (scopedCases: ExecutionCaseView[]) => scopedCases.map((testCase) => (
+      <ExecutionSuiteCaseCard
+        assignedUser={testCase.assigned_user || selectedExecution?.assigned_user || null}
+        caseStatus={caseDerivedStatus(testCase)}
+        durationLabel={formatDuration(resolveCaseDurationMs(testCase.id, resultByCaseId[testCase.id]), DEFAULT_DURATION_LABEL)}
+        isActive={selectedTestCaseId === testCase.id}
+        isNext={nextFocusCase?.id === testCase.id}
+        key={`${testCase.suite_id || "direct"}-${testCase.module_id || "unassigned"}-${testCase.id}`}
+        onSelect={() => focusExecutionCase(testCase.id)}
+        stepCount={(stepsByCaseId[testCase.id] || []).length}
+        suiteName={suiteName}
+        testCase={testCase}
+      />
+    ));
 
     return (
       <div className="execution-run-case-catalog">
@@ -5407,6 +5501,13 @@ export function ExecutionsPage() {
           <CatalogViewToggle onChange={setExecutionCaseCatalogViewMode} value={executionCaseCatalogViewMode} />
           {suiteId ? (
             <>
+              <ReportBugSplitActionButton
+                canUseAi={canUseAiBugTriage}
+                className="execution-scope-report-bug"
+                disabled={!canReportBugs}
+                onReportBug={() => handleReportSelectedExecutionIssue("suite", { suiteId, suiteName })}
+                onReportBugWithAi={() => handleReportSelectedExecutionIssue("suite", { suiteId, suiteName }, "ai")}
+              />
               <button
                 className="ghost-button suite-bulk-pass"
                 disabled={!isExecutionStarted || isExecutionLocked}
@@ -5430,23 +5531,66 @@ export function ExecutionsPage() {
         </div>
 
         {executionCaseCatalogViewMode === "tile" ? (
-          <div className="tree-children">
-            {cases.map((testCase) => (
-              <ExecutionSuiteCaseCard
-                assignedUser={testCase.assigned_user || selectedExecution?.assigned_user || null}
-                caseStatus={caseDerivedStatus(testCase)}
-                durationLabel={formatDuration(resolveCaseDurationMs(testCase.id, resultByCaseId[testCase.id]), DEFAULT_DURATION_LABEL)}
-                isActive={selectedTestCaseId === testCase.id}
-                isNext={nextFocusCase?.id === testCase.id}
-                key={`${testCase.suite_id || "direct"}-${testCase.id}`}
-                onSelect={() => focusExecutionCase(testCase.id)}
-                stepCount={(stepsByCaseId[testCase.id] || []).length}
-                suiteName={suiteName}
-                testCase={testCase}
-              />
-            ))}
-            {!cases.length ? <div className="empty-state compact">{resolvedEmptyMessage}</div> : null}
-          </div>
+          suiteId ? (
+            <div className="execution-module-tree">
+              {moduleGroups.map((module) => {
+                const passed = module.cases.filter((testCase) => caseDerivedStatus(testCase) === "passed").length;
+                const failed = module.cases.filter((testCase) => caseDerivedStatus(testCase) === "failed").length;
+                const blocked = module.cases.filter((testCase) => ["blocked", "running"].includes(caseDerivedStatus(testCase))).length;
+                const resolved = passed + failed + blocked;
+                const completion = module.cases.length ? Math.round((resolved / module.cases.length) * 100) : 0;
+                const passRate = resolved ? Math.round((passed / resolved) * 100) : 0;
+                const moduleAssignees = selectedExecution?.module_assignments?.[module.id] || [];
+                return (
+                  <section className="execution-module-scope" key={`${suiteId}-${module.id}`}>
+                    <div className="execution-module-scope-header">
+                      <div className="execution-module-scope-title">
+                        <LayersIcon />
+                        <div>
+                          <strong>{module.name}</strong>
+                          <span>{module.cases.length} cases · {resolved} resolved</span>
+                        </div>
+                      </div>
+                      <HierarchyMetricStrip
+                        count={module.cases.length}
+                        noun="case"
+                        metrics={[
+                          { label: "Complete", value: `${completion}%`, tone: completion === 100 ? "success" : completion ? "warning" : "neutral" },
+                          { label: "Pass rate", value: resolved ? `${passRate}%` : "—", tone: !resolved ? "neutral" : passRate >= 85 ? "success" : passRate >= 65 ? "warning" : "danger" },
+                          { label: "Failed", value: failed, tone: failed ? "danger" : "success" },
+                          { label: "Blocked", value: blocked, tone: blocked ? "warning" : "success" }
+                        ]}
+                      />
+                      <div className="execution-scope-assignee" title="Assign module responsibility">
+                        <ExecutionAssigneeIcon />
+                        <MultiAssigneePicker
+                          disabled={!canExecuteRuns || module.id === "unassigned-module" || updateExecutionScopeAssignment.isPending}
+                          emptyLabel={module.id === "unassigned-module" ? "No module owner" : "Inherit suite/run"}
+                          onChange={(ids) => void handleScopeAssignmentChange("modules", module.id, ids)}
+                          options={assigneeOptions}
+                          selectedIds={moduleAssignees}
+                        />
+                      </div>
+                      <ReportBugSplitActionButton
+                        canUseAi={canUseAiBugTriage}
+                        className="execution-scope-report-bug"
+                        disabled={!canReportBugs || module.id === "unassigned-module"}
+                        onReportBug={() => handleReportSelectedExecutionIssue("module", { suiteId, suiteName, moduleId: module.id, moduleName: module.name })}
+                        onReportBugWithAi={() => handleReportSelectedExecutionIssue("module", { suiteId, suiteName, moduleId: module.id, moduleName: module.name }, "ai")}
+                      />
+                    </div>
+                    <div className="tree-children">{renderCaseCards(module.cases)}</div>
+                  </section>
+                );
+              })}
+              {!cases.length ? <div className="empty-state compact">{resolvedEmptyMessage}</div> : null}
+            </div>
+          ) : (
+            <div className="tree-children">
+              {renderCaseCards(cases)}
+              {!cases.length ? <div className="empty-state compact">{resolvedEmptyMessage}</div> : null}
+            </div>
+          )
         ) : (
           <DataTable
             columns={executionCaseListColumns}
@@ -5472,6 +5616,7 @@ export function ExecutionsPage() {
       canCreateEvidence={canCreateRunEvidence}
       canDeleteEvidence={canDeleteRunEvidence}
       canInspectApi={step.step_type === "api" || (!step.step_type && selectedExecutionAppTypeKind === "api")}
+      canPreviewAutomation={canPreviewRunAutomation}
       canViewEvidence={canViewRunEvidence}
       captures={stepCaptures[step.id] || stepApiDetails[step.id]?.captures || {}}
       defectIds={stepDefects[step.id] || []}
@@ -6304,8 +6449,10 @@ export function ExecutionsPage() {
                               </div>
                               <div className="execution-step-view-header-actions">
                                 <ReportBugSplitActionButton
-                                  disabled={!selectedExecution}
+                                  canUseAi={canUseAiBugTriage}
+                                  disabled={!selectedExecution || !canReportBugs}
                                   onReportBug={() => handleReportSelectedExecutionIssue(selectedExecutionCase ? "case" : "run")}
+                                  onReportBugWithAi={() => handleReportSelectedExecutionIssue(selectedExecutionCase ? "case" : "run", {}, "ai")}
                                 />
                                 <div className="execution-step-view-toggle" role="tablist" aria-label="Step view">
                                   <button
@@ -6393,22 +6540,24 @@ export function ExecutionsPage() {
                               {executionStepGroupIds.length ? (
                                 <>
                                   <button
-                                    className="ghost-button execution-steps-bulk-action"
+                                    aria-label="Expand groups"
+                                    className="ghost-button execution-steps-bulk-action explorer-icon-button"
                                     disabled={expandedExecutionStepGroupIds.length === executionStepGroupIds.length}
                                     onClick={() => setExpandedExecutionStepGroupIds(executionStepGroupIds)}
+                                    title="Expand groups"
                                     type="button"
                                   >
-                                    <ExecutionAccordionChevronIcon />
-                                    <span>Expand groups</span>
+                                    <CollapseExpandIcon isExpanded={false} />
                                   </button>
                                   <button
-                                    className="ghost-button execution-steps-bulk-action"
+                                    aria-label="Collapse groups"
+                                    className="ghost-button execution-steps-bulk-action explorer-icon-button"
                                     disabled={!expandedExecutionStepGroupIds.length}
                                     onClick={() => setExpandedExecutionStepGroupIds([])}
+                                    title="Collapse groups"
                                     type="button"
                                   >
-                                    <ExecutionAccordionChevronIcon />
-                                    <span>Collapse groups</span>
+                                    <CollapseExpandIcon isExpanded={true} />
                                   </button>
                                 </>
                               ) : null}
@@ -6464,6 +6613,7 @@ export function ExecutionsPage() {
                                           return (
                                             <Fragment key={block.key}>
                                               <ExecutionStepGroupRow
+                                                canPreviewAutomation={canPreviewRunAutomation}
                                                 isExpanded={isExpanded}
                                                 kind={block.groupKind}
                                                 name={block.groupName || "Step group"}
@@ -6820,8 +6970,10 @@ export function ExecutionsPage() {
                           <span>Email report</span>
                         </button>
                         <ReportBugSplitActionButton
-                          disabled={!selectedExecution}
+                          canUseAi={canUseAiBugTriage}
+                          disabled={!selectedExecution || !canReportBugs}
                           onReportBug={() => handleReportSelectedExecutionIssue(selectedExecutionCase ? "case" : "run")}
+                          onReportBugWithAi={() => handleReportSelectedExecutionIssue(selectedExecutionCase ? "case" : "run", {}, "ai")}
                         />
 
                         <button
@@ -7104,6 +7256,19 @@ export function ExecutionsPage() {
 
                                 {isExpanded ? (
                                   <div className="tree-suite-body">
+                                    <div className="execution-scope-assignment-bar">
+                                      <div>
+                                        <ExecutionAssigneeIcon />
+                                        <span><strong>Suite owner</strong><small>Cases inherit this unless their module or case has an override.</small></span>
+                                      </div>
+                                      <MultiAssigneePicker
+                                        disabled={!canExecuteRuns || updateExecutionScopeAssignment.isPending}
+                                        emptyLabel="Inherit run owner"
+                                        onChange={(ids) => void handleScopeAssignmentChange("suites", suite.id, ids)}
+                                        options={assigneeOptions}
+                                        selectedIds={selectedExecution?.suite_assignments?.[suite.id] || []}
+                                      />
+                                    </div>
                                     {renderExecutionCaseCatalog({
                                       cases: filteredDisplayCasesBySuiteId[suite.id] || [],
                                       emptyMessage: "No test cases were snapped into this suite.",
@@ -7154,6 +7319,19 @@ export function ExecutionsPage() {
                                       >
                                         Close suite
                                       </button>
+                                    </div>
+                                    <div className="execution-scope-assignment-bar">
+                                      <div>
+                                        <ExecutionAssigneeIcon />
+                                        <span><strong>Suite owner</strong><small>Module and case overrides take precedence.</small></span>
+                                      </div>
+                                      <MultiAssigneePicker
+                                        disabled={!canExecuteRuns || updateExecutionScopeAssignment.isPending}
+                                        emptyLabel="Inherit run owner"
+                                        onChange={(ids) => void handleScopeAssignmentChange("suites", suite.id, ids)}
+                                        options={assigneeOptions}
+                                        selectedIds={selectedExecution?.suite_assignments?.[suite.id] || []}
+                                      />
                                     </div>
                                     {renderExecutionCaseCatalog({
                                       cases: filteredDisplayCasesBySuiteId[suite.id] || [],
@@ -7448,6 +7626,7 @@ function ExecutionAccordionPanel({
         aria-expanded={isExpanded}
         className="execution-accordion-toggle execution-accordion-toggle--panel"
         onClick={onToggle}
+        title={isExpanded ? `Collapse ${title}` : `Expand ${title}`}
         type="button"
       >
         <div className="execution-accordion-toggle-main">
@@ -7460,7 +7639,7 @@ function ExecutionAccordionPanel({
           </div>
         </div>
         <div className="execution-accordion-toggle-meta">
-          <span className="execution-accordion-toggle-state">{isExpanded ? "Collapse" : "Expand"}</span>
+          <span aria-hidden="true" className="execution-accordion-toggle-state explorer-toggle-glyph"><CollapseExpandIcon isExpanded={isExpanded} /></span>
         </div>
       </button>
       {isExpanded ? <div className="execution-accordion-panel-body">{children}</div> : null}
@@ -7489,6 +7668,7 @@ function ExecutionAccordionSection({
         aria-expanded={isExpanded}
         className="execution-accordion-toggle execution-accordion-toggle--section"
         onClick={onToggle}
+        title={isExpanded ? `Collapse ${title}` : `Expand ${title}`}
         type="button"
       >
         <div className="execution-accordion-toggle-main">
@@ -7501,7 +7681,7 @@ function ExecutionAccordionSection({
           </div>
         </div>
         <div className="execution-accordion-toggle-meta">
-          <span className="execution-accordion-toggle-state">{isExpanded ? "Collapse" : "Expand"}</span>
+          <span aria-hidden="true" className="execution-accordion-toggle-state explorer-toggle-glyph"><CollapseExpandIcon isExpanded={isExpanded} /></span>
         </div>
       </button>
       {isExpanded ? <div className="execution-accordion-body">{children}</div> : null}
@@ -7943,7 +8123,7 @@ function ExecutionListCard({
   onSelect: () => void;
   onToggleSelected: () => void;
 }) {
-  const totalScopedCases = execution.case_snapshots?.length || summary.total || 0;
+  const totalScopedCases = executionScopeCaseCount(execution) || summary.total || 0;
   const resolvedTotal = Math.max(totalScopedCases, summary.total, 0);
   const executionStatus = normalizeExecutionStatus(execution.status);
   const isTestCaseRun = execution.suite_ids.length === 0;
@@ -8846,6 +9026,7 @@ function ExecutionSuiteCaseCard({
 }
 
 function ExecutionStepGroupRow({
+  canPreviewAutomation,
   name,
   kind,
   isExpanded,
@@ -8853,6 +9034,7 @@ function ExecutionStepGroupRow({
   onPreviewCode,
   onToggle
 }: {
+  canPreviewAutomation: boolean;
   name: string;
   kind: TestStep["group_kind"];
   isExpanded: boolean;
@@ -8888,15 +9070,17 @@ function ExecutionStepGroupRow({
         </button>
         <span className="execution-step-group-meta" role="cell">
           <span className="execution-step-group-count">{stepCount} step{stepCount === 1 ? "" : "s"}</span>
-          <button
-            aria-label={`Preview automation for ${name}`}
-            className="step-inline-tool is-active"
-            onClick={onPreviewCode}
-            title="Preview group automation"
-            type="button"
-          >
-            <AutomationCodeIcon />
-          </button>
+          {canPreviewAutomation ? (
+            <button
+              aria-label={`Preview automation for ${name}`}
+              className="step-inline-tool is-active"
+              onClick={onPreviewCode}
+              title="Preview group automation"
+              type="button"
+            >
+              <AutomationCodeIcon />
+            </button>
+          ) : null}
         </span>
       </div>
     </div>
@@ -8916,6 +9100,7 @@ function ExecutionStepCard({
   automationDetail,
   captures,
   canInspectApi,
+  canPreviewAutomation,
   isRunningApi,
   parameterValues,
   isLocked,
@@ -8952,6 +9137,7 @@ function ExecutionStepCard({
   automationDetail: ExecutionStepAutomationDetail | null;
   captures: Record<string, string>;
   canInspectApi: boolean;
+  canPreviewAutomation: boolean;
   isRunningApi: boolean;
   parameterValues: Record<string, string>;
   isLocked: boolean;
@@ -9082,14 +9268,16 @@ function ExecutionStepCard({
               <StepTypeIcon size={14} type={step.step_type || "api"} />
             </button>
           ) : null}
-          <InlineStepToolButton
-            ariaLabel={`Preview automation for step ${step.step_order}`}
-            className="is-active"
-            onClick={onPreviewCode}
-            title="Preview step automation"
-          >
-            <AutomationCodeIcon />
-          </InlineStepToolButton>
+          {canPreviewAutomation ? (
+            <InlineStepToolButton
+              ariaLabel={`Preview automation for step ${step.step_order}`}
+              className="is-active"
+              onClick={onPreviewCode}
+              title="Preview step automation"
+            >
+              <AutomationCodeIcon />
+            </InlineStepToolButton>
+          ) : null}
         </div>
       </div>
 

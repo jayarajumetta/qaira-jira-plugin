@@ -139,25 +139,25 @@ export function JiraAttachmentPanel({
           <strong>{title}</strong>
           <span>{attachments.data?.length || 0} on {issueKey}</span>
         </div>
-        {canUpload && attachmentMeta.data?.enabled !== false ? (
-          <button className="primary-button compact" disabled={upload.isPending} onClick={() => fileInputRef.current?.click()} type="button">
-            <JiraAttachmentIcon />
-            <span>{upload.isPending ? "Uploading…" : "Add files"}</span>
-          </button>
-        ) : null}
       </div>
 
       {canUpload && attachmentMeta.data?.enabled !== false ? (
         <div
           className={isDragging ? "jira-attachment-dropzone is-dragging" : "jira-attachment-dropzone"}
+          aria-busy={upload.isPending}
           onDragEnter={(event) => { event.preventDefault(); setIsDragging(true); }}
-          onDragLeave={() => setIsDragging(false)}
+          onDragLeave={(event) => {
+            if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setIsDragging(false);
+          }}
           onDragOver={(event) => event.preventDefault()}
           onDrop={handleDrop}
         >
           <input hidden multiple onChange={(event) => chooseFiles(event.target.files)} ref={fileInputRef} type="file" />
-          <JiraAttachmentIcon />
-          <span>Drop images, videos, or files here</span>
+          <JiraAttachmentUploadIcon />
+          <span>{upload.isPending ? "Uploading files…" : "Drop files to attach or"}</span>
+          <button className="jira-attachment-browse-button" disabled={upload.isPending} onClick={() => fileInputRef.current?.click()} type="button">
+            Browse
+          </button>
         </div>
       ) : null}
 
@@ -203,6 +203,16 @@ export function JiraAttachmentPanel({
 
 export function JiraAttachmentIcon() {
   return <svg aria-hidden="true" fill="none" height="16" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.8" viewBox="0 0 24 24" width="16"><path d="m20.5 11.5-8.7 8.7a6 6 0 0 1-8.5-8.5l9.2-9.2a4 4 0 0 1 5.7 5.7L9 17.4a2 2 0 1 1-2.8-2.8l8.5-8.5" /></svg>;
+}
+
+function JiraAttachmentUploadIcon() {
+  return (
+    <svg aria-hidden="true" fill="none" height="18" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.8" viewBox="0 0 24 24" width="18">
+      <path d="M7 18.5H5.75a3.75 3.75 0 0 1-.54-7.46A6.5 6.5 0 0 1 17.7 9.2 4.5 4.5 0 0 1 18.5 18H17" />
+      <path d="M12 11v9" />
+      <path d="m8.75 14.25 3.25-3.25 3.25 3.25" />
+    </svg>
+  );
 }
 
 function FileKindIcon({ kind }: { kind: string }) {

@@ -27,6 +27,7 @@ const isOpenDefectStatus = (status?: string | null) => !/^(done|closed|resolved|
 const isCriticalOrHigh = (value?: string | null) => /^(critical|blocker|highest|high|p0|p1|p2|sev0|sev1|sev2)$/i.test(String(value || "").trim());
 
 export function deriveIterationHealth(items: IterationHealthInput[], automationEnabled: boolean) {
+  const completedRequirementCount = items.filter((item) => isDone(item.status)).length;
   const readinessScores = items.map((item) => Math.round(
     automationEnabled
       ? (item.passPercent * 0.55) + ((item.automationPercent || 0) * 0.45)
@@ -85,7 +86,8 @@ export function deriveIterationHealth(items: IterationHealthInput[], automationE
     coveragePercent: percent(items.filter((item) => item.linkedCaseCount > 0).length, items.length),
     zeroCoverageCount: items.filter((item) => item.linkedCaseCount === 0).length,
     readinessPercent: items.length ? Math.round(readinessScores.reduce((sum, value) => sum + value, 0) / items.length) : 0,
-    completionPercent: percent(items.filter((item) => isDone(item.status)).length, items.length),
+    completedRequirementCount,
+    completionPercent: percent(completedRequirementCount, items.length),
     plannedCaseCount,
     executedCaseCount,
     executionPercent: percent(executedCaseCount, plannedCaseCount),

@@ -13,6 +13,7 @@ import { AutomationCodeIcon, CodePreviewDialog } from "./StepAutomationEditor";
 import { RichTextContent } from "./RichTextEditor";
 import { DialogCloseButton } from "./DialogCloseButton";
 import { LoadingState } from "./LoadingState";
+import { CollapseExpandIcon } from "./AppIcons";
 
 const linkedCaseHistoryDateFormatter = new Intl.DateTimeFormat(undefined, {
   month: "short",
@@ -380,8 +381,14 @@ function LinkedTestCaseSection({
         <div className="editor-accordion-toggle-meta">
           <span className="editor-accordion-toggle-count">{countLabel}</span>
           {actions ? <div className="editor-accordion-actions">{actions}</div> : null}
-          <button className="editor-accordion-toggle-state" onClick={onToggle} type="button">
-            {isExpanded ? "Collapse" : "Expand"}
+          <button
+            aria-label={isExpanded ? `Collapse ${title}` : `Expand ${title}`}
+            className="editor-accordion-toggle-state explorer-icon-button"
+            onClick={onToggle}
+            title={isExpanded ? "Collapse section" : "Expand section"}
+            type="button"
+          >
+            <CollapseExpandIcon isExpanded={isExpanded} />
           </button>
         </div>
       </div>

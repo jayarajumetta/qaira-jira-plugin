@@ -8,6 +8,7 @@ const accessSource = read('../src/qairaAccess.js');
 const analyticsSource = read('../src/qualityAnalytics.js');
 const clientSource = read('../static/qaira-ui/src/lib/api.ts');
 const customDashboardSource = read('../static/qaira-ui/src/components/CustomQualityDashboard.tsx');
+const overviewSource = read('../static/qaira-ui/src/pages/OverviewPage.tsx');
 const projectSource = read('../static/qaira-ui/src/pages/ProjectsPage.tsx');
 const aiCaseAuthoringSource = read('../static/qaira-ui/src/components/AiCaseAuthoringModal.tsx');
 const requirementSource = read('../static/qaira-ui/src/pages/RequirementsPage.tsx');
@@ -23,14 +24,17 @@ const workspaceDataSource = read('../static/qaira-ui/src/hooks/useWorkspaceData.
 const manifestSource = read('../manifest.yml');
 const notificationCenterSource = read('../static/qaira-ui/src/lib/notificationCenter.ts');
 
-test('hierarchy health is shared, derived, and rendered for assigned and unassigned scope', () => {
+test('sprint hierarchy health is shared, derived, and rendered for Jira sprint and backlog scope', () => {
   assert.match(requirementSource, /deriveIterationHealth/);
-  assert.match(requirementSource, /Unassigned iteration/);
+  assert.match(requirementSource, /Backlog \/ No sprint/);
+  assert.match(requirementSource, /label: "Done"/);
   assert.match(requirementSource, /label: "Coverage"/);
-  assert.match(requirementSource, /label: "Execution"/);
-  assert.match(requirementSource, /label: "Pass rate"/);
-  assert.match(requirementSource, /label: "P1\/P2 bugs"/);
-  assert.match(requirementSource, /label: "Req risk"/);
+  assert.match(requirementSource, /label: "Run pass"/);
+  assert.match(requirementSource, /label: "At risk"/);
+  assert.match(requirementSource, /sprintDateRangeLabel/);
+  assert.match(requirementSource, /sprintStateLabel/);
+  assert.match(apiSource, /\/rest\/agile\/1\.0\/sprint/);
+  assert.match(manifestSource, /write:sprint:jira-software/);
   assert.match(apiSource, /severity: target\.fields\?\.priority\?\.name \|\| null/);
   assert.match(testCaseSource, /deriveModuleHealth/);
   assert.match(testCaseSource, /Unassigned module/);
@@ -55,6 +59,27 @@ test('custom dashboards use one bounded batch request with stakeholder templates
   assert.match(customDashboardSource, /deleteSelectedDashboard/);
 });
 
+test('automation previews and analytics fail closed behind dedicated permissions and feature flags', () => {
+  assert.match(accessSource, /qaira\.automation\.preview[\s\S]*automation\.preview/);
+  assert.match(accessSource, /qaira\.automation\.analytics[\s\S]*automation\.analytics\.view[\s\S]*dashboard\.view/);
+  assert.match(executionsSource, /hasPermission\(session, "automation\.preview"\)[\s\S]*qaira\.automation\.preview/);
+  assert.match(executionsSource, /canPreviewAutomation \? \([\s\S]*title="Preview step automation"/);
+  assert.match(apiSource, /isAutomationDashboardDesign[\s\S]*requiredPermission: 'automation\.analytics\.view'[\s\S]*qaira\.automation\.analytics/);
+  assert.match(overviewSource, /canViewAutomationAnalytics[\s\S]*qaira\.automation\.analytics/);
+  assert.match(overviewSource, /sectionVisible\("automation"\)/);
+  assert.match(customDashboardSource, /canUseAutomation[\s\S]*audience\.id !== "automation"/);
+});
+
+test('quality analytics separates release evidence from automation and supports local rearrangement', () => {
+  assert.match(overviewSource, /35% traceability \+ 25% design completeness \+ 40% latest pass confidence/);
+  assert.match(overviewSource, /automation adoption does not raise it/);
+  assert.match(overviewSource, /This browser-only preference creates no Forge or Jira API traffic/);
+  assert.match(overviewSource, /window\.localStorage\.setItem\(layoutStorageKey/);
+  assert.match(overviewSource, /Why this release posture\?/);
+  assert.match(overviewSource, /MetricEvidenceDialog/);
+  assert.match(overviewSource, /users: false[\s\S]*projectMembers: false[\s\S]*issues: false[\s\S]*testCasesProjection: "summary"/);
+});
+
 test('custom dashboard reports capture the live styled DOM and fail closed when fidelity is unavailable', () => {
   assert.match(customDashboardSource, /import \{ toJpeg \} from "html-to-image"/);
   assert.match(customDashboardSource, /fitDashboardSnapshotToForgePayload/);
@@ -63,7 +88,9 @@ test('custom dashboard reports capture the live styled DOM and fail closed when 
   assert.doesNotMatch(customDashboardSource, /custom-dashboard-toolbar-summary/);
   assert.match(stylesSource, /\.custom-dashboard-selector-field/);
   assert.match(apiSource, /DASHBOARD_SNAPSHOT_REQUIRED/);
-  assert.match(apiSource, /renderedSnapshotDataUrl \? \[\] : await mapInBatches/);
+  assert.match(apiSource, /render_for_email === true/);
+  assert.match(apiSource, /shouldEvaluate \? await mapInBatches/);
+  assert.match(apiSource, /emailHtmlBody: fallbackHtml/);
   assert.match(apiSource, /base64\.length > 450_000/);
 });
 
@@ -73,6 +100,17 @@ test('bug creation uses compact metadata controls without redundant section copy
   assert.match(issuesSource, /bug-field-linked-run/);
   assert.match(stylesSource, /\.bug-field-assignee/);
   assert.match(stylesSource, /\.bug-field-environment/);
+});
+
+test('requirement and Bug status controls are Jira-workflow-native and transition aware', () => {
+  assert.match(apiSource, /\/rest\/api\/3\/project\/\$\{project\.key\}\/statuses/);
+  assert.match(apiSource, /jiraIssueTransitionStatusCatalog/);
+  assert.match(apiSource, /source: 'jira-issue-transitions'/);
+  assert.match(apiSource, /status_category: issue\.fields\?\.status\?\.statusCategory\?\.key/);
+  assert.match(requirementSource, /editRequirementStatusOptions/);
+  assert.match(requirementSource, /createRequirementStatusOptions/);
+  assert.match(issuesSource, /activeBugStatusOptions/);
+  assert.match(issuesSource, /category !== "done"/);
 });
 
 test('notifications are persistent event records delivered through Forge Realtime and native flags', () => {

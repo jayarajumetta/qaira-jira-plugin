@@ -13,7 +13,7 @@ Current release highlights:
 - a default Quality Analytics command center plus Create/Edit/Delete custom-dashboard workflows, modal JQL gadget design, four AI-assisted stakeholder templates, six visualizations, twelve metric functions, fifteen grouping dimensions, and batched project-scoped evaluation;
 - one consistent AI prompt pack across requirement creation/improvement, test generation, and case completion: prompt templates, selected requirements, bounded knowledge/text context, external links, and reference images, with collapsible context rails;
 - mandatory project-member role assignment: Jira administrators are idempotently synchronized into Qaira-visible projects as system-managed Jira administrator memberships, other project creators receive QA lead, and every additional Jira user requires an explicit Qaira role;
-- one-line requirement-iteration and test-module health signals for coverage, readiness, traceability, executability, stability, automation, and risk;
+- Jira-native Sprint strips with lifecycle dates/status plus story completion, test coverage, run pass rate, and risk signals; test-module health remains focused on traceability, executability, stability, automation, and risk;
 - bounded transient Jira retries with retry telemetry, while non-idempotent creates and attachment uploads remain single-attempt;
 - one centered shared loading state with the label below the spinner; the duplicate shell spinner is removed;
 - governed test-case content versions with compare, confirmed restore, optimistic concurrency, review reset, and a 20-snapshot retention bound;
@@ -97,7 +97,8 @@ Automation Assets        Qaira Automation Asset Jira issue
 Object Repository        Qaira Object Repository Item Jira issue
 Test Data Sets           Sharded Jira project properties
 Quality Gates            Qaira Quality Gate Jira issue
-Iterations/modules       Jira project properties
+Sprints                  Jira Software Sprint (project-property mirror only for compatibility metadata)
+Modules                  Jira project properties
 Test steps/specification Jira issue property qaira.testCaseSpec.v1
 Test case versions        Jira issue properties qaira.testCaseVersion.v1.<revision> (latest 20)
 Run metadata/results     Jira issue properties
@@ -210,7 +211,7 @@ The adapter covers the original frontend domains:
 ```text
 Session and current Atlassian user
 Projects and Jira users
-Requirements and iterations
+Requirements and Jira Software Sprints
 Requirement AI previews and generated test drafts
 Jira Bugs / issue reporting
 Test cases, steps, reviews, retained content versions and modules

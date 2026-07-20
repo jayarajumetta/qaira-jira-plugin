@@ -108,6 +108,9 @@ describe('request authorization policy', () => {
     assert.equal(permissionForRequest('/requirements', 'GET'), 'requirement.view');
     assert.equal(permissionForRequest('/requirements', 'POST'), 'requirement.create');
     assert.equal(permissionForRequest('/requirements/REQ-1', 'PUT'), 'requirement.update');
+    assert.equal(permissionForRequest('/requirements/REQ-1/edit-metadata', 'GET'), 'requirement.update');
+    assert.equal(permissionForRequest('/requirement-iterations/sprint-1/requirements', 'GET'), 'requirement_iteration.view');
+    assert.equal(permissionForRequest('/requirement-iterations/sprint-1/requirements', 'DELETE'), 'requirement_iteration.update');
     assert.equal(permissionForRequest('/requirements/REQ-1', 'PATCH'), 'requirement.update');
     assert.equal(permissionForRequest('/requirements/REQ-1', 'DELETE'), 'requirement.delete');
   });
@@ -134,6 +137,7 @@ describe('request authorization policy', () => {
     assert.equal(permissionForRequest('/requirements/REQ-1/design-test-cases-preview', 'POST'), 'requirement.ai');
     assert.equal(permissionForRequest('/requirements/REQ-1/design-test-cases-accept', 'POST'), 'testcase.create');
     assert.equal(permissionForRequest('/feedback/create-metadata', 'GET'), 'feedback.manage');
+    assert.equal(permissionForRequest('/feedback/BUG-1/edit-metadata', 'GET'), 'feedback.manage');
     assert.equal(permissionForRequest('/test-cases/ai-authoring-preview', 'POST'), 'testcase.ai');
     assert.equal(permissionForRequest('/test-data-sets/ai-generate-preview', 'POST'), 'data.ai');
     assert.equal(permissionForRequest('/test-cases/automation/learning-cache/export.csv', 'GET'), 'automation.repository.export');
@@ -210,6 +214,8 @@ describe('feature flag defaults', () => {
       'qaira.ai.test_authoring',
       'qaira.ai.test_data_generation',
       'qaira.automation.builder',
+      'qaira.automation.preview',
+      'qaira.automation.analytics',
       'qaira.ai.automation',
       'qaira.automation.step_recording',
       'qaira.automation.local_execution',

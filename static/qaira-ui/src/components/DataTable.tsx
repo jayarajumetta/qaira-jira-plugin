@@ -20,6 +20,10 @@ import {
   type StoredColumnPreference
 } from "../lib/tablePreferences/columnPreferences";
 
+const DEFAULT_COLUMN_COMPRESSION_RATIO = 0.85;
+const SELECTION_COLUMN_WIDTH = 36;
+const COLUMN_CONFIG_WIDTH = 28;
+
 export type DataTableColumn<T> = {
   key: string;
   label: string;
@@ -277,7 +281,8 @@ export function DataTable<T>({
         })
       ];
       const longest = sampleValues.reduce((length, value) => Math.max(length, value.length), 0);
-      const estimatedWidth = Math.min(DEFAULT_MAX_COLUMN_WIDTH, Math.max(DEFAULT_MIN_COLUMN_WIDTH, longest * 7 + 56));
+      const headerChromeWidth = column.sortValue ? 36 : 20;
+      const estimatedWidth = Math.min(DEFAULT_MAX_COLUMN_WIDTH, Math.max(DEFAULT_MIN_COLUMN_WIDTH, longest * 7 + headerChromeWidth));
 
       widths[column.key] = clampColumnWidth(column, estimatedWidth);
       return widths;
@@ -295,8 +300,28 @@ export function DataTable<T>({
     }));
   };
 
-  const getColumnWidth = (column: DataTableColumn<T>) =>
-    enableColumnResize ? columnWidths[column.key] || column.width || estimatedColumnWidths[column.key] || DEFAULT_COLUMN_WIDTH : undefined;
+  const getColumnWidth = (column: DataTableColumn<T>) => {
+    if (!enableColumnResize) {
+      return undefined;
+    }
+
+    if (isSelectionColumn(column)) {
+      return SELECTION_COLUMN_WIDTH;
+    }
+
+    const storedWidth = columnWidths[column.key];
+    if (storedWidth) {
+      return storedWidth;
+    }
+
+    if (column.width) {
+      const headerWidth = column.label.length * 7 + (column.sortValue ? 36 : 20);
+      const compactPreferredWidth = Math.round(column.width * DEFAULT_COLUMN_COMPRESSION_RATIO);
+      return clampColumnWidth(column, Math.min(column.width, Math.max(headerWidth, compactPreferredWidth)));
+    }
+
+    return estimatedColumnWidths[column.key] || DEFAULT_COLUMN_WIDTH;
+  };
 
   const handleColumnResizePointerDown = (column: DataTableColumn<T>, event: ReactPointerEvent<HTMLSpanElement>) => {
     if (!enableColumnResize || column.canResize === false) {
@@ -637,23 +662,27 @@ export function DataTable<T>({
         <button
           aria-expanded={isColumnConfigOpen}
           aria-haspopup="menu"
-          aria-label="Column configuration"
+          aria-label={`Configure columns (${columnPreference.visibleColumnKeys.length} visible)`}
           className="ghost-button data-table-config-trigger"
           onClick={() => {
             updateColumnConfigPanelPosition();
             setIsColumnConfigOpen((current) => !current);
           }}
           ref={columnConfigTriggerRef}
-          title="Column configuration"
+          title={`Configure columns (${columnPreference.visibleColumnKeys.length} visible)`}
           type="button"
         >
           <ColumnsIcon />
-          <span className="data-table-config-count">{columnPreference.visibleColumnKeys.length}</span>
         </button>
         {columnConfigPanel && typeof document !== "undefined" ? createPortal(columnConfigPanel, document.body) : null}
       </div>
     </div>
   ) : null;
+
+  const resizableTableWidth = enableColumnResize
+    ? activeColumns.reduce((width, column) => width + (getColumnWidth(column) || 0), shouldRenderSelectionColumn ? SELECTION_COLUMN_WIDTH : 0)
+      + (columnConfigControl ? COLUMN_CONFIG_WIDTH : 0)
+    : undefined;
 
   return (
     <div className={`data-table-shell data-table-shell--${columnPreference.density}`}>
@@ -661,12 +690,19 @@ export function DataTable<T>({
 
       {rows.length ? (
         <div className="table-wrap catalog-table-wrap">
-          <table className={["data-table catalog-data-table", enableColumnResize ? "is-resizable" : ""].filter(Boolean).join(" ")}>
+          <table
+            className={["data-table catalog-data-table", enableColumnResize ? "is-resizable" : ""].filter(Boolean).join(" ")}
+            style={resizableTableWidth ? { width: `${resizableTableWidth}px` } : undefined}
+          >
             {enableColumnResize ? (
               <colgroup>
                 {shouldRenderSelectionColumn ? <col className="data-table-selection-col" /> : null}
                 {activeColumns.map((column) => (
-                  <col key={column.key} style={{ width: `${getColumnWidth(column)}px` }} />
+                  <col
+                    className={isSelectionColumn(column) ? "data-table-selection-col" : undefined}
+                    key={column.key}
+                    style={{ width: `${getColumnWidth(column)}px` }}
+                  />
                 ))}
                 {columnConfigControl ? <col className="data-table-control-col" /> : null}
               </colgroup>

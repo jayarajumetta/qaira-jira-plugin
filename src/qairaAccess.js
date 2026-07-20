@@ -99,6 +99,7 @@ export const PERMISSION_GROUPS = [
       write('mobile.manage', 'Manage mobile and Appium configuration and recorder workflows.'),
       read('automation.code.view', 'View generated automation code.'),
       read('automation.preview', 'Preview generated automation.'),
+      read('automation.analytics.view', 'View automation-specific quality analytics.'),
       read('agentic_workflow.view', 'View agentic workflows.'),
       write('agentic_workflow.manage', 'Manage agentic workflows.'),
       write('agentic_workflow.run', 'Start agentic workflow runs.'),
@@ -298,6 +299,8 @@ export const FEATURE_GROUPS = [
     description: 'Automation design, object repository, batch processing, and mobile metadata.',
     features: [
       { key: 'qaira.automation.workspace', label: 'Automation workspace', routes: ['/automation'], permissions: ['automation.view', 'automation.preview'] },
+      { key: 'qaira.automation.preview', label: 'Run step automation preview', routes: ['/executions', '/test-cases'], permissions: ['automation.preview'] },
+      { key: 'qaira.automation.analytics', label: 'Automation quality analytics', routes: ['/'], permissions: ['automation.analytics.view', 'dashboard.view'] },
       { key: 'qaira.automation.assets', label: 'Automation assets', routes: ['/automation-assets'], permissions: ['automation.view', 'automation.asset.create', 'automation.asset.update', 'automation.asset.delete'] },
       { key: 'qaira.automation.builder', label: 'Automation builder', routes: ['/automation'], permissions: ['automation.build'] },
       { key: 'qaira.automation.step_code', label: 'Step code editor', routes: ['/automation'], permissions: ['automation.code.view'] },
@@ -406,6 +409,10 @@ const methodIndex = (method) => ({ GET: 0, POST: 1, PUT: 2, PATCH: 2, DELETE: 3 
 export function permissionForRequest(pathname, method = 'GET') {
   if (pathname === '/feature-flags') return method === 'GET' ? 'workspace.view' : 'feature_flag.manage';
   if (pathname === '/requirements/create-metadata') return 'requirement.create';
+  if (/^\/requirements\/[^/]+\/edit-metadata$/.test(pathname)) return 'requirement.update';
+  if (/^\/requirement-iterations\/[^/]+\/requirements$/.test(pathname)) {
+    return method === 'GET' ? 'requirement_iteration.view' : 'requirement_iteration.update';
+  }
   if (pathname === '/requirements/ai-create-preview') return 'requirement.ai';
   if (pathname === '/requirements/ai-description-rephrase') return 'requirement.ai';
   if (pathname === '/ai/rich-text-rephrase') return 'content.ai';
@@ -414,6 +421,7 @@ export function permissionForRequest(pathname, method = 'GET') {
   if (pathname === '/requirements/ai-create-jobs' || /^\/requirements\/ai-create-jobs\/[^/]+$/.test(pathname)) return 'requirement.ai';
   if (pathname === '/feedback/ai-draft-preview') return 'feedback.manage';
   if (pathname === '/feedback/create-metadata') return 'feedback.manage';
+  if (/^\/feedback\/[^/]+\/edit-metadata$/.test(pathname)) return 'feedback.manage';
   if (pathname === '/requirements/import') return 'requirement.import';
   if (pathname === '/requirements/export') return 'requirement.export';
   if (pathname === '/test-cases/import') return 'testcase.import';

@@ -73,7 +73,7 @@ test('dynamic AI analysis endpoints are explainable POST previews without Jira m
       label: 'execution failure clustering',
       source: sourceBetween(
         "const failureClusterMatch = pathname.match(/^\\/executions\\/([^/]+)\\/ai-failure-clusters$/);",
-        "const assignmentMatch = pathname.match(/^\\/executions\\/([^/]+)\\/cases\\/([^/]+)\\/assignment$/);"
+        "const scopeAssignmentMatch = pathname.match(/^\\/executions\\/([^/]+)\\/(suites|modules|cases)\\/([^/]+)\\/assignment$/);"
       ),
       capability: 'execution-failure-clustering-preview'
     },
@@ -213,10 +213,12 @@ test('requirement create and import Jira reads recover when Atlassian user auth 
   assert.match(requirementHandler, /queued:\s*true/);
 });
 
-test('Jira Software and create-metadata scope mismatches do not break core requirement authoring', () => {
+test('Jira Software lookup degradation stays bounded while create metadata fails closed', () => {
   const requiredScopes = [
     'read:board-scope:jira-software',
+    'write:board-scope:jira-software',
     'read:sprint:jira-software',
+    'write:sprint:jira-software',
     'read:issue-meta:jira',
     'read:avatar:jira',
     'read:field-configuration:jira',
@@ -248,8 +250,8 @@ test('Jira Software and create-metadata scope mismatches do not break core requi
   assert.match(apiSource, /sprint_lookup_unavailable:\s*Boolean\(sprints\?\.qairaLookupUnavailable\)/);
   assert.match(apiSource, /metadata\.sprint_lookup_unavailable\) sprintFallback/);
   assert.match(createMetaSource, /isJiraScopeMismatchError\(error\)/);
-  assert.match(createMetaSource, /core issue fields only/);
-  assert.match(createMetaSource, /return \[\]/);
+  assert.match(createMetaSource, /JIRA_CREATE_METADATA_UNAVAILABLE/);
+  assert.doesNotMatch(createMetaSource, /core issue fields only/);
 });
 
 test('async AI generation jobs have queue consumers and terminal result records', () => {

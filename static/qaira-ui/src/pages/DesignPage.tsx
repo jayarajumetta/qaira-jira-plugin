@@ -2,7 +2,7 @@ import { DragEvent, FormEvent, useEffect, useMemo, useRef, useState, type ReactN
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
-import { AddIcon, ClearSelectionIcon, EyeIcon, GridIcon, LayersIcon, SelectAllIcon } from "../components/AppIcons";
+import { AddIcon, ClearSelectionIcon, CollapseExpandIcon, EyeIcon, GridIcon, LayersIcon, SelectAllIcon } from "../components/AppIcons";
 import { CatalogSelectionControls } from "../components/CatalogSelectionControls";
 import { CreateRunActionButton } from "../components/CreateRunActionButton";
 import { CatalogViewToggle } from "../components/CatalogViewToggle";
@@ -353,7 +353,7 @@ export function DesignPage() {
   });
   const executionResultsQuery = useQuery({
     queryKey: ["design-case-results", appTypeId],
-    queryFn: () => api.executionResults.list({ app_type_id: appTypeId }),
+    queryFn: () => api.executionResults.list({ app_type_id: appTypeId, run_limit: 10, limit: 100 }),
     enabled: Boolean(appTypeId)
   });
   const selectedSuiteStepsQuery = useQuery({
@@ -1852,6 +1852,7 @@ export function DesignPage() {
             historyByCaseId={historyByCaseId}
             requirements={requirements}
             stepCountByCaseId={stepCountByCaseId}
+            moduleLabelByCaseId={suitePickerModuleLabelByCaseId}
             onSearch={setSearchTerm}
             onStatusFilter={setStatusFilter}
             onCasePriorityFilter={setCasePriorityFilter}
@@ -2287,14 +2288,14 @@ function SuiteSidebar({
                 const suiteTone = failedRunCount ? "is-risk" : !mappedCaseCount || coverageScore < 70 ? "is-warning" : "is-healthy";
                 const suiteInsightTone = failedRunCount ? "danger" : !mappedCaseCount || coverageScore < 70 ? "warning" : "success";
                 const suiteInsight = failedRunCount
-                  ? "AI: Recent suite runs show failed or blocked evidence. Review the unstable cases before release gating."
+                  ? "Signal: Recent suite runs show failed or blocked evidence. Review the unstable cases before release gating."
                   : !mappedCaseCount
-                    ? "AI: This suite is empty. Add reusable cases so the suite can become executable release coverage."
+                    ? "Signal: This suite is empty. Add reusable cases so the suite can become executable release coverage."
                     : coverageScore < 70
-                      ? "AI: Requirement coverage is thin. Link more mapped cases to requirements to improve traceability."
+                      ? "Signal: Requirement coverage is thin. Link more mapped cases to requirements to improve traceability."
                       : automationScore >= 70
-                        ? "AI: Strong suite candidate for scheduled regression because most mapped cases are automated."
-                        : "AI: Traceability is healthy. Automate the highest-repeat cases next to reduce manual run effort.";
+                        ? "Signal: Strong suite candidate for scheduled regression because most mapped cases are automated."
+                        : "Signal: Traceability is healthy. Automate the highest-repeat cases next to reduce manual run effort.";
 
                 return (
                   <button
@@ -2368,7 +2369,7 @@ function SuiteSidebar({
                           </div>
                         </div>
                         <div className={`test-case-ai-note ${suiteInsightTone}`}>
-                          <span aria-hidden="true">{failedRunCount ? "!" : "AI"}</span>
+                          <span aria-hidden="true">{failedRunCount ? "!" : "S"}</span>
                           <p>{suiteInsight}</p>
                         </div>
                       </div>
@@ -2416,6 +2417,7 @@ function TestCaseList({
   historyByCaseId,
   requirements,
   stepCountByCaseId,
+  moduleLabelByCaseId,
   onSearch,
   onStatusFilter,
   onCasePriorityFilter,
@@ -2449,6 +2451,7 @@ function TestCaseList({
   historyByCaseId: Record<string, ExecutionResult[]>;
   requirements: Requirement[];
   stepCountByCaseId: Record<string, number>;
+  moduleLabelByCaseId: Record<string, string>;
   onSearch: (value: string) => void;
   onStatusFilter: (value: string) => void;
   onCasePriorityFilter: (value: string) => void;
@@ -2469,6 +2472,17 @@ function TestCaseList({
   const [selectedCaseIds, setSelectedCaseIds] = useState<string[]>([]);
   const selectedCaseIdSet = useMemo(() => new Set(selectedCaseIds), [selectedCaseIds]);
   const areAllVisibleCasesSelected = Boolean(cases.length) && cases.every((testCase) => selectedCaseIdSet.has(testCase.id));
+  const moduleSummaries = useMemo(() => Object.entries(cases.reduce<Record<string, TestCase[]>>((groups, testCase) => {
+    const moduleName = moduleLabelByCaseId[testCase.id] || "Unassigned module";
+    groups[moduleName] = groups[moduleName] || [];
+    groups[moduleName].push(testCase);
+    return groups;
+  }, {})).map(([name, moduleCases]) => ({
+    name,
+    count: moduleCases.length,
+    automated: moduleCases.filter((testCase) => testCase.automated === "yes").length,
+    withRequirements: moduleCases.filter((testCase) => Boolean(testCase.requirement_ids?.length || testCase.requirement_id)).length
+  })), [cases, moduleLabelByCaseId]);
 
   useEffect(() => {
     setSelectedCaseIds([]);
@@ -2541,6 +2555,12 @@ function TestCaseList({
       }
     },
     {
+      key: "module",
+      label: "Module",
+      render: (testCase) => moduleLabelByCaseId[testCase.id] || "Unassigned module",
+      sortValue: (testCase) => moduleLabelByCaseId[testCase.id] || "Unassigned module"
+    },
+    {
       key: "automated",
       label: "Automated",
       render: (testCase) => (testCase.automated === "yes" ? "Yes" : "No")
@@ -2585,7 +2605,7 @@ function TestCaseList({
       label: "Runs",
       render: (testCase) => (historyByCaseId[testCase.id] || []).length
     }
-  ], [canUnlinkCases, defaultCaseStatus, historyByCaseId, requirements, selectedCaseIdSet, stepCountByCaseId]);
+  ], [canUnlinkCases, defaultCaseStatus, historyByCaseId, moduleLabelByCaseId, requirements, selectedCaseIdSet, stepCountByCaseId]);
 
   return (
     <Panel
@@ -2686,6 +2706,20 @@ function TestCaseList({
           <button className="primary-button" onClick={onCreateCase} type="button"><AddIcon />New Test Case</button>
         </div>
 
+        {selectedSuite && moduleSummaries.length ? (
+          <div className="suite-module-summary-strip" aria-label="Modules represented in this suite">
+            {moduleSummaries.map((module) => (
+              <div className="suite-module-summary" key={module.name}>
+                <LayersIcon />
+                <span>
+                  <strong>{module.name}</strong>
+                  <small>{module.count} cases · {module.automated} automated · {module.withRequirements} traced</small>
+                </span>
+              </div>
+            ))}
+          </div>
+        ) : null}
+
         <TileBrowserPane className="test-case-library-scroll">
           {isLoading ? <TileCardSkeletonGrid /> : null}
           {!isLoading && !cases.length ? (
@@ -2716,16 +2750,17 @@ function TestCaseList({
                   ? 100
                   : Math.min(96, Math.max(26, 36 + stepCount * 4 + (requirement ? 14 : 0) + (history.length ? 8 : 0) - failedRunCount * 6));
                 const caseTypeLabel = testCase.automated === "yes" ? "Auto" : "Manual";
+                const moduleLabel = moduleLabelByCaseId[testCase.id] || "Unassigned module";
                 const isRiskCase = failedRunCount > 0;
                 const isWarningCase = !requirement || stabilityScore < 60;
                 const aiInsightTone = isRiskCase ? "danger" : isWarningCase ? "warning" : "success";
                 const aiInsight = isRiskCase
-                  ? "AI: Recent suite evidence includes failed or blocked runs. Review this case before the suite is promoted."
+                  ? "Signal: Recent suite evidence includes failed or blocked runs. Review this case before the suite is promoted."
                   : !requirement
-                    ? "AI: Link this case to a requirement so the suite can report traceable coverage."
+                    ? "Signal: Link this case to a requirement so the suite can report traceable coverage."
                     : testCase.automated !== "yes" && automationReadiness >= 70
-                      ? "AI: This suite case is a strong automation candidate because its scope and steps are ready."
-                      : "AI: This case is healthy within the suite. Keep it ordered near related validation coverage.";
+                      ? "Signal: This suite case is a strong automation candidate because its scope and steps are ready."
+                      : "Signal: This case is healthy within the suite. Keep it ordered near related validation coverage.";
 
                 return (
                   <button
@@ -2777,6 +2812,7 @@ function TestCaseList({
 	                          <StatusBadge value={caseStatusLabel} />
 	                        </div>
 	                      </div>
+	                      <div className="suite-case-module-label"><LayersIcon /><span>{moduleLabel}</span></div>
 	                      <div className="test-case-requirement-block">
 	                        <span className="test-case-requirement-label">
 	                          <TileCardLinkIcon />
@@ -2824,7 +2860,7 @@ function TestCaseList({
                           </div>
                         </div>
                         <div className={`test-case-ai-note ${aiInsightTone}`}>
-                          <span aria-hidden="true">{isRiskCase ? "!" : "AI"}</span>
+                          <span aria-hidden="true">{isRiskCase ? "!" : "S"}</span>
                           <p>{aiInsight}</p>
                         </div>
                       </div>
@@ -3083,11 +3119,11 @@ function SuiteCaseEditorModal({
               <div className="step-editor step-editor--embedded">
                 {!isCreatingCase && displaySteps.length ? (
                   <div className="action-row">
-                    <button className="ghost-button" onClick={onExpandAllSteps} type="button">
-                      Expand all
+                    <button aria-label="Expand all steps" className="ghost-button explorer-icon-button" onClick={onExpandAllSteps} title="Expand all steps" type="button">
+                      <CollapseExpandIcon isExpanded={false} />
                     </button>
-                    <button className="ghost-button" onClick={onCollapseAllSteps} type="button">
-                      Collapse all
+                    <button aria-label="Collapse all steps" className="ghost-button explorer-icon-button" onClick={onCollapseAllSteps} title="Collapse all steps" type="button">
+                      <CollapseExpandIcon isExpanded={true} />
                     </button>
                   </div>
                 ) : null}
@@ -3231,6 +3267,7 @@ function EditorAccordionSection({
         aria-expanded={isExpanded}
         className="editor-accordion-toggle"
         onClick={onToggle}
+        title={isExpanded ? `Collapse ${title}` : `Expand ${title}`}
         type="button"
       >
         <div className="editor-accordion-toggle-main">
@@ -3244,7 +3281,7 @@ function EditorAccordionSection({
         </div>
         <div className="editor-accordion-toggle-meta">
           <span className="editor-accordion-toggle-count">{countLabel}</span>
-          <span className="editor-accordion-toggle-state">{isExpanded ? "Collapse" : "Expand"}</span>
+          <span aria-hidden="true" className="editor-accordion-toggle-state explorer-toggle-glyph"><CollapseExpandIcon isExpanded={isExpanded} /></span>
         </div>
       </button>
       {isExpanded ? <div className="editor-accordion-body">{children}</div> : null}

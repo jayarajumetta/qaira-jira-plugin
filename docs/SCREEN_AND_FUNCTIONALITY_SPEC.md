@@ -33,7 +33,7 @@ These are calculated from accessible Jira data. They are not a substitute for an
 
 - List and scoped JQL over configured Jira requirement issue types
 - Create/read/update/delete and import
-- Iteration grouping in `qaira.data.requirement-iterations.v1` shards
+- Jira Software Sprint grouping, creation, lifecycle dates/status, and story assignment; `qaira.data.requirement-iterations.v1` shards remain only as a compatibility mirror
 - Requirement/test/defect traceability through Jira links
 - Quality/coverage suggestions and test-candidate preview/accept workflows
 

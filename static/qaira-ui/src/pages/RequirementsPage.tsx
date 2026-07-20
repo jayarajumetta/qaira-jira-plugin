@@ -1,13 +1,13 @@
 import { ChangeEvent, CSSProperties, Dispatch, FormEvent, Fragment, ReactNode, SetStateAction, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useInfiniteQuery, useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
 import { AiDesignStudioModal } from "../components/AiDesignStudioModal";
 import { AiAssurancePanel } from "../components/AiAssurancePanel";
 import { AiInsightPreviewDialog, type AiPreviewFinding } from "../components/AiInsightPreviewDialog";
 import { AiPromptContextPanel } from "../components/AiPromptContextPanel";
-import { ActivityIcon, AddIcon, BugIcon, ClearSelectionIcon, ExportIcon, ImportIcon, IterationIcon, LayersIcon, OpenIcon, PencilIcon, SearchIcon, SelectAllIcon, SparkIcon, TrashIcon } from "../components/AppIcons";
+import { ActivityIcon, AddIcon, BugIcon, ClearSelectionIcon, CollapseExpandIcon, ExportIcon, FileAddIcon, ImportIcon, IterationIcon, LayersIcon, OpenIcon, PencilIcon, SearchIcon, SelectAllIcon, SparkIcon, TrashIcon } from "../components/AppIcons";
 import { CatalogActionMenu } from "../components/CatalogActionMenu";
 import { CatalogViewToggle } from "../components/CatalogViewToggle";
 import { CatalogSearchFilter } from "../components/CatalogSearchFilter";
@@ -19,9 +19,12 @@ import { ExternalReferencesField } from "../components/ExternalReferencesField";
 import { FormField } from "../components/FormField";
 import { InfoTooltip } from "../components/InfoTooltip";
 import { HierarchyMetricStrip } from "../components/HierarchyMetricStrip";
+import { HierarchyLoadMoreButton } from "../components/HierarchyLoadMoreButton";
 import { LinkedTestCaseModal } from "../components/LinkedTestCaseModal";
 import { LinkedDefectsPanel } from "../components/LinkedDefectsPanel";
 import { JiraAttachmentPanel } from "../components/JiraAttachmentPanel";
+import { JiraCommentsPanel } from "../components/JiraCommentsPanel";
+import { JiraRequiredFields } from "../components/JiraRequiredFields";
 import { LoadingState } from "../components/LoadingState";
 import { PageHeader } from "../components/PageHeader";
 import { Panel } from "../components/Panel";
@@ -43,7 +46,8 @@ import { useDeleteConfirmation } from "../components/DeleteConfirmationDialog";
 import { useCurrentAppType, useCurrentProject } from "../hooks/useCurrentProject";
 import { useDomainMetadata } from "../hooks/useDomainMetadata";
 import { useFeatureFlags } from "../hooks/useFeatureFlags";
-import { api, type JiraCreateFieldMetadata } from "../lib/api";
+import { api } from "../lib/api";
+import { isJiraCoreFieldRequired } from "../lib/jiraCreateMetadata";
 import { mergeAiReferenceImagesWithinBudget, parseExternalLinks, readImageFiles } from "../lib/aiDesignStudio";
 import { assessRequirementAiReadiness } from "../lib/aiAssurance";
 import { formatAuditTimestamp, resolveAuditUserLabel } from "../lib/auditDisplay";
@@ -56,7 +60,7 @@ import { deriveIterationHealth } from "../lib/hierarchyHealth";
 import { parseRequirementCsv } from "../lib/requirementImport";
 import { findByRoutableId, getRoutableId } from "../lib/urlSelection";
 import { readDefaultCatalogViewMode } from "../lib/viewPreferences";
-import type { AiDesignImageInput, AiDesignedTestCaseCandidate, Execution, ExecutionResult, Integration, Issue, Requirement, RequirementDefectLink, RequirementIteration, TestCase, User } from "../types";
+import type { AiDesignImageInput, AiDesignedTestCaseCandidate, Execution, ExecutionResult, Integration, Issue, Requirement, RequirementDefectLink, RequirementIteration, RequirementRelatedItem, TestCase, User } from "../types";
 
 type RequirementDraft = {
   title: string;
@@ -73,7 +77,7 @@ type RequirementDraft = {
 };
 
 type RequirementSectionKey = "details" | "library" | "defects" | "runHistory";
-type RequirementTraceabilityTab = "details" | "grounding" | "cases" | "defects" | "history" | "evidence";
+type RequirementTraceabilityTab = "details" | "related" | "comments" | "grounding" | "cases" | "defects" | "history" | "evidence";
 type RequirementCoverageFilter = "all" | "linked" | "unlinked";
 
 type RequirementCoverageMetric = {
@@ -111,7 +115,7 @@ const isRecoverableRequirementAiJob = (job: RequirementGenerationJob) => {
   return Number.isNaN(createdAt) || Date.now() - createdAt <= RECOVERABLE_REQUIREMENT_AI_JOB_WINDOW_MS;
 };
 
-const createEmptyRequirementDraft = (defaultStatus = "open"): RequirementDraft => ({
+const createEmptyRequirementDraft = (defaultStatus = "To Do"): RequirementDraft => ({
   title: "",
   description: "",
   externalReferencesText: "",
@@ -124,6 +128,39 @@ const createEmptyRequirementDraft = (defaultStatus = "open"): RequirementDraft =
   status: defaultStatus,
   additionalFields: {}
 });
+
+const toDateInputValue = (date: Date) => {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+};
+
+const defaultSprintDates = () => {
+  const start = new Date();
+  const end = new Date(start);
+  end.setDate(end.getDate() + 14);
+  return { start: toDateInputValue(start), end: toDateInputValue(end) };
+};
+
+const formatSprintShortDate = (value?: string | null) => {
+  const match = String(value || "").match(/^(\d{4})-(\d{2})-(\d{2})/);
+  return match ? `${match[2]}/${match[3]}` : "—";
+};
+
+const sprintDateRangeLabel = (start?: string | null, end?: string | null) => {
+  if (!start && !end) return "Dates not set";
+  return `${formatSprintShortDate(start)} – ${formatSprintShortDate(end)}`;
+};
+
+const sprintStateLabel = (state?: string | null) => ({
+  future: "Planned",
+  active: "Active",
+  closed: "Completed"
+})[String(state || "").toLowerCase()] || "Status unavailable";
+
+const sprintOptionLabel = (sprint: { name: string; state?: string | null; start_date?: string | null; end_date?: string | null }) =>
+  [sprint.name, sprintStateLabel(sprint.state), sprintDateRangeLabel(sprint.start_date, sprint.end_date)].join(" · ");
 
 const createDefaultRequirementSections = (): Record<RequirementSectionKey, boolean> => ({
   details: true,
@@ -196,6 +233,7 @@ type RequirementSplitAction = {
 function RequirementSplitActionButton({
   label,
   icon,
+  iconOnly = false,
   disabled,
   onClick,
   menuLabel,
@@ -203,6 +241,7 @@ function RequirementSplitActionButton({
 }: {
   label: string;
   icon: ReactNode;
+  iconOnly?: boolean;
   disabled?: boolean;
   onClick: () => void;
   menuLabel: string;
@@ -306,10 +345,10 @@ function RequirementSplitActionButton({
   ) : null;
 
   return (
-    <div className="create-run-action-button requirement-split-action-button" ref={triggerRef}>
-      <button className="run-action-main" disabled={disabled} onClick={onClick} type="button">
+    <div className={`create-run-action-button requirement-split-action-button${iconOnly ? " is-explorer-compact" : ""}`} ref={triggerRef}>
+      <button aria-label={iconOnly ? label : undefined} className="run-action-main" disabled={disabled} onClick={onClick} title={iconOnly ? label : undefined} type="button">
         {icon}
-        <span>{label}</span>
+        {iconOnly ? null : <span>{label}</span>}
       </button>
       <button
         aria-expanded={isOpen}
@@ -372,10 +411,18 @@ export function RequirementsPage() {
   const [deleteSelectedRequirementIds, setDeleteSelectedRequirementIds] = useState<string[]>([]);
   const [isDeletingSelectedRequirements, setIsDeletingSelectedRequirements] = useState(false);
   const [isCreateIterationModalOpen, setIsCreateIterationModalOpen] = useState(false);
+  const [editingIteration, setEditingIteration] = useState<RequirementIteration | null>(null);
   const [iterationDraftName, setIterationDraftName] = useState("");
   const [iterationDraftDescription, setIterationDraftDescription] = useState("");
+  const [iterationDraftBoardId, setIterationDraftBoardId] = useState("");
+  const [iterationDraftStartDate, setIterationDraftStartDate] = useState(() => defaultSprintDates().start);
+  const [iterationDraftEndDate, setIterationDraftEndDate] = useState(() => defaultSprintDates().end);
+  const [iterationDraftStatus, setIterationDraftStatus] = useState<"future" | "active">("future");
+  const [sprintDraftRequirementIds, setSprintDraftRequirementIds] = useState<string[]>([]);
   const [iterationRequirementSearch, setIterationRequirementSearch] = useState("");
   const [collapsedIterationIds, setCollapsedIterationIds] = useState<string[]>([]);
+  const [isSprintHierarchySeeded, setIsSprintHierarchySeeded] = useState(false);
+  const [sprintPageCursorsById, setSprintPageCursorsById] = useState<Record<string, Array<string | null>>>({});
   const [selectedIterationIds, setSelectedIterationIds] = useState<string[]>([]);
   const [draggingRequirementIds, setDraggingRequirementIds] = useState<string[]>([]);
   const [requirementSearchTerm, setRequirementSearchTerm] = useState("");
@@ -396,9 +443,17 @@ export function RequirementsPage() {
   const [isDefectSearchLoaded, setIsDefectSearchLoaded] = useState(false);
   const [message, setMessage] = useState("");
   const [messageTone, setMessageTone] = useState<"success" | "error">("success");
-  const defaultRequirementStatus = domainMetadataQuery.data?.requirements.default_status || "open";
-  const jiraSprints = domainMetadataQuery.data?.jira?.sprints || [];
-  const jiraVersions = (domainMetadataQuery.data?.jira?.versions || []).filter((version) => !version.archived);
+  const defaultRequirementStatus = domainMetadataQuery.data?.requirements.default_status || "To Do";
+  const jiraBoards = useMemo(() => domainMetadataQuery.data?.jira?.boards || [], [domainMetadataQuery.data?.jira?.boards]);
+  const jiraSprints = useMemo(() => domainMetadataQuery.data?.jira?.sprints || [], [domainMetadataQuery.data?.jira?.sprints]);
+  const assignableJiraSprints = useMemo(
+    () => jiraSprints.filter((sprint) => String(sprint.state || "").toLowerCase() !== "closed"),
+    [jiraSprints]
+  );
+  const jiraVersions = useMemo(
+    () => (domainMetadataQuery.data?.jira?.versions || []).filter((version) => !version.archived),
+    [domainMetadataQuery.data?.jira?.versions]
+  );
   const emptyRequirementDraft = useMemo(() => createEmptyRequirementDraft(defaultRequirementStatus), [defaultRequirementStatus]);
   const [draft, setDraft] = useState<RequirementDraft>(() => createEmptyRequirementDraft());
   const [isCreateModalOpen, setIsCreateModalOpen] = useState(false);
@@ -447,9 +502,11 @@ export function RequirementsPage() {
     queryFn: () => api.appTypes.list({ project_id: projectId }),
     enabled: Boolean(projectId)
   });
-  const requirementsQuery = useQuery({
+  const requirementsQuery = useInfiniteQuery({
     queryKey: ["requirements", projectId],
-    queryFn: () => api.requirements.list({ project_id: projectId, page_size: 25 }),
+    queryFn: ({ pageParam }) => api.requirements.listPage({ project_id: projectId, unassigned: true, page_size: 15, cursor: pageParam, projection: "summary" }),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (lastPage) => lastPage.next_cursor || undefined,
     enabled: Boolean(projectId)
   });
   const requirementDetailQuery = useQuery({
@@ -464,10 +521,67 @@ export function RequirementsPage() {
     enabled: Boolean(projectId && (isCreateModalOpen || (isOptimizeModalOpen && requirementAiMode === "create"))),
     staleTime: 5 * 60_000
   });
+  const requirementEditMetadataQuery = useQuery({
+    queryKey: ["requirement-edit-metadata", projectId, selectedRequirementId],
+    queryFn: () => api.requirements.editMetadata(selectedRequirementId, { project_id: projectId }),
+    enabled: Boolean(projectId && selectedRequirementId && canUpdateRequirements),
+    staleTime: 60_000
+  });
   const requirementIterationsQuery = useQuery({
     queryKey: ["requirement-iterations", projectId],
     queryFn: () => api.requirementIterations.list({ project_id: projectId }),
     enabled: Boolean(projectId && canViewRequirementIterations)
+  });
+  useEffect(() => {
+    if (!requirementIterationsQuery.data || isSprintHierarchySeeded) return;
+    setCollapsedIterationIds(requirementIterationsQuery.data.map((iteration) => iteration.id));
+    setIsSprintHierarchySeeded(true);
+  }, [isSprintHierarchySeeded, requirementIterationsQuery.data]);
+  useEffect(() => {
+    setIsSprintHierarchySeeded(false);
+    setCollapsedIterationIds([]);
+    setSprintPageCursorsById({});
+  }, [projectId]);
+  const expandedSprintHeaders = (requirementIterationsQuery.data || []).filter((iteration) =>
+    isSprintHierarchySeeded && !collapsedIterationIds.includes(iteration.id)
+  );
+  const sprintPageRequests = expandedSprintHeaders.flatMap((iteration) =>
+    (sprintPageCursorsById[iteration.id] || [null]).map((cursor, pageIndex) => ({ iteration, cursor, pageIndex }))
+  );
+  const sprintRequirementQueries = useQueries({
+    queries: sprintPageRequests.map(({ iteration, cursor, pageIndex }) => ({
+      queryKey: ["sprint-requirement-children", projectId, iteration.id, pageIndex, cursor || "first"],
+      queryFn: () => api.requirementIterations.listRequirements(iteration.id, { page_size: 25, cursor: cursor || undefined, projection: "summary" as const }),
+      staleTime: 30_000
+    }))
+  });
+  const sprintPageStateById = useMemo(() => sprintPageRequests.reduce<Record<string, { loaded: number; total: number; nextCursor: string | null; isFetching: boolean }>>((state, request, index) => {
+    const response = sprintRequirementQueries[index];
+    const current = state[request.iteration.id] || { loaded: 0, total: request.iteration.requirement_count || 0, nextCursor: null, isFetching: false };
+    current.loaded += response.data?.items.length || 0;
+    current.total = response.data?.total ?? current.total;
+    current.nextCursor = response.data?.next_cursor || null;
+    current.isFetching = current.isFetching || response.isFetching;
+    state[request.iteration.id] = current;
+    return state;
+  }, {}), [sprintPageRequests, sprintRequirementQueries]);
+  const loadNextSprintPage = (iterationId: string) => {
+    const nextCursor = sprintPageStateById[iterationId]?.nextCursor;
+    if (!nextCursor) return;
+    setSprintPageCursorsById((current) => ({
+      ...current,
+      [iterationId]: (current[iterationId] || [null]).includes(nextCursor)
+        ? (current[iterationId] || [null])
+        : [...(current[iterationId] || [null]), nextCursor]
+    }));
+  };
+  const requestedRequirementRouteId = searchParams.get("requirement") || "";
+  const requestedRequirementQuery = useQuery({
+    queryKey: ["requirement-route-detail", projectId, requestedRequirementRouteId],
+    queryFn: () => api.requirements.get(requestedRequirementRouteId, { project_id: projectId }),
+    enabled: Boolean(projectId && requestedRequirementRouteId),
+    staleTime: 30_000,
+    retry: false
   });
   const testCasesQuery = useQuery({
     queryKey: ["requirements-test-cases", projectId, appTypeId],
@@ -476,7 +590,7 @@ export function RequirementsPage() {
   });
   const executionResultsQuery = useQuery({
     queryKey: ["requirements-execution-results", projectId, appTypeId],
-    queryFn: () => api.executionResults.list({ app_type_id: appTypeId }),
+    queryFn: () => api.executionResults.list({ app_type_id: appTypeId, run_limit: 10, limit: 100 }),
     enabled: Boolean(appTypeId)
   });
   const executionsQuery = useQuery({
@@ -512,6 +626,10 @@ export function RequirementsPage() {
 
   const createRequirement = useMutation({ mutationFn: api.requirements.create });
   const createRequirementIteration = useMutation({ mutationFn: api.requirementIterations.create });
+  const updateRequirementIteration = useMutation({
+    mutationFn: ({ id, input }: { id: string; input: Parameters<typeof api.requirementIterations.update>[1] }) =>
+      api.requirementIterations.update(id, input)
+  });
   const assignRequirementsToIteration = useMutation({
     mutationFn: ({ id, requirementIds, append }: { id: string; requirementIds: string[]; append?: boolean }) =>
       api.requirementIterations.assignRequirements(id, requirementIds, append ?? true)
@@ -576,7 +694,16 @@ export function RequirementsPage() {
 
   const projects = projectsQuery.data || [];
   const appTypes = appTypesQuery.data || [];
-  const requirements = requirementsQuery.data || [];
+  const requirements = useMemo(() => {
+    const byId = new Map<string, Requirement>();
+    for (const requirement of requirementsQuery.data?.pages.flatMap((page) => page.items) || []) byId.set(requirement.id, requirement);
+    for (const query of sprintRequirementQueries) {
+      for (const requirement of query.data?.items || []) byId.set(requirement.id, requirement);
+    }
+    if (requestedRequirementQuery.data) byId.set(requestedRequirementQuery.data.id, requestedRequirementQuery.data);
+    if (requirementDetailQuery.data) byId.set(requirementDetailQuery.data.id, requirementDetailQuery.data);
+    return [...byId.values()];
+  }, [requirementDetailQuery.data, requestedRequirementQuery.data, requirementsQuery.data, sprintRequirementQueries]);
   const requirementIterations = requirementIterationsQuery.data || [];
   const testCases = testCasesQuery.data || [];
   const executionResults = executionResultsQuery.data || [];
@@ -587,157 +714,30 @@ export function RequirementsPage() {
   const integrations = integrationsQuery.data || [];
   const users = (usersQuery.data || []) as User[];
   const requiredJiraRequirementFields = requirementCreateMetadataQuery.data?.required_fields || [];
-  const updateAdditionalRequirementField = (fieldId: string, value: unknown) => {
-    setCreateDraft((current) => ({
+  const requiredJiraRequirementEditFields = requirementEditMetadataQuery.data?.required_fields || [];
+  const jiraRequirementCoreRequired = {
+    description: isJiraCoreFieldRequired(requirementCreateMetadataQuery.data, "description"),
+    priority: isJiraCoreFieldRequired(requirementCreateMetadataQuery.data, "priority"),
+    labels: isJiraCoreFieldRequired(requirementCreateMetadataQuery.data, "labels"),
+    sprint: isJiraCoreFieldRequired(requirementCreateMetadataQuery.data, "sprint"),
+    release: isJiraCoreFieldRequired(requirementCreateMetadataQuery.data, "fixVersions", "versions")
+  };
+  const jiraRequirementEditCoreRequired = {
+    description: isJiraCoreFieldRequired(requirementEditMetadataQuery.data, "description"),
+    priority: isJiraCoreFieldRequired(requirementEditMetadataQuery.data, "priority"),
+    labels: isJiraCoreFieldRequired(requirementEditMetadataQuery.data, "labels"),
+    sprint: isJiraCoreFieldRequired(requirementEditMetadataQuery.data, "sprint"),
+    release: isJiraCoreFieldRequired(requirementEditMetadataQuery.data, "fixVersions", "versions")
+  };
+  const updateAdditionalRequirementField = (target: "create" | "edit", fieldId: string, value: unknown) => {
+    const setter = target === "create" ? setCreateDraft : setDraft;
+    setter((current) => ({
       ...current,
       additionalFields: {
         ...current.additionalFields,
         [fieldId]: value
       }
     }));
-  };
-  const renderAdditionalRequirementField = (field: JiraCreateFieldMetadata) => {
-    const schemaType = String(field.schema?.type || "").toLowerCase();
-    const itemType = String(field.schema?.items || "").toLowerCase();
-    const customType = String(field.schema?.custom || "").toLowerCase();
-    const allowedValues = field.allowed_values || [];
-    const value = createDraft.additionalFields[field.id];
-
-    if (allowedValues.length && (schemaType === "array" || itemType)) {
-      const selectedValues = Array.isArray(value) ? value.map(String) : [];
-      return (
-        <FormField
-          hint={`Required by Jira Story create metadata. Field ID: ${field.id}`}
-          key={field.id}
-          label={field.name}
-          required
-        >
-          <select
-            multiple
-            onChange={(event) => updateAdditionalRequirementField(field.id, Array.from(event.currentTarget.selectedOptions, (option) => option.value))}
-            size={Math.min(6, Math.max(3, allowedValues.length))}
-            value={selectedValues}
-          >
-            {allowedValues.map((option) => (
-              <option key={option.id || option.value || option.name || option.label} value={option.id || option.value || option.name || option.label || ""}>
-                {option.label || option.name || option.value || option.id}
-              </option>
-            ))}
-          </select>
-        </FormField>
-      );
-    }
-
-    if (allowedValues.length) {
-      return (
-        <FormField
-          hint={`Required by Jira Story create metadata. Field ID: ${field.id}`}
-          key={field.id}
-          label={field.name}
-          required
-        >
-          <select value={String(value || "")} onChange={(event) => updateAdditionalRequirementField(field.id, event.target.value)}>
-            <option value="">Select {field.name}</option>
-            {allowedValues.map((option) => (
-              <option key={option.id || option.value || option.name || option.label} value={option.id || option.value || option.name || option.label || ""}>
-                {option.label || option.name || option.value || option.id}
-              </option>
-            ))}
-          </select>
-        </FormField>
-      );
-    }
-
-    if (schemaType === "array" && itemType === "user") {
-      const selectedValues = Array.isArray(value) ? value.map(String) : [];
-      return (
-        <FormField
-          hint={`Required by Jira Story create metadata. Field ID: ${field.id}`}
-          key={field.id}
-          label={field.name}
-          required
-        >
-          <select
-            multiple
-            onChange={(event) => updateAdditionalRequirementField(field.id, Array.from(event.currentTarget.selectedOptions, (option) => option.value))}
-            size={Math.min(6, Math.max(3, users.length || 3))}
-            value={selectedValues}
-          >
-            {users.map((user) => (
-              <option key={user.id} value={user.id}>{user.name || user.email || user.id}</option>
-            ))}
-          </select>
-        </FormField>
-      );
-    }
-
-    if (schemaType === "user") {
-      return (
-        <FormField
-          hint={`Required by Jira Story create metadata. Field ID: ${field.id}`}
-          key={field.id}
-          label={field.name}
-          required
-        >
-          <select value={String(value || "")} onChange={(event) => updateAdditionalRequirementField(field.id, event.target.value)}>
-            <option value="">Select user</option>
-            {users.map((user) => (
-              <option key={user.id} value={user.id}>{user.name || user.email || user.id}</option>
-            ))}
-          </select>
-        </FormField>
-      );
-    }
-
-    if (schemaType === "number") {
-      return (
-        <FormField
-          hint={`Required by Jira Story create metadata. Field ID: ${field.id}`}
-          key={field.id}
-          label={field.name}
-          required
-        >
-          <input type="number" value={String(value || "")} onChange={(event) => updateAdditionalRequirementField(field.id, event.target.value)} />
-        </FormField>
-      );
-    }
-
-    if (schemaType === "date" || schemaType === "datetime") {
-      return (
-        <FormField
-          hint={`Required by Jira Story create metadata. Field ID: ${field.id}`}
-          key={field.id}
-          label={field.name}
-          required
-        >
-          <input type={schemaType === "date" ? "date" : "datetime-local"} value={String(value || "")} onChange={(event) => updateAdditionalRequirementField(field.id, event.target.value)} />
-        </FormField>
-      );
-    }
-
-    if (customType.includes(":textarea")) {
-      return (
-        <FormField
-          hint={`Required by Jira Story create metadata. Field ID: ${field.id}`}
-          key={field.id}
-          label={field.name}
-          required
-        >
-          <textarea rows={4} value={String(value || "")} onChange={(event) => updateAdditionalRequirementField(field.id, event.target.value)} />
-        </FormField>
-      );
-    }
-
-    return (
-      <FormField
-        hint={`Required by Jira Story create metadata. Field ID: ${field.id}`}
-        key={field.id}
-        label={field.name}
-        required
-      >
-        <input value={String(value || "")} onChange={(event) => updateAdditionalRequirementField(field.id, event.target.value)} />
-      </FormField>
-    );
   };
   const userById = useMemo(
     () =>
@@ -994,17 +994,13 @@ export function RequirementsPage() {
 
   const requirementIterationById = useMemo(() => {
     const map = new Map<string, RequirementIteration>();
-
-    requirementIterations.forEach((iteration) => {
-      (iteration.requirement_ids || []).forEach((requirementId) => {
-        map.set(requirementId, iteration);
-      });
-    });
-
     requirements.forEach((requirement) => {
-      const iteration = requirement.iteration_id
-        ? requirementIterations.find((item) => item.id === requirement.iteration_id)
-        : null;
+      const iteration = requirementIterations.find((item) =>
+        (item.requirement_ids || []).includes(requirement.id)
+        || Boolean(requirement.iteration_id && item.id === requirement.iteration_id)
+        || Boolean(requirement.sprint_id && item.jira_sprint_id && String(requirement.sprint_id) === String(item.jira_sprint_id))
+        || Boolean(!requirement.sprint_id && requirement.sprint && [item.jira_sprint_name, item.name].some((name) => name === requirement.sprint))
+      );
 
       if (iteration) {
         map.set(requirement.id, iteration);
@@ -1086,6 +1082,7 @@ export function RequirementsPage() {
             id: issue.id,
             title: issue.title,
             status: issue.status,
+            status_category: issue.status_category,
             severity: "severity" in issue ? issue.severity : linkedDefects.find((defect) => defect.id === issue.id)?.severity,
             priority: "priority" in issue ? issue.priority : linkedDefects.find((defect) => defect.id === issue.id)?.priority,
             link_source: "link_source" in issue ? issue.link_source : linkedDefects.find((defect) => defect.id === issue.id)?.link_source,
@@ -1100,12 +1097,20 @@ export function RequirementsPage() {
 
   const bugResolutionByRequirementId = useMemo(() => {
     const coverage: Record<string, RequirementCoverageMetric> = {};
-    const openStatus = domainMetadataQuery.data?.issues.default_status || "open";
+    const statusCategoryByName = new Map(
+      (domainMetadataQuery.data?.issues.statuses || []).map((status) => [
+        status.value.toLowerCase(),
+        String(status.category_key || status.category_name || "").toLowerCase()
+      ])
+    );
 
     requirements.forEach((requirement) => {
       const defects = defectsByRequirementId[requirement.id] || [];
       const total = defects.length;
-      const covered = defects.filter((defect) => (defect.status || openStatus) !== openStatus).length;
+      const covered = defects.filter((defect) => {
+        const category = String(defect.status_category || statusCategoryByName.get(String(defect.status || "").toLowerCase()) || "").toLowerCase();
+        return category === "done";
+      }).length;
 
       coverage[requirement.id] = {
         total,
@@ -1115,7 +1120,7 @@ export function RequirementsPage() {
     });
 
     return coverage;
-  }, [defectsByRequirementId, domainMetadataQuery.data?.issues.default_status, requirements]);
+  }, [defectsByRequirementId, domainMetadataQuery.data?.issues.statuses, requirements]);
 
   const executionById = useMemo(
     () => new Map(executions.map((execution) => [execution.id, execution])),
@@ -1180,6 +1185,18 @@ export function RequirementsPage() {
       ])).sort((left, right) => left.localeCompare(right)),
     [defaultRequirementStatus, predefinedRequirementStatuses, requirements]
   );
+  const createRequirementStatusOptions = useMemo(() => {
+    const workflowOptions = requirementCreateMetadataQuery.data?.workflow_statuses?.statuses || [];
+    const baseOptions = workflowOptions.length ? workflowOptions : predefinedRequirementStatuses;
+    if (!createDraft.status || baseOptions.some((option) => option.value === createDraft.status)) return baseOptions;
+    return [{ value: createDraft.status, label: createDraft.status }, ...baseOptions];
+  }, [createDraft.status, predefinedRequirementStatuses, requirementCreateMetadataQuery.data?.workflow_statuses?.statuses]);
+  const editRequirementStatusOptions = useMemo(() => {
+    const workflowOptions = requirementEditMetadataQuery.data?.workflow_statuses?.statuses || [];
+    const baseOptions = workflowOptions.length ? workflowOptions : predefinedRequirementStatuses;
+    if (!draft.status || baseOptions.some((option) => option.value === draft.status)) return baseOptions;
+    return [{ value: draft.status, label: draft.status, current: true }, ...baseOptions];
+  }, [draft.status, predefinedRequirementStatuses, requirementEditMetadataQuery.data?.workflow_statuses?.statuses]);
   const requirementPriorityOptions = useMemo(
     () =>
       Array.from(new Set(requirements.map((item) => String(item.priority ?? 3)))).sort((left, right) => Number(left) - Number(right)),
@@ -1302,21 +1319,26 @@ export function RequirementsPage() {
   }, [defaultRequirementStatus, iterationRequirementSearch, requirementIterationById, requirements]);
 
   const areAllIterationRequirementsSelected = Boolean(iterationRequirementOptions.length)
-    && iterationRequirementOptions.every((item) => deleteSelectedRequirementIds.includes(item.id));
+    && iterationRequirementOptions.every((item) => sprintDraftRequirementIds.includes(item.id));
 
   const requirementIterationGroups = useMemo(() => {
-    const filteredById = new Map(filteredRequirements.map((requirement) => [requirement.id, requirement]));
-    const groups = requirementIterations.map((iteration) => ({
-      iteration,
-      requirements: (iteration.requirement_ids || [])
-        .map((requirementId) => filteredById.get(requirementId))
-        .filter(Boolean) as Requirement[]
-    }));
-    const assignedRequirementIds = new Set(groups.flatMap((group) => group.iteration.requirement_ids || []));
-    const validIterationIds = new Set(requirementIterations.map((iteration) => iteration.id));
-    const unassignedRequirements = filteredRequirements.filter((requirement) =>
-      !assignedRequirementIds.has(requirement.id) && (!requirement.iteration_id || !validIterationIds.has(requirement.iteration_id))
+    const assignedRequirementIds = new Set<string>();
+    const groups = requirementIterations.map((iteration) => {
+      const locallyAssignedIds = new Set((iteration.requirement_ids || []).map(String));
+      const groupRequirements = filteredRequirements.filter((requirement) => {
+        if (assignedRequirementIds.has(requirement.id)) return false;
+        const matches = locallyAssignedIds.has(requirement.id)
+          || Boolean(requirement.iteration_id && requirement.iteration_id === iteration.id)
+          || Boolean(requirement.sprint_id && iteration.jira_sprint_id && String(requirement.sprint_id) === String(iteration.jira_sprint_id))
+          || Boolean(!requirement.sprint_id && requirement.sprint && [iteration.jira_sprint_name, iteration.name].some((name) => name === requirement.sprint));
+        if (matches) assignedRequirementIds.add(requirement.id);
+        return matches;
+      });
+      return { iteration, requirements: groupRequirements };
+    }).filter(({ iteration, requirements: groupRequirements }) =>
+      String(iteration.state || iteration.status || "").toLowerCase() !== "closed" || groupRequirements.length > 0
     );
+    const unassignedRequirements = filteredRequirements.filter((requirement) => !assignedRequirementIds.has(requirement.id));
 
     return { groups, unassignedRequirements };
   }, [filteredRequirements, requirementIterations]);
@@ -1346,7 +1368,7 @@ export function RequirementsPage() {
     };
     const derive = (items: Requirement[]) => deriveIterationHealth(items.map((item) => ({
       priority: item.priority,
-      status: item.status || defaultRequirementStatus,
+      status: item.status_category || item.status || defaultRequirementStatus,
       linkedCaseCount: (linkedCaseIdsByRequirementId[item.id] || []).length,
       passPercent: passCoverageByRequirementId[item.id]?.percent || 0,
       automationPercent: automationCoverageByRequirementId[item.id]?.percent || 0,
@@ -1372,41 +1394,63 @@ export function RequirementsPage() {
   const renderIterationMetrics = (health: ReturnType<typeof deriveIterationHealth>) => (
     <HierarchyMetricStrip
       count={health.count}
-      noun="requirement"
+      noun="story"
       metrics={[
+        {
+          label: "Done",
+          value: `${health.completionPercent}%`,
+          tone: health.completionPercent >= 80 ? "success" : health.completionPercent >= 50 ? "warning" : "neutral",
+          title: `${health.completedRequirementCount}/${health.count} stories are in a completed Jira workflow status.`
+        },
         {
           label: "Coverage",
           value: `${health.coveragePercent}%`,
           tone: health.coveragePercent >= 80 ? "success" : health.coveragePercent >= 50 ? "warning" : "danger",
-          title: `${health.count - health.zeroCoverageCount}/${health.count} requirements have at least one linked test case. Zero coverage: ${health.zeroCoverageCount}.`
+          title: `${health.count - health.zeroCoverageCount}/${health.count} stories have at least one linked test case. Zero coverage: ${health.zeroCoverageCount}.`
         },
         {
-          label: "Execution",
-          value: `${health.executionPercent}%`,
-          tone: health.executionPercent >= 80 ? "success" : health.executionPercent >= 50 ? "warning" : "danger",
-          title: `${health.executedCaseCount}/${health.plannedCaseCount} planned linked test cases have a latest pass/fail/blocked result. Blocked/not-run: ${health.blockedNotRunPercent}%.`
-        },
-        {
-          label: "Pass rate",
-          value: `${health.passRatePercent}%`,
-          tone: health.passRatePercent >= 85 ? "success" : health.passRatePercent >= 65 ? "warning" : "danger",
+          label: "Run pass",
+          value: health.executedCaseCount ? `${health.passRatePercent}%` : "—",
+          tone: !health.executedCaseCount ? "neutral" : health.passRatePercent >= 85 ? "success" : health.passRatePercent >= 65 ? "warning" : "danger",
           title: `${health.passedCaseCount}/${health.executedCaseCount} executed cases passed. Fail rate: ${health.failRatePercent}%; blocked: ${health.blockedCaseCount}; not run: ${health.notRunCaseCount}.`
         },
         {
-          label: "P1/P2 bugs",
-          value: health.openHighDefectCount,
-          tone: health.openHighDefectCount ? "danger" : "success",
-          title: `Open critical/high Jira Bugs linked to this scope. Total defects: ${health.totalDefectCount}; density: ${health.defectDensityPerRequirement}/requirement, ${health.defectDensityPerTenCases}/10 test cases.`
-        },
-        {
-          label: "Req risk",
+          label: "At risk",
           value: health.requirementsAtRisk,
           tone: health.requirementsAtRisk ? "danger" : "success",
-          title: `Requirements at risk are uncovered, have failed/blocked linked cases, have open critical/high defects, or weak high-priority readiness. Passed: ${health.requirementsPassed}; failed: ${health.requirementsFailed}.`
+          title: `At-risk stories are uncovered, have failed or blocked linked cases, open P1/P2 bugs, or weak high-priority readiness. P1/P2 bugs: ${health.openHighDefectCount}; total bugs: ${health.totalDefectCount}.`
         }
       ]}
     />
   );
+  const renderDeferredSprintMetrics = (count: number) => (
+    <HierarchyMetricStrip
+      count={count}
+      noun="story"
+      metrics={[{ label: "Metrics", value: "On expand", tone: "neutral", title: "Open this Sprint to load its bounded Story page and calculate live Sprint metrics." }]}
+    />
+  );
+
+  const renderSprintIdentity = (iteration: RequirementIteration) => {
+    const state = String(iteration.state || iteration.status || "unknown").toLowerCase();
+    const goal = richTextToPlainText(iteration.goal || iteration.description).trim();
+    return (
+      <div className="requirement-sprint-identity">
+        <span className="module-folder-icon"><IterationIcon /></span>
+        <div className="requirement-sprint-copy">
+          <div className="requirement-sprint-heading">
+            <strong>{iteration.name}</strong>
+            <span className={`requirement-sprint-status is-${state}`}>{sprintStateLabel(state)}</span>
+          </div>
+          <div className="requirement-sprint-meta">
+            <span className="requirement-sprint-dates">{sprintDateRangeLabel(iteration.start_date, iteration.end_date)}</span>
+            {iteration.board_name ? <span title="Jira board">{iteration.board_name}</span> : null}
+          </div>
+          {goal ? <span className="requirement-sprint-goal" title={goal}>{goal}</span> : null}
+        </div>
+      </div>
+    );
+  };
 
   const iterationTileEntries = useMemo(() => {
     const entries: Array<
@@ -1426,13 +1470,13 @@ export function RequirementsPage() {
       }
     });
 
-    if (requirementIterationGroups.unassignedRequirements.length) {
+    if (requirementIterationGroups.unassignedRequirements.length || requirementsQuery.hasNextPage) {
       entries.push({ kind: "unassigned", count: requirementIterationGroups.unassignedRequirements.length });
       requirementIterationGroups.unassignedRequirements.forEach((requirement) => entries.push({ kind: "requirement", requirement }));
     }
 
     return entries;
-  }, [collapsedIterationIds, requirementIterationGroups, requirementSearchTerm]);
+  }, [collapsedIterationIds, requirementIterationGroups, requirementSearchTerm, requirementsQuery.hasNextPage]);
 
   const activeRequirementFilterCount =
     Number(requirementStatusFilter !== "all") +
@@ -1446,7 +1490,9 @@ export function RequirementsPage() {
   const areAllFilteredRequirementsSelected =
     (filteredRequirements.length > 0 || requirementIterationGroups.groups.length > 0)
     && filteredRequirements.every((item) => deleteSelectedRequirementIds.includes(item.id))
-    && requirementIterationGroups.groups.every(({ iteration }) => selectedIterationIds.includes(iteration.id));
+    && requirementIterationGroups.groups
+      .filter(({ iteration }) => iteration.source !== "jira")
+      .every(({ iteration }) => selectedIterationIds.includes(iteration.id));
 
   const selectedExportRequirements = useMemo(
     () => requirements.filter((item) => deleteSelectedRequirementIds.includes(item.id)),
@@ -1465,7 +1511,9 @@ export function RequirementsPage() {
 
   const setAllFilteredRequirementItemsSelected = (checked: boolean) => {
     const requirementIds = filteredRequirements.map((item) => item.id);
-    const iterationIds = requirementIterationGroups.groups.map(({ iteration }) => iteration.id);
+    const iterationIds = requirementIterationGroups.groups
+      .filter(({ iteration }) => iteration.source !== "jira")
+      .map(({ iteration }) => iteration.id);
 
     setRequirementIdsSelected(requirementIds, checked);
     setSelectedIterationIds((current) => checked
@@ -1475,9 +1523,11 @@ export function RequirementsPage() {
 
   const setIterationAndChildrenSelected = (iteration: RequirementIteration, checked: boolean) => {
     const requirementIds = getVisibleIterationRequirementIds(iteration.id);
-    setSelectedIterationIds((current) => checked
-      ? [...new Set([...current, iteration.id])]
-      : current.filter((id) => id !== iteration.id));
+    setSelectedIterationIds((current) => iteration.source === "jira"
+      ? current.filter((id) => id !== iteration.id)
+      : checked
+        ? [...new Set([...current, iteration.id])]
+        : current.filter((id) => id !== iteration.id));
     setRequirementIdsSelected(requirementIds, checked);
   };
 
@@ -1566,7 +1616,8 @@ export function RequirementsPage() {
     {
       key: "sprint",
       label: "Sprint",
-      defaultVisible: false,
+      canToggle: false,
+      defaultVisible: true,
       sortValue: (item) => item.sprint || "",
       render: (item) => item.sprint || "—"
     },
@@ -1583,14 +1634,6 @@ export function RequirementsPage() {
       defaultVisible: false,
       sortValue: (item) => item.release || "",
       render: (item) => item.release || "—"
-    },
-    {
-      key: "iteration",
-      label: "Iteration",
-      canToggle: false,
-      defaultVisible: true,
-      sortValue: (item) => requirementIterationById.get(item.id)?.name || "Unassigned",
-      render: (item) => requirementIterationById.get(item.id)?.name || "Unassigned"
     },
     {
       key: "status",
@@ -1866,7 +1909,10 @@ export function RequirementsPage() {
       description: selectedRequirement.description || "",
       externalReferencesText: formatReferenceList(selectedRequirement.external_references),
       labelsText: formatReferenceList(selectedRequirement.labels),
-      sprint: selectedRequirement.sprint || "",
+      sprint: selectedRequirement.sprint_id
+        || jiraSprints.find((sprint) => sprint.name === selectedRequirement.sprint)?.id
+        || selectedRequirement.sprint
+        || "",
       fixVersion: selectedRequirement.fix_version || "",
       release: selectedRequirement.release || "",
       iterationId: selectedRequirement.iteration_id || requirementIterationById.get(selectedRequirement.id)?.id || "",
@@ -1876,7 +1922,15 @@ export function RequirementsPage() {
     });
     setSelectedTestCaseIds(selectedRequirement.test_case_ids || []);
     setSelectedDefectIds(selectedRequirement.defect_ids || []);
-  }, [defaultRequirementStatus, emptyRequirementDraft, requirementIterationById, selectedRequirement]);
+  }, [defaultRequirementStatus, emptyRequirementDraft, jiraSprints, requirementIterationById, selectedRequirement]);
+
+  useEffect(() => {
+    if (!selectedRequirement || !requirementEditMetadataQuery.data) return;
+    setDraft((current) => ({
+      ...current,
+      additionalFields: { ...(requirementEditMetadataQuery.data.current_values || {}) }
+    }));
+  }, [requirementEditMetadataQuery.data, selectedRequirement]);
 
   useEffect(() => {
     setExpandedSections(createDefaultRequirementSections());
@@ -1946,6 +2000,7 @@ export function RequirementsPage() {
       queryClient.invalidateQueries({ queryKey: ["requirements-execution-results", projectId, appTypeId] }),
       queryClient.invalidateQueries({ queryKey: ["requirements-executions", projectId, appTypeId] }),
       queryClient.invalidateQueries({ queryKey: ["requirements-issues", projectId] }),
+      queryClient.invalidateQueries({ queryKey: ["domain-metadata"] }),
       queryClient.invalidateQueries({ queryKey: ["test-cases"] }),
       queryClient.invalidateQueries({ queryKey: ["workspace-transactions"] }),
       queryClient.invalidateQueries({ queryKey: ["workspace-transaction-events"] })
@@ -2033,6 +2088,16 @@ export function RequirementsPage() {
       return;
     }
 
+    if (requirementCreateMetadataQuery.isError) {
+      showError(null, "Qaira could not verify this Jira Story create screen. Refresh the form or ask a Jira administrator to check the app field-metadata permission.");
+      return;
+    }
+
+    if (jiraRequirementCoreRequired.description && !richTextToPlainText(createDraft.description).trim()) {
+      showError(null, "Jira requires a description for this Story type.");
+      return;
+    }
+
     try {
       const response = await createRequirement.mutateAsync({
         project_id: projectId,
@@ -2043,7 +2108,6 @@ export function RequirementsPage() {
         sprint: createDraft.sprint || undefined,
         fix_version: createDraft.fixVersion || undefined,
         release: createDraft.release || undefined,
-        iteration_id: createDraft.iterationId || undefined,
         priority: createDraft.priority,
         status: createDraft.status,
         additional_fields: createDraft.additionalFields
@@ -2063,34 +2127,81 @@ export function RequirementsPage() {
     }
   };
 
-  const handleCreateIteration = async (event: FormEvent<HTMLFormElement>) => {
+  const openEditIteration = (iteration: RequirementIteration) => {
+    setEditingIteration(iteration);
+    setIterationRequirementSearch("");
+    setIterationDraftName(iteration.name);
+    setIterationDraftDescription(iteration.description || iteration.goal || "");
+    setIterationDraftBoardId(iteration.board_id || jiraBoards[0]?.id || "");
+    setIterationDraftStartDate(String(iteration.start_date || "").slice(0, 10));
+    setIterationDraftEndDate(String(iteration.end_date || "").slice(0, 10));
+    setIterationDraftStatus(String(iteration.state || iteration.status || "future").toLowerCase() === "active" ? "active" : "future");
+    setSprintDraftRequirementIds([]);
+    setIsCreateIterationModalOpen(true);
+  };
+
+  const handleSaveIteration = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
 
-    if (!canCreateRequirementIterations) {
-      showError(null, "Permission required: requirement_iteration.create");
+    if (editingIteration ? !canUpdateRequirementIterations : !canCreateRequirementIterations) {
+      showError(null, `Permission required: requirement_iteration.${editingIteration ? "update" : "create"}`);
       return;
     }
 
-    if (!projectId || !iterationDraftName.trim()) {
+    if (!projectId || !iterationDraftName.trim() || (!editingIteration && !iterationDraftBoardId) || !iterationDraftStartDate || !iterationDraftEndDate) {
+      return;
+    }
+
+    if (iterationDraftEndDate <= iterationDraftStartDate) {
+      showError(null, "Sprint end date must be after its start date.");
       return;
     }
 
     try {
+      if (editingIteration) {
+        await updateRequirementIteration.mutateAsync({
+          id: editingIteration.id,
+          input: {
+            name: iterationDraftName.trim(),
+            description: iterationDraftDescription.trim(),
+            goal: richTextToPlainText(iterationDraftDescription).trim(),
+            start_date: iterationDraftStartDate,
+            end_date: iterationDraftEndDate,
+            state: iterationDraftStatus
+          }
+        });
+        setEditingIteration(null);
+        setIsCreateIterationModalOpen(false);
+        showSuccess("Sprint updated in Jira.");
+        await refresh();
+        return;
+      }
       const response = await createRequirementIteration.mutateAsync({
         project_id: projectId,
         name: iterationDraftName.trim(),
         description: iterationDraftDescription.trim() || undefined,
-        requirement_ids: deleteSelectedRequirementIds
+        goal: richTextToPlainText(iterationDraftDescription).trim() || undefined,
+        board_id: iterationDraftBoardId,
+        start_date: iterationDraftStartDate,
+        end_date: iterationDraftEndDate,
+        state: iterationDraftStatus,
+        requirement_ids: sprintDraftRequirementIds
       });
       setIterationDraftName("");
       setIterationDraftDescription("");
+      setIterationDraftStatus("future");
+      const nextDates = defaultSprintDates();
+      setIterationDraftStartDate(nextDates.start);
+      setIterationDraftEndDate(nextDates.end);
+      setSprintDraftRequirementIds([]);
+      setEditingIteration(null);
       setIsCreateIterationModalOpen(false);
       setCollapsedIterationIds((current) => current.filter((id) => id !== response.id));
       setDeleteSelectedRequirementIds([]);
-      showSuccess("Iteration created.");
+      showSuccess("Sprint created in Jira.");
       await refresh();
     } catch (error) {
-      showError(error, "Unable to create iteration");
+      showError(error, editingIteration ? "Unable to update sprint" : "Unable to create sprint");
     }
   };
 
@@ -2104,10 +2215,10 @@ export function RequirementsPage() {
       const movedCount = draggingRequirementIds.length;
       setDraggingRequirementIds([]);
       setCollapsedIterationIds((current) => current.filter((id) => id !== iterationId));
-      showSuccess(`${movedCount} requirement${movedCount === 1 ? "" : "s"} moved into iteration.`);
+      showSuccess(`${movedCount} ${movedCount === 1 ? "story" : "stories"} moved into sprint.`);
       await refresh();
     } catch (error) {
-      showError(error, "Unable to move requirement into iteration");
+      showError(error, "Unable to move story into sprint");
     }
   };
 
@@ -2117,7 +2228,7 @@ export function RequirementsPage() {
     }
 
     const confirmed = await confirmDelete({
-      message: `Delete ${selectedIterationIds.length} iteration${selectedIterationIds.length === 1 ? "" : "s"}? Requirements will stay available as unassigned requirements.`
+      message: `Delete ${selectedIterationIds.length} legacy sprint group${selectedIterationIds.length === 1 ? "" : "s"}? Stories will stay available in the backlog.`
     });
 
     if (!confirmed) {
@@ -2127,10 +2238,10 @@ export function RequirementsPage() {
     try {
       await Promise.all(selectedIterationIds.map((iterationId) => deleteRequirementIteration.mutateAsync(iterationId)));
       setSelectedIterationIds([]);
-      showSuccess("Selected iteration deleted.");
+      showSuccess("Selected legacy sprint group deleted.");
       await refresh();
     } catch (error) {
-      showError(error, "Unable to delete selected iterations");
+      showError(error, "Unable to delete selected sprint groups");
     }
   };
 
@@ -2149,10 +2260,10 @@ export function RequirementsPage() {
 
     const parts = [
       selectedRequirements.length ? `${selectedRequirements.length} requirement${selectedRequirements.length === 1 ? "" : "s"}` : "",
-      selectedIterations.length ? `${selectedIterations.length} iteration${selectedIterations.length === 1 ? "" : "s"}` : ""
+      selectedIterations.length ? `${selectedIterations.length} legacy sprint group${selectedIterations.length === 1 ? "" : "s"}` : ""
     ].filter(Boolean);
     const confirmed = await confirmDelete({
-      message: `Delete ${parts.join(" and ")}? Linked test cases stay available; only requirements not selected for deletion remain unassigned when an iteration is removed.`
+      message: `Delete ${parts.join(" and ")}? Linked test cases stay available; stories not selected for deletion return to the backlog when a legacy sprint group is removed.`
     });
 
     if (!confirmed) {
@@ -2190,11 +2301,11 @@ export function RequirementsPage() {
 
       if (failedCount) {
         setMessageTone("error");
-        setMessage(`${deletedRequirementIds.length} requirement${deletedRequirementIds.length === 1 ? "" : "s"} and ${deletedIterationIds.length} iteration${deletedIterationIds.length === 1 ? "" : "s"} deleted, ${failedCount} failed.`);
+        setMessage(`${deletedRequirementIds.length} requirement${deletedRequirementIds.length === 1 ? "" : "s"} and ${deletedIterationIds.length} sprint group${deletedIterationIds.length === 1 ? "" : "s"} deleted, ${failedCount} failed.`);
         return;
       }
 
-      showSuccess(`${deletedRequirementIds.length} requirement${deletedRequirementIds.length === 1 ? "" : "s"} and ${deletedIterationIds.length} iteration${deletedIterationIds.length === 1 ? "" : "s"} deleted.`);
+      showSuccess(`${deletedRequirementIds.length} requirement${deletedRequirementIds.length === 1 ? "" : "s"} and ${deletedIterationIds.length} sprint group${deletedIterationIds.length === 1 ? "" : "s"} deleted.`);
     } catch (error) {
       showError(error, "Unable to delete selected requirement items");
     } finally {
@@ -2214,6 +2325,21 @@ export function RequirementsPage() {
 	      return;
 	    }
 
+    if (requirementEditMetadataQuery.isLoading) {
+      showError(null, "Checking this Jira Story's editable required fields. Try again in a moment.");
+      return;
+    }
+
+    if (requirementEditMetadataQuery.isError) {
+      showError(null, "Qaira could not verify this Jira Story edit screen. Refresh before updating the Story.");
+      return;
+    }
+
+    if (jiraRequirementEditCoreRequired.description && !richTextToPlainText(draft.description).trim()) {
+      showError(null, "Jira requires a description for this Story type.");
+      return;
+    }
+
     try {
       await updateRequirement.mutateAsync({
         id: selectedRequirement.id,
@@ -2225,9 +2351,10 @@ export function RequirementsPage() {
           sprint: draft.sprint,
           fix_version: draft.fixVersion,
           release: draft.release,
-          iteration_id: draft.iterationId || "",
           priority: draft.priority,
-          status: draft.status
+          status: draft.status,
+          additional_fields: draft.additionalFields,
+          expected_revision: selectedRequirement.revision
         }
       });
 
@@ -2317,7 +2444,7 @@ export function RequirementsPage() {
         Sprint: requirement.sprint || "",
         "Fix Version": requirement.fix_version || "",
         Release: requirement.release || "",
-        "Iteration ID": requirement.iteration_id || "",
+        "Sprint ID": requirement.sprint_id || "",
         "Linked Test Cases": (requirement.test_case_ids || []).join("|"),
         "Linked Bugs": (requirement.defect_ids || []).join("|")
       })));
@@ -2791,6 +2918,12 @@ export function RequirementsPage() {
         return;
       }
 
+      if (requirementCreateMetadataQuery.isError) {
+        setPreviewTone("error");
+        setPreviewMessage("Qaira could not verify this Jira Story create screen. Refresh before creating the selected drafts.");
+        return;
+      }
+
       try {
         const createdIds: string[] = [];
         let statusWarningCount = 0;
@@ -2801,6 +2934,9 @@ export function RequirementsPage() {
             description: composeAiRequirementDescription(candidate),
             external_references: candidate.external_references,
             labels: ["ai-drafted"],
+            sprint: createDraft.sprint || undefined,
+            fix_version: createDraft.fixVersion || undefined,
+            release: createDraft.release || undefined,
             priority: candidate.priority,
             status: candidate.status,
             additional_fields: createDraft.additionalFields
@@ -3213,17 +3349,27 @@ export function RequirementsPage() {
                 className="ghost-button catalog-selection-button"
                 disabled={!canCreateRequirementIterations || !projectId}
                 onClick={() => {
+                  const nextDates = defaultSprintDates();
+                  setEditingIteration(null);
                   setIterationRequirementSearch("");
+                  setIterationDraftName("");
+                  setIterationDraftDescription("");
+                  setIterationDraftBoardId(jiraBoards[0]?.id || jiraSprints[0]?.board_id || "");
+                  setIterationDraftStartDate(nextDates.start);
+                  setIterationDraftEndDate(nextDates.end);
+                  setIterationDraftStatus("future");
+                  setSprintDraftRequirementIds(deleteSelectedRequirementIds);
                   setIsCreateIterationModalOpen(true);
                 }}
                 type="button"
               >
                 <IterationIcon />
-                <span>Create iteration</span>
+                <span>Create sprint</span>
               </button>
               <RequirementSplitActionButton
                 disabled={!canCreateRequirements || !projectId}
-                icon={<AddIcon />}
+                icon={<FileAddIcon />}
+                iconOnly={true}
                 label="Create Requirement"
                 menuLabel="Open create requirement options"
                 onClick={openCreateRequirementModal}
@@ -3308,25 +3454,28 @@ export function RequirementsPage() {
             <TileBrowserPane className="requirement-card-list">
               {isRequirementCatalogLoading ? <TileCardSkeletonGrid /> : null}
 
-              {!isRequirementCatalogLoading && filteredRequirements.length && catalogViewMode === "tile" ? (
+              {!isRequirementCatalogLoading && (filteredRequirements.length || requirementIterationGroups.groups.length) && catalogViewMode === "tile" ? (
                 <div className="tile-browser-grid">
 	                  {iterationTileEntries.map((entry) => {
                     if (entry.kind === "iteration") {
                       const isCollapsed = collapsedIterationIds.includes(entry.iteration.id);
                       const iterationChildIds = getVisibleIterationRequirementIds(entry.iteration.id);
-                      const isSelected = selectedIterationIds.includes(entry.iteration.id)
-                        && iterationChildIds.every((id) => deleteSelectedRequirementIds.includes(id));
+                      const sprintPageState = sprintPageStateById[entry.iteration.id];
+                      const isSelected = iterationChildIds.length > 0
+                        && iterationChildIds.every((id) => deleteSelectedRequirementIds.includes(id))
+                        && (entry.iteration.source === "jira" || selectedIterationIds.includes(entry.iteration.id));
+                      const canAcceptDrop = String(entry.iteration.state || entry.iteration.status || "").toLowerCase() !== "closed";
 
                       return (
                         <div
-                          className={draggingRequirementIds.length ? "test-case-module-header requirement-iteration-header is-drop-ready" : "test-case-module-header requirement-iteration-header"}
+                          className={draggingRequirementIds.length && canAcceptDrop ? "test-case-module-header requirement-iteration-header is-drop-ready" : "test-case-module-header requirement-iteration-header"}
                           key={`iteration-${entry.iteration.id}`}
                           onDragOver={(event) => {
-                            if (draggingRequirementIds.length) {
+                            if (draggingRequirementIds.length && canAcceptDrop) {
                               event.preventDefault();
                             }
                           }}
-                          onDrop={() => void handleDropRequirementOnIteration(entry.iteration.id)}
+                          onDrop={() => canAcceptDrop && void handleDropRequirementOnIteration(entry.iteration.id)}
                         >
                           <label className="checkbox-field" onClick={(event) => event.stopPropagation()}>
                             <input
@@ -3336,7 +3485,7 @@ export function RequirementsPage() {
                             />
                           </label>
                           <button
-                            aria-label={isCollapsed ? "Expand iteration" : "Collapse iteration"}
+                            aria-label={isCollapsed ? "Expand sprint" : "Collapse sprint"}
                             className={isCollapsed ? "ghost-button compact module-toggle-button" : "ghost-button compact module-toggle-button is-expanded"}
                             onClick={() =>
                               setCollapsedIterationIds((current) =>
@@ -3349,9 +3498,30 @@ export function RequirementsPage() {
                           >
                             <HierarchyToggleIcon isExpanded={!isCollapsed} />
                           </button>
-                          <span className="module-folder-icon"><IterationIcon /></span>
-                          <strong>{entry.iteration.name}</strong>
-                          {renderIterationMetrics(iterationHealth.byId.get(entry.iteration.id)!)}
+                          {renderSprintIdentity(entry.iteration)}
+                          <button
+                            aria-label={`Edit ${entry.iteration.name}`}
+                            className="ghost-button compact sprint-edit-button"
+                            disabled={!canUpdateRequirementIterations || String(entry.iteration.state || entry.iteration.status || "").toLowerCase() === "closed"}
+                            onClick={() => openEditIteration(entry.iteration)}
+                            title="Edit sprint in Jira"
+                            type="button"
+                          >
+                            <PencilIcon />
+                          </button>
+                          {isCollapsed
+                            ? renderDeferredSprintMetrics(entry.iteration.requirement_count ?? entry.count)
+                            : renderIterationMetrics(iterationHealth.byId.get(entry.iteration.id)!)}
+                          {!isCollapsed && (sprintPageState?.isFetching || sprintPageState?.nextCursor) ? (
+                            <HierarchyLoadMoreButton
+                              batchSize={25}
+                              isLoading={Boolean(sprintPageState?.isFetching)}
+                              loaded={sprintPageState?.loaded}
+                              onLoad={() => loadNextSprintPage(entry.iteration.id)}
+                              scopeLabel={`stories in ${entry.iteration.name}`}
+                              total={sprintPageState?.total}
+                            />
+                          ) : null}
                         </div>
                       );
                     }
@@ -3368,9 +3538,22 @@ export function RequirementsPage() {
                               type="checkbox"
                             />
                           </label>
-                          <span className="module-folder-icon"><IterationIcon /></span>
-                          <strong>Unassigned iteration</strong>
+                          <div className="requirement-sprint-identity">
+                            <span className="module-folder-icon"><IterationIcon /></span>
+                            <div className="requirement-sprint-copy">
+                              <div className="requirement-sprint-heading"><strong>Backlog / No sprint</strong></div>
+                              <div className="requirement-sprint-meta"><span>Stories without a Jira Sprint</span></div>
+                            </div>
+                          </div>
                           {renderIterationMetrics(iterationHealth.unassigned)}
+                          {requirementsQuery.hasNextPage ? (
+                            <HierarchyLoadMoreButton
+                              batchSize={15}
+                              isLoading={requirementsQuery.isFetchingNextPage}
+                              onLoad={() => requirementsQuery.fetchNextPage()}
+                              scopeLabel="backlog stories"
+                            />
+                          ) : null}
                         </div>
                       );
                     }
@@ -3518,23 +3701,26 @@ export function RequirementsPage() {
                   })}
                 </div>
               ) : null}
-              {!isRequirementCatalogLoading && filteredRequirements.length && catalogViewMode === "list" ? (
+              {!isRequirementCatalogLoading && (filteredRequirements.length || requirementIterationGroups.groups.length) && catalogViewMode === "list" ? (
                 <>
                   {requirementIterationGroups.groups.map(({ iteration, requirements: groupRequirements }) => {
                     const isCollapsed = collapsedIterationIds.includes(iteration.id);
                     const iterationChildIds = groupRequirements.map((requirement) => requirement.id);
-                    const isSelected = selectedIterationIds.includes(iteration.id)
-                      && iterationChildIds.every((id) => deleteSelectedRequirementIds.includes(id));
+                    const sprintPageState = sprintPageStateById[iteration.id];
+                    const isSelected = iterationChildIds.length > 0
+                      && iterationChildIds.every((id) => deleteSelectedRequirementIds.includes(id))
+                      && (iteration.source === "jira" || selectedIterationIds.includes(iteration.id));
+                    const canAcceptDrop = String(iteration.state || iteration.status || "").toLowerCase() !== "closed";
                     return (
                       <Fragment key={iteration.id}>
                         <div
-                          className={draggingRequirementIds.length ? "test-case-module-header requirement-iteration-header requirement-iteration-list-header is-drop-ready" : "test-case-module-header requirement-iteration-header requirement-iteration-list-header"}
+                          className={draggingRequirementIds.length && canAcceptDrop ? "test-case-module-header requirement-iteration-header requirement-iteration-list-header is-drop-ready" : "test-case-module-header requirement-iteration-header requirement-iteration-list-header"}
                           onDragOver={(event) => {
-                            if (draggingRequirementIds.length) {
+                            if (draggingRequirementIds.length && canAcceptDrop) {
                               event.preventDefault();
                             }
                           }}
-                          onDrop={() => void handleDropRequirementOnIteration(iteration.id)}
+                          onDrop={() => canAcceptDrop && void handleDropRequirementOnIteration(iteration.id)}
                         >
                           <label className="checkbox-field" onClick={(event) => event.stopPropagation()}>
                             <input
@@ -3544,7 +3730,7 @@ export function RequirementsPage() {
                             />
                           </label>
                           <button
-                            aria-label={isCollapsed ? "Expand iteration" : "Collapse iteration"}
+                            aria-label={isCollapsed ? "Expand sprint" : "Collapse sprint"}
                             className={isCollapsed ? "ghost-button compact module-toggle-button" : "ghost-button compact module-toggle-button is-expanded"}
                             onClick={() =>
                               setCollapsedIterationIds((current) =>
@@ -3557,15 +3743,36 @@ export function RequirementsPage() {
                           >
                             <HierarchyToggleIcon isExpanded={!isCollapsed} />
                           </button>
-                          <span className="module-folder-icon"><IterationIcon /></span>
-                          <strong>{iteration.name}</strong>
-                          {renderIterationMetrics(iterationHealth.byId.get(iteration.id)!)}
+                          {renderSprintIdentity(iteration)}
+                          <button
+                            aria-label={`Edit ${iteration.name}`}
+                            className="ghost-button compact sprint-edit-button"
+                            disabled={!canUpdateRequirementIterations || String(iteration.state || iteration.status || "").toLowerCase() === "closed"}
+                            onClick={() => openEditIteration(iteration)}
+                            title="Edit sprint in Jira"
+                            type="button"
+                          >
+                            <PencilIcon />
+                          </button>
+                          {isCollapsed
+                            ? renderDeferredSprintMetrics(iteration.requirement_count ?? groupRequirements.length)
+                            : renderIterationMetrics(iterationHealth.byId.get(iteration.id)!)}
+                          {!isCollapsed && (sprintPageState?.isFetching || sprintPageState?.nextCursor) ? (
+                            <HierarchyLoadMoreButton
+                              batchSize={25}
+                              isLoading={Boolean(sprintPageState?.isFetching)}
+                              loaded={sprintPageState?.loaded}
+                              onLoad={() => loadNextSprintPage(iteration.id)}
+                              scopeLabel={`stories in ${iteration.name}`}
+                              total={sprintPageState?.total}
+                            />
+                          ) : null}
                         </div>
                         {!isCollapsed ? (
                           <DataTable
-                            columns={getScopedRequirementListColumns(iterationChildIds, `Select all requirements in ${iteration.name}`)}
+                            columns={getScopedRequirementListColumns(iterationChildIds, `Select all stories in ${iteration.name}`)}
                             enableColumnResize
-                            emptyMessage="No requirements match this iteration."
+                            emptyMessage="No stories match this sprint."
                             getRowDraggable={() => true}
                             getRowClassName={(item) => (selectedRequirement?.id === item.id ? "is-active-row" : "")}
                             getRowKey={(item) => item.id}
@@ -3579,7 +3786,7 @@ export function RequirementsPage() {
                       </Fragment>
                     );
                   })}
-                  {requirementIterationGroups.unassignedRequirements.length ? (
+                  {requirementIterationGroups.unassignedRequirements.length || requirementsQuery.hasNextPage ? (
                     <>
                       <div className="test-case-module-header is-unassigned requirement-iteration-header requirement-iteration-list-header">
                         <label className="checkbox-field" onClick={(event) => event.stopPropagation()}>
@@ -3589,14 +3796,27 @@ export function RequirementsPage() {
                             type="checkbox"
                           />
                         </label>
-                        <span className="module-folder-icon"><IterationIcon /></span>
-                        <strong>Unassigned iteration</strong>
+                        <div className="requirement-sprint-identity">
+                          <span className="module-folder-icon"><IterationIcon /></span>
+                          <div className="requirement-sprint-copy">
+                            <div className="requirement-sprint-heading"><strong>Backlog / No sprint</strong></div>
+                            <div className="requirement-sprint-meta"><span>Stories without a Jira Sprint</span></div>
+                          </div>
+                        </div>
                         {renderIterationMetrics(iterationHealth.unassigned)}
+                        {requirementsQuery.hasNextPage ? (
+                          <HierarchyLoadMoreButton
+                            batchSize={15}
+                            isLoading={requirementsQuery.isFetchingNextPage}
+                            onLoad={() => requirementsQuery.fetchNextPage()}
+                            scopeLabel="backlog stories"
+                          />
+                        ) : null}
                       </div>
                       <DataTable
-                        columns={getScopedRequirementListColumns(requirementIterationGroups.unassignedRequirements.map((requirement) => requirement.id), "Select all unassigned requirements")}
+                        columns={getScopedRequirementListColumns(requirementIterationGroups.unassignedRequirements.map((requirement) => requirement.id), "Select all backlog stories")}
                         enableColumnResize
-                        emptyMessage="No unassigned requirements match the current search."
+                        emptyMessage="No backlog stories match the current search."
                         getRowDraggable={() => true}
                         getRowClassName={(item) => (selectedRequirement?.id === item.id ? "is-active-row" : "")}
                         getRowKey={(item) => item.id}
@@ -3610,7 +3830,7 @@ export function RequirementsPage() {
                   ) : null}
                 </>
               ) : null}
-              {!isRequirementCatalogLoading && !requirements.length ? (
+              {!isRequirementCatalogLoading && !requirements.length && !requirementIterationGroups.groups.length ? (
                 <div className="empty-state compact">
                   <div>No requirements yet for this project.</div>
 	                  <button className="primary-button" disabled={!canCreateRequirements || !projectId} onClick={openCreateRequirementModal} type="button">Create first requirement</button>
@@ -3658,6 +3878,8 @@ export function RequirementsPage() {
                   ariaLabel="Requirement detail sections"
                   items={[
                     { value: "details", label: "Details", icon: <PencilIcon /> },
+                    { value: "related", label: "Related items", icon: <OpenIcon />, count: selectedRequirement.related_items?.length || 0 },
+                    { value: "comments", label: "Comments", icon: <CommentTabIcon /> },
                     { value: "grounding", label: "AI Assurance", icon: <SparkIcon /> },
                     { value: "cases", label: "Linked test cases", icon: <LayersIcon />, count: selectedTestCaseIds.length },
                     { value: "defects", label: "Linked bugs", icon: <BugIcon />, count: selectedDefectIds.length },
@@ -3712,37 +3934,36 @@ export function RequirementsPage() {
                         </FormField>
                         <RequirementLabelsField
                           options={requirementLabelOptions}
+                          required={jiraRequirementEditCoreRequired.labels}
                           value={draft.labelsText}
                           onChange={(labelsText) => setDraft((current) => ({ ...current, labelsText }))}
                         />
                         <FormField className="form-field--compact-enum" label="Status">
                           <select value={draft.status} onChange={(event) => setDraft((current) => ({ ...current, status: event.target.value }))}>
-                            {requirementStatusOptions.map((status) => (
-                              <option key={status} value={status}>
-                                {formatTileCardLabel(status, "Open")}
+                            {editRequirementStatusOptions.map((status) => (
+                              <option key={status.value} value={status.value}>
+                                {status.label}{status.category_name && status.category_name.toLowerCase() !== status.label.toLowerCase() ? ` · ${status.category_name}` : ""}{status.current ? " · current" : ""}
                               </option>
                             ))}
                           </select>
                         </FormField>
-                        <FormField className="form-field--compact-enum form-field--compact-number" label="Priority">
-                          <input min="1" max="5" type="number" value={draft.priority} onChange={(event) => setDraft((current) => ({ ...current, priority: Number(event.target.value) || 3 }))} />
+                        <FormField className="form-field--compact-enum form-field--compact-number" label="Priority" required={jiraRequirementEditCoreRequired.priority}>
+                          <input min="1" max="5" required={jiraRequirementEditCoreRequired.priority} type="number" value={draft.priority} onChange={(event) => setDraft((current) => ({ ...current, priority: Number(event.target.value) || 3 }))} />
                         </FormField>
-                        <FormField label="Iteration">
-                          <select value={draft.iterationId} onChange={(event) => setDraft((current) => ({ ...current, iterationId: event.target.value }))}>
-                            <option value="">No iteration</option>
-                            {requirementIterations.map((iteration) => (
-                              <option key={iteration.id} value={iteration.id}>{iteration.name}</option>
-                            ))}
-                          </select>
-                        </FormField>
-                        <FormField label="Sprint">
-                          <select value={draft.sprint} onChange={(event) => setDraft((current) => ({ ...current, sprint: event.target.value }))}>
+                        <FormField label="Sprint" required={jiraRequirementEditCoreRequired.sprint}>
+                          <select required={jiraRequirementEditCoreRequired.sprint} value={draft.sprint} onChange={(event) => setDraft((current) => ({ ...current, sprint: event.target.value, iterationId: "" }))}>
                             <option value="">No sprint</option>
-                            {jiraSprints.map((sprint) => <option key={sprint.id} value={sprint.name}>{sprint.name}{sprint.state ? ` · ${sprint.state}` : ""}</option>)}
+                            {draft.sprint && !jiraSprints.some((sprint) => sprint.id === draft.sprint)
+                              ? <option value={draft.sprint}>{selectedRequirement.sprint || "Current sprint"}</option>
+                              : null}
+                            {jiraSprints
+                              .filter((sprint) => String(sprint.state || "").toLowerCase() !== "closed" || sprint.id === draft.sprint)
+                              .map((sprint) => <option key={sprint.id} value={sprint.id}>{sprintOptionLabel(sprint)}</option>)}
                           </select>
                         </FormField>
-                        <FormField label="Release / Fix version">
+                        <FormField label="Release / Fix version" required={jiraRequirementEditCoreRequired.release}>
                           <select
+                            required={jiraRequirementEditCoreRequired.release}
                             value={draft.fixVersion || draft.release}
                             onChange={(event) => setDraft((current) => ({ ...current, fixVersion: event.target.value, release: event.target.value }))}
                           >
@@ -3751,10 +3972,11 @@ export function RequirementsPage() {
                           </select>
                         </FormField>
                       </div>
-                      <FormField label="Description">
+                      <FormField label="Description" required={jiraRequirementEditCoreRequired.description}>
                         <RichTextEditor
                           aiRephraseTitle="Rephrase requirement description with AI"
                           onAiRephrase={(html, plainText) => rephraseRequirementDescriptionWithAi(html, plainText, "detail")}
+                          required={jiraRequirementEditCoreRequired.description}
                           rows={4}
                           value={draft.description}
                           onChange={(description) => setDraft((current) => ({ ...current, description }))}
@@ -3765,14 +3987,54 @@ export function RequirementsPage() {
                         onChange={(externalReferencesText) => setDraft((current) => ({ ...current, externalReferencesText }))}
                       />
 
+                      {requirementEditMetadataQuery.isLoading || requirementEditMetadataQuery.isError || requiredJiraRequirementEditFields.length ? (
+                        <section className="issue-form-section">
+                          <div className="issue-form-section-head">
+                            <strong>Jira required fields</strong>
+                            <span>Values come from this Story’s live Jira edit screen and are written back to the same Jira fields.</span>
+                          </div>
+                          {requirementEditMetadataQuery.isLoading ? (
+                            <LoadingState label="Checking Jira Story edit fields" />
+                          ) : requirementEditMetadataQuery.isError ? (
+                            <p className="inline-message error-message">Qaira could not verify this Jira Story edit screen. Refresh before saving.</p>
+                          ) : (
+                            <JiraRequiredFields
+                              fields={requiredJiraRequirementEditFields}
+                              issueTypeName="Story"
+                              mode="edit"
+                              onChange={(fieldId, value) => updateAdditionalRequirementField("edit", fieldId, value)}
+                              users={users}
+                              values={draft.additionalFields}
+                            />
+                          )}
+                        </section>
+                      ) : null}
+
                       <div className="action-row">
-                        <button className="primary-button" disabled={!canUpdateRequirements || updateRequirement.isPending || replaceMappings.isPending || replaceDefectMappings.isPending} type="submit">
+                        <button className="primary-button" disabled={!canUpdateRequirements || requirementEditMetadataQuery.isLoading || requirementEditMetadataQuery.isError || updateRequirement.isPending || replaceMappings.isPending || replaceDefectMappings.isPending} type="submit">
                           {updateRequirement.isPending || replaceMappings.isPending || replaceDefectMappings.isPending ? "Saving…" : "Save requirement"}
                         </button>
                       </div>
                     </form>
                   </RequirementAccordionSection>
                   </div>
+                  </div>
+                ) : null}
+                {activeTraceabilityTab === "related" ? (
+                  <div className="detail-section-panel requirement-detail-wide-panel" role="tabpanel">
+                    <RequirementRelatedItemsPanel
+                      items={selectedRequirement.related_items || []}
+                      navigate={navigate}
+                      testCases={testCases}
+                    />
+                  </div>
+                ) : null}
+                {activeTraceabilityTab === "comments" ? (
+                  <div className="detail-section-panel requirement-detail-wide-panel" role="tabpanel">
+                    <JiraCommentsPanel
+                      canComment={canUpdateRequirements}
+                      issueKey={selectedRequirement.display_id || selectedRequirement.id}
+                    />
                   </div>
                 ) : null}
                 {activeTraceabilityTab === "grounding" ? (
@@ -3904,39 +4166,40 @@ export function RequirementsPage() {
                         value={createDraft.status}
                         onChange={(event) => setCreateDraft((current) => ({ ...current, status: event.target.value }))}
                       >
-                        {requirementStatusOptions.map((status) => (
-                          <option key={status} value={status}>
-                            {formatTileCardLabel(status, "Open")}
+                        {createRequirementStatusOptions.map((status) => (
+                          <option key={status.value} value={status.value}>
+                            {status.label}{status.category_name && status.category_name.toLowerCase() !== status.label.toLowerCase() ? ` · ${status.category_name}` : ""}
                           </option>
                         ))}
                       </select>
                     </FormField>
-	                    <FormField className="form-field--compact-enum form-field--compact-number" label="Priority">
+	                    <FormField className="form-field--compact-enum form-field--compact-number" label="Priority" required={jiraRequirementCoreRequired.priority}>
 	                      <input
                         min="1"
                         max="5"
+                        required={jiraRequirementCoreRequired.priority}
                         type="number"
                         value={createDraft.priority}
                         onChange={(event) => setCreateDraft((current) => ({ ...current, priority: Number(event.target.value) || 3 }))}
 	                      />
 	                    </FormField>
-	                    <FormField label="Iteration">
+	                    <FormField label="Sprint" required={jiraRequirementCoreRequired.sprint}>
 	                      <select
-	                        value={createDraft.iterationId}
-	                        onChange={(event) => setCreateDraft((current) => ({ ...current, iterationId: event.target.value }))}
+	                        required={jiraRequirementCoreRequired.sprint}
+	                        value={createDraft.sprint}
+	                        onChange={(event) => setCreateDraft((current) => ({ ...current, sprint: event.target.value, iterationId: "" }))}
 	                      >
-	                        <option value="">No iteration</option>
-	                        {requirementIterations.map((iteration) => (
-	                          <option key={iteration.id} value={iteration.id}>{iteration.name}</option>
-	                        ))}
+	                        <option value="">No sprint</option>
+	                        {assignableJiraSprints.map((sprint) => <option key={sprint.id} value={sprint.id}>{sprintOptionLabel(sprint)}</option>)}
 	                      </select>
 	                    </FormField>
 	                  </div>
-                  <FormField label="Description" inputId="create-requirement-description-input">
+                  <FormField label="Description" inputId="create-requirement-description-input" required={jiraRequirementCoreRequired.description}>
                     <RichTextEditor
                       id="create-requirement-description-input"
                       aiRephraseTitle="Rephrase requirement description with AI"
                       onAiRephrase={(html, plainText) => rephraseRequirementDescriptionWithAi(html, plainText, "create")}
+                      required={jiraRequirementCoreRequired.description}
                       rows={4}
                       value={createDraft.description}
                       onChange={(description) => setCreateDraft((current) => ({ ...current, description }))}
@@ -3945,20 +4208,13 @@ export function RequirementsPage() {
                   <div className="record-grid requirement-compact-metadata-grid">
                     <RequirementLabelsField
                       options={requirementLabelOptions}
+                      required={jiraRequirementCoreRequired.labels}
                       value={createDraft.labelsText}
                       onChange={(labelsText) => setCreateDraft((current) => ({ ...current, labelsText }))}
                     />
-                    <FormField label="Sprint">
+                    <FormField label="Release / Fix version" required={jiraRequirementCoreRequired.release}>
                       <select
-                        value={createDraft.sprint}
-                        onChange={(event) => setCreateDraft((current) => ({ ...current, sprint: event.target.value }))}
-                      >
-                        <option value="">No sprint</option>
-                        {jiraSprints.map((sprint) => <option key={sprint.id} value={sprint.name}>{sprint.name}{sprint.state ? ` · ${sprint.state}` : ""}</option>)}
-                      </select>
-                    </FormField>
-                    <FormField label="Release / Fix version">
-                      <select
+                        required={jiraRequirementCoreRequired.release}
                         value={createDraft.fixVersion || createDraft.release}
                         onChange={(event) => setCreateDraft((current) => ({ ...current, fixVersion: event.target.value, release: event.target.value }))}
                       >
@@ -3971,7 +4227,7 @@ export function RequirementsPage() {
                     value={createDraft.externalReferencesText}
                     onChange={(externalReferencesText) => setCreateDraft((current) => ({ ...current, externalReferencesText }))}
                   />
-                  {requirementCreateMetadataQuery.isLoading || requiredJiraRequirementFields.length ? (
+                  {requirementCreateMetadataQuery.isLoading || requirementCreateMetadataQuery.isError || requiredJiraRequirementFields.length ? (
                     <section className="issue-form-section">
                       <div className="issue-form-section-head">
                         <strong>Jira required fields</strong>
@@ -3981,10 +4237,17 @@ export function RequirementsPage() {
                       </div>
                       {requirementCreateMetadataQuery.isLoading ? (
                         <LoadingState label="Checking Jira Story create fields" />
+                      ) : requirementCreateMetadataQuery.isError ? (
+                        <p className="inline-message error-message">Qaira could not verify this Jira Story create screen. Refresh or ask a Jira administrator to check the app field-metadata permission.</p>
                       ) : (
-                        <div className="issue-form-grid issue-form-grid--triple">
-                          {requiredJiraRequirementFields.map(renderAdditionalRequirementField)}
-                        </div>
+                        <JiraRequiredFields
+                          fields={requiredJiraRequirementFields}
+                          issueTypeName="Story"
+                          mode="create"
+                          onChange={(fieldId, value) => updateAdditionalRequirementField("create", fieldId, value)}
+                          users={users}
+                          values={createDraft.additionalFields}
+                        />
                       )}
                     </section>
                   ) : null}
@@ -3996,7 +4259,7 @@ export function RequirementsPage() {
                 <button className="ghost-button" disabled={createRequirement.isPending} onClick={closeCreateRequirementModal} type="button">
                   Cancel
                 </button>
-	                <button className="primary-button" disabled={!canCreateRequirements || createRequirement.isPending || requirementCreateMetadataQuery.isLoading} type="submit">
+	                <button className="primary-button" disabled={!canCreateRequirements || createRequirement.isPending || requirementCreateMetadataQuery.isLoading || requirementCreateMetadataQuery.isError} type="submit">
 	                  {createRequirement.isPending ? "Creating…" : requirementCreateMetadataQuery.isLoading ? "Checking Jira fields…" : "Create requirement"}
 	                </button>
               </div>
@@ -4006,39 +4269,82 @@ export function RequirementsPage() {
       ) : null}
 
       {isCreateIterationModalOpen ? (
-        <div className="modal-backdrop modal-backdrop--scroll" onClick={() => setIsCreateIterationModalOpen(false)} role="presentation">
+        <div className="modal-backdrop modal-backdrop--scroll" onClick={() => !createRequirementIteration.isPending && !updateRequirementIteration.isPending && setIsCreateIterationModalOpen(false)} role="presentation">
           <form
-            aria-labelledby="create-requirement-iteration-title"
+            aria-labelledby="create-sprint-title"
             aria-modal="true"
-            className="modal-card requirement-create-modal requirement-iteration-modal"
+            className="modal-card requirement-create-modal requirement-iteration-modal requirement-sprint-modal"
             onClick={(event) => event.stopPropagation()}
-            onSubmit={(event) => void handleCreateIteration(event)}
+            onSubmit={(event) => void handleSaveIteration(event)}
             role="dialog"
           >
 	            <div className="requirement-create-header">
 	              <div className="requirement-create-title">
-	                <h2 className="dialog-title" id="create-requirement-iteration-title">Create iteration</h2>
-	                <p>Group requirements into a focused delivery scope. Select the requirements to include now; more can be dragged into the iteration later.</p>
+	                <h2 className="dialog-title" id="create-sprint-title">{editingIteration ? "Edit sprint" : "Create sprint"}</h2>
+	                <p>{editingIteration ? "Update the Jira Sprint’s plan, delivery window, goal, and status." : "Create the Sprint in Jira, define its delivery window, and place the selected stories into its scope."}</p>
 	              </div>
-	              <DialogCloseButton label="Close create iteration" onClick={() => setIsCreateIterationModalOpen(false)} />
+	              <DialogCloseButton disabled={createRequirementIteration.isPending || updateRequirementIteration.isPending} label={`Close ${editingIteration ? "edit" : "create"} sprint`} onClick={() => { setEditingIteration(null); setIsCreateIterationModalOpen(false); }} />
 	            </div>
 	            <div className="requirement-create-modal-body requirement-create-modal-body--stacked">
 	              <div className="iteration-create-layout">
-	                <section className="iteration-create-details-card">
-	                  <FormField label="Iteration name" required>
-	                    <input autoFocus required value={iterationDraftName} onChange={(event) => setIterationDraftName(event.target.value)} />
-	                  </FormField>
-	                  <FormField label="Description">
-	                    <RichTextEditor value={iterationDraftDescription} onChange={setIterationDraftDescription} />
-	                  </FormField>
+	                <section className="iteration-create-details-card sprint-create-plan-card">
+                    <div className="sprint-create-section-heading">
+                      <div>
+                        <strong>Sprint plan</strong>
+                        <span>These details are saved to Jira Software.</span>
+                      </div>
+                      <span className={`requirement-sprint-status is-${iterationDraftStatus}`}>{sprintStateLabel(iterationDraftStatus)}</span>
+                    </div>
+                    <div className="sprint-create-plan-grid">
+	                    <FormField className="sprint-create-name-field" label="Sprint name" required>
+	                      <input autoFocus required value={iterationDraftName} onChange={(event) => setIterationDraftName(event.target.value)} />
+	                    </FormField>
+                      <FormField label="Jira board" required={!editingIteration}>
+                        <select disabled={Boolean(editingIteration)} required={!editingIteration} value={iterationDraftBoardId} onChange={(event) => setIterationDraftBoardId(event.target.value)}>
+                          <option value="">Choose board</option>
+                          {jiraBoards.map((board) => <option key={board.id} value={board.id}>{board.name}{board.type ? ` · ${board.type}` : ""}</option>)}
+                        </select>
+                      </FormField>
+                      <FormField label="Status" required>
+                        <select value={iterationDraftStatus} onChange={(event) => setIterationDraftStatus(event.target.value as "future" | "active")}>
+                          <option value="future">Planned</option>
+                          <option value="active">Active</option>
+                        </select>
+                      </FormField>
+                      <FormField label="Start date" required>
+                        <input required type="date" value={iterationDraftStartDate} onChange={(event) => setIterationDraftStartDate(event.target.value)} />
+                      </FormField>
+                      <FormField label="End date" required>
+                        <input min={iterationDraftStartDate} required type="date" value={iterationDraftEndDate} onChange={(event) => setIterationDraftEndDate(event.target.value)} />
+                      </FormField>
+	                    <FormField className="sprint-create-goal-field" label="Sprint goal / description">
+	                      <RichTextEditor rows={4} value={iterationDraftDescription} onChange={setIterationDraftDescription} />
+	                    </FormField>
+                    </div>
+                    {!jiraBoards.length ? (
+                      <div className="empty-state compact">No Jira Software board is available for this project. Check board access and the app’s Jira Software scopes.</div>
+                    ) : (
+                      <p className="sprint-create-lifecycle-note">
+                        {iterationDraftStatus === "active"
+                          ? "The Sprint will be started in Jira immediately after creation. Jira board constraints still apply."
+                          : "The Sprint will remain planned in Jira until your team starts it."}
+                      </p>
+                    )}
 	                </section>
-	              <div className="iteration-requirement-picker">
+	              {!editingIteration ? <div className="iteration-requirement-picker sprint-story-picker">
+	                <div className="sprint-create-section-heading sprint-story-picker-heading">
+                    <div>
+                      <strong>Stories in this sprint</strong>
+                      <span>Choose scope now; stories can also be dragged into the Sprint later.</span>
+                    </div>
+                    <span className="sprint-story-count">{sprintDraftRequirementIds.length} selected</span>
+                  </div>
 	                <div className="iteration-requirement-picker-toolbar">
-	                  <FormField label="Requirements">
+	                  <FormField label="Search stories">
                     <div className="search-input-with-icon">
                       <SearchIcon />
                       <input
-                        placeholder="Search requirements to include"
+                        placeholder="Search stories"
                         value={iterationRequirementSearch}
                         onChange={(event) => setIterationRequirementSearch(event.target.value)}
                       />
@@ -4049,7 +4355,7 @@ export function RequirementsPage() {
                       className="ghost-button compact"
                       disabled={!iterationRequirementOptions.length || areAllIterationRequirementsSelected}
                       onClick={() =>
-                        setDeleteSelectedRequirementIds((current) => [
+                        setSprintDraftRequirementIds((current) => [
                           ...new Set([...current, ...iterationRequirementOptions.map((requirement) => requirement.id)])
                         ])
                       }
@@ -4058,10 +4364,10 @@ export function RequirementsPage() {
                       <SelectAllIcon />
                       <span>Select all</span>
                     </button>
-                    {deleteSelectedRequirementIds.length ? (
+                    {sprintDraftRequirementIds.length ? (
                       <button
                         className="ghost-button compact"
-                        onClick={() => setDeleteSelectedRequirementIds([])}
+                        onClick={() => setSprintDraftRequirementIds([])}
                         type="button"
                       >
                         <ClearSelectionIcon />
@@ -4070,17 +4376,17 @@ export function RequirementsPage() {
                     ) : null}
                   </div>
                 </div>
-                <div className="iteration-requirement-picker-list" role="listbox" aria-label="Requirements for this iteration">
+                <div className="iteration-requirement-picker-list sprint-story-picker-list" role="listbox" aria-label="Stories for this sprint">
                   {iterationRequirementOptions.map((requirement) => {
-                    const isChecked = deleteSelectedRequirementIds.includes(requirement.id);
-                    const iterationName = requirementIterationById.get(requirement.id)?.name;
+                    const isChecked = sprintDraftRequirementIds.includes(requirement.id);
+                    const iterationName = requirementIterationById.get(requirement.id)?.name || requirement.sprint;
 
                     return (
                       <label className="iteration-requirement-option" key={requirement.id}>
                         <input
                           checked={isChecked}
                           onChange={(event) =>
-                            setDeleteSelectedRequirementIds((current) =>
+                            setSprintDraftRequirementIds((current) =>
                               event.target.checked
                                 ? [...new Set([...current, requirement.id])]
                                 : current.filter((id) => id !== requirement.id)
@@ -4091,7 +4397,7 @@ export function RequirementsPage() {
                         <span>
                           <strong>{requirement.title}</strong>
                           <small>
-                            {[requirement.display_id || requirement.id, iterationName || "Unassigned", requirement.status || defaultRequirementStatus]
+                            {[requirement.display_id || requirement.id, iterationName || "Backlog", requirement.status || defaultRequirementStatus]
                               .filter(Boolean)
                               .join(" · ")}
                           </small>
@@ -4100,16 +4406,20 @@ export function RequirementsPage() {
                     );
                   })}
 	                  {!iterationRequirementOptions.length ? (
-	                    <div className="empty-state compact">No requirements match this search.</div>
+	                    <div className="empty-state compact">No stories match this search.</div>
 	                  ) : null}
 	                </div>
-	              </div>
+	              </div> : null}
 	              </div>
 	            </div>
             <div className="action-row requirement-create-modal-actions">
-              <button className="ghost-button" onClick={() => setIsCreateIterationModalOpen(false)} type="button">Cancel</button>
-              <button className="primary-button" disabled={!canCreateRequirementIterations || createRequirementIteration.isPending || !iterationDraftName.trim()} type="submit">
-                {createRequirementIteration.isPending ? "Creating..." : "Create iteration"}
+              <button className="ghost-button" disabled={createRequirementIteration.isPending || updateRequirementIteration.isPending} onClick={() => { setEditingIteration(null); setIsCreateIterationModalOpen(false); }} type="button">Cancel</button>
+              <button
+                className="primary-button"
+                disabled={(editingIteration ? !canUpdateRequirementIterations : !canCreateRequirementIterations) || createRequirementIteration.isPending || updateRequirementIteration.isPending || !iterationDraftName.trim() || (!editingIteration && !iterationDraftBoardId) || !iterationDraftStartDate || !iterationDraftEndDate || iterationDraftEndDate <= iterationDraftStartDate}
+                type="submit"
+              >
+                {createRequirementIteration.isPending || updateRequirementIteration.isPending ? `${editingIteration ? "Updating" : "Creating"} sprint…` : `${editingIteration ? "Update" : "Create"} sprint in Jira`}
               </button>
             </div>
           </form>
@@ -4334,7 +4644,42 @@ export function RequirementsPage() {
               <div className="ai-studio-main">
                 {previewMessage ? <ToastMessage message={previewMessage} onDismiss={() => setPreviewMessage("")} tone={previewTone} /> : null}
 
-                {requirementAiMode === "create" && (requirementCreateMetadataQuery.isLoading || requiredJiraRequirementFields.length) ? (
+                {requirementAiMode === "create" && (jiraRequirementCoreRequired.sprint || jiraRequirementCoreRequired.release) ? (
+                  <section className="issue-form-section">
+                    <div className="issue-form-section-head">
+                      <strong>Jira delivery scope</strong>
+                      <span>Required Jira scope is applied to every selected AI-assisted Story.</span>
+                    </div>
+                    <div className="issue-form-grid issue-form-grid--triple">
+                      {jiraRequirementCoreRequired.sprint ? (
+                        <FormField label="Sprint" required>
+                          <select
+                            onChange={(event) => setCreateDraft((current) => ({ ...current, sprint: event.target.value, iterationId: "" }))}
+                            required
+                            value={createDraft.sprint}
+                          >
+                            <option value="">Select sprint</option>
+                            {assignableJiraSprints.map((sprint) => <option key={sprint.id} value={sprint.id}>{sprintOptionLabel(sprint)}</option>)}
+                          </select>
+                        </FormField>
+                      ) : null}
+                      {jiraRequirementCoreRequired.release ? (
+                        <FormField label="Release / Fix version" required>
+                          <select
+                            onChange={(event) => setCreateDraft((current) => ({ ...current, fixVersion: event.target.value, release: event.target.value }))}
+                            required
+                            value={createDraft.fixVersion || createDraft.release}
+                          >
+                            <option value="">Select release</option>
+                            {jiraVersions.map((version) => <option key={version.id} value={version.name}>{version.name}{version.released ? " · released" : ""}</option>)}
+                          </select>
+                        </FormField>
+                      ) : null}
+                    </div>
+                  </section>
+                ) : null}
+
+                {requirementAiMode === "create" && (requirementCreateMetadataQuery.isLoading || requirementCreateMetadataQuery.isError || requiredJiraRequirementFields.length) ? (
                   <section className="issue-form-section">
                     <div className="issue-form-section-head">
                       <strong>Jira required fields</strong>
@@ -4344,10 +4689,17 @@ export function RequirementsPage() {
                     </div>
                     {requirementCreateMetadataQuery.isLoading ? (
                       <LoadingState label="Checking Jira Story create fields" />
+                    ) : requirementCreateMetadataQuery.isError ? (
+                      <p className="inline-message error-message">Qaira could not verify this Jira Story create screen. Refresh before creating AI-assisted Stories.</p>
                     ) : (
-                      <div className="issue-form-grid issue-form-grid--triple">
-                        {requiredJiraRequirementFields.map(renderAdditionalRequirementField)}
-                      </div>
+                      <JiraRequiredFields
+                        fields={requiredJiraRequirementFields}
+                        issueTypeName="Story"
+                        mode="create"
+                        onChange={(fieldId, value) => updateAdditionalRequirementField("create", fieldId, value)}
+                        users={users}
+                        values={createDraft.additionalFields}
+                      />
                     )}
                   </section>
                 ) : null}
@@ -4375,11 +4727,13 @@ export function RequirementsPage() {
                             {areAllRequirementCreationDraftsSelected ? "Clear selection" : "Select all drafts"}
                           </button>
                           <button
-                            className="ghost-button compact"
+                            aria-label={isRequirementAiSidebarCollapsed ? "Expand prompt panel" : "Collapse prompt panel"}
+                            className="ghost-button compact explorer-icon-button"
                             onClick={() => setIsRequirementAiSidebarCollapsed((current) => !current)}
+                            title={isRequirementAiSidebarCollapsed ? "Expand prompt panel" : "Collapse prompt panel"}
                             type="button"
                           >
-                            {isRequirementAiSidebarCollapsed ? "Expand prompt panel" : "Collapse prompt panel"}
+                            <CollapseExpandIcon isExpanded={!isRequirementAiSidebarCollapsed} />
                           </button>
                         </div>
                       </div>
@@ -4411,15 +4765,17 @@ export function RequirementsPage() {
                                 </label>
                                 <button
                                   aria-expanded={isExpanded}
-                                  className="ghost-button compact"
+                                  aria-label={isExpanded ? "Collapse requirement draft" : "Expand requirement draft"}
+                                  className="ghost-button compact explorer-icon-button"
                                   onClick={() => setExpandedRequirementCreationDraftIds((current) =>
                                     current.includes(draftId)
                                       ? current.filter((id) => id !== draftId)
                                       : [...current, draftId]
                                   )}
+                                  title={isExpanded ? "Collapse requirement draft" : "Expand requirement draft"}
                                   type="button"
                                 >
-                                  {isExpanded ? "Collapse" : "Expand"}
+                                  <CollapseExpandIcon isExpanded={isExpanded} />
                                 </button>
                               </div>
 
@@ -4533,7 +4889,7 @@ export function RequirementsPage() {
 		              <button
                   className="primary-button"
                   disabled={requirementAiMode === "create"
-                    ? !canCreateRequirements || !selectedRequirementCreationDraftCount || previewRequirementCreation.isPending || createRequirementGenerationJob.isPending || isRequirementCreationJobRunning || createRequirement.isPending || requirementCreateMetadataQuery.isLoading
+                    ? !canCreateRequirements || !selectedRequirementCreationDraftCount || previewRequirementCreation.isPending || createRequirementGenerationJob.isPending || isRequirementCreationJobRunning || createRequirement.isPending || requirementCreateMetadataQuery.isLoading || requirementCreateMetadataQuery.isError
                     : !canUpdateRequirements || !optimizationSuggestion || !Object.values(optimizationFields).some(Boolean) || updateRequirement.isPending}
                   onClick={() => void handleApplyRequirementOptimization()}
                   type="button"
@@ -4633,6 +4989,85 @@ export function RequirementsPage() {
   );
 }
 
+function RequirementRelatedItemsPanel({
+  items,
+  navigate,
+  testCases
+}: {
+  items: RequirementRelatedItem[];
+  navigate: (to: string) => void;
+  testCases: TestCase[];
+}) {
+  const testCaseByReference = new Map(testCases.flatMap((testCase) => [
+    [String(testCase.id), testCase] as const,
+    ...(testCase.display_id ? [[String(testCase.display_id), testCase] as const] : [])
+  ]));
+  const qairaRoute = (item: RequirementRelatedItem) => {
+    if (item.qaira_kind === "test-case") return `/test-cases?case=${encodeURIComponent(item.id)}`;
+    if (item.qaira_kind === "test-suite") return `/design?suite=${encodeURIComponent(item.id)}`;
+    if (item.qaira_kind === "test-run") return `/executions?execution=${encodeURIComponent(item.id)}`;
+    if (item.qaira_kind === "bug") return `/issues?issue=${encodeURIComponent(item.id)}`;
+    if (item.qaira_kind === "requirement") return `/requirements?requirement=${encodeURIComponent(item.id)}`;
+    return "";
+  };
+
+  return (
+    <section className="requirement-related-panel" aria-label="Requirement related items">
+      <div className="requirement-related-head">
+        <div>
+          <strong>Jira related items</strong>
+          <span>Bidirectional Jira links, with QAira test status and ownership kept visible.</span>
+        </div>
+        <span className="count-pill">{items.length} linked</span>
+      </div>
+      <div className="requirement-related-list">
+        {items.map((item) => {
+          const linkedTestCase = item.qaira_kind === "test-case"
+            ? testCaseByReference.get(item.id) || testCaseByReference.get(item.display_id || "")
+            : null;
+          const status = linkedTestCase?.status || item.status || "No status";
+          const assignee = linkedTestCase?.assignee_name || linkedTestCase?.assignee_email || item.assignee_name || "Unassigned";
+          const route = qairaRoute(item);
+          return (
+            <article className="requirement-related-item" key={`${item.direction}-${item.relation}-${item.id}`}>
+              <div className="requirement-related-item-main">
+                <div className="requirement-related-item-id">
+                  <DisplayIdBadge value={item.display_id || item.id} href={getJiraBrowseUrl(item.display_id || item.id, item.jira_url)} />
+                  <span>{item.relation}</span>
+                </div>
+                <strong>{item.title}</strong>
+                <small>{item.issue_type}{item.priority ? ` · ${item.priority}` : ""}</small>
+              </div>
+              <div className="requirement-related-item-meta">
+                <StatusBadge value={status} />
+                <span className="requirement-related-assignee" title={`Assignee: ${assignee}`}>
+                  <RelatedAssigneeIcon />
+                  <span>{assignee}</span>
+                </span>
+                {route ? (
+                  <button className="ghost-button compact" onClick={() => navigate(route)} type="button">
+                    <OpenIcon />
+                    <span>Open in QAira</span>
+                  </button>
+                ) : null}
+              </div>
+            </article>
+          );
+        })}
+        {!items.length ? <div className="empty-state compact">No Jira related items are visible for this requirement.</div> : null}
+      </div>
+    </section>
+  );
+}
+
+function RelatedAssigneeIcon() {
+  return <svg aria-hidden="true" fill="none" height="15" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.8" viewBox="0 0 24 24" width="15"><circle cx="12" cy="8" r="3" /><path d="M5.5 20a6.5 6.5 0 0 1 13 0" /></svg>;
+}
+
+function CommentTabIcon() {
+  return <svg aria-hidden="true" fill="none" height="16" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.8" viewBox="0 0 24 24" width="16"><path d="M5 5h14v10H9l-4 4V5Z" /></svg>;
+}
+
 function AttachmentTabIcon() {
   return <svg aria-hidden="true" fill="none" height="16" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.8" viewBox="0 0 24 24" width="16"><path d="m20.5 11.5-8.7 8.7a6 6 0 0 1-8.5-8.5l9.2-9.2a4 4 0 0 1 5.7 5.7L9 17.4a2 2 0 1 1-2.8-2.8l8.5-8.5" /></svg>;
 }
@@ -4640,10 +5075,12 @@ function AttachmentTabIcon() {
 function RequirementLabelsField({
   value,
   options,
+  required = false,
   onChange
 }: {
   value: string;
   options: string[];
+  required?: boolean;
   onChange: (value: string) => void;
 }) {
   const [draftLabel, setDraftLabel] = useState("");
@@ -4720,7 +5157,7 @@ function RequirementLabelsField({
   };
 
   return (
-    <FormField label="Labels">
+    <FormField label="Labels" required={required}>
       <div className="requirement-label-picker" ref={pickerRef}>
         <div className="requirement-label-combobox">
           <div className="requirement-label-entry">
@@ -4728,6 +5165,7 @@ function RequirementLabelsField({
               aria-autocomplete="list"
               aria-expanded={isMenuOpen}
               aria-label="Select or add labels"
+              required={required && !selectedLabels.length}
               placeholder="Select or add label"
               role="combobox"
               value={draftLabel}
@@ -5273,6 +5711,7 @@ function RequirementAccordionSection({
         aria-expanded={isExpanded}
         className="requirement-accordion-toggle"
         onClick={onToggle}
+        title={isExpanded ? `Collapse ${title}` : `Expand ${title}`}
         type="button"
       >
         <div className="requirement-accordion-toggle-main">
@@ -5286,7 +5725,7 @@ function RequirementAccordionSection({
         </div>
         <div className="requirement-accordion-toggle-meta">
           <span className="requirement-accordion-toggle-count">{countLabel}</span>
-          <span className="requirement-accordion-toggle-state">{isExpanded ? "Collapse" : "Expand"}</span>
+          <span aria-hidden="true" className="requirement-accordion-toggle-state explorer-toggle-glyph"><CollapseExpandIcon isExpanded={isExpanded} /></span>
         </div>
       </button>
       {isExpanded ? <div className="requirement-accordion-body">{children}</div> : null}

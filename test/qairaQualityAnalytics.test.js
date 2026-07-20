@@ -42,13 +42,20 @@ test('quality dashboard definitions and results stay bounded', () => {
 test('stakeholder templates are complete, release-aware, and use Qaira Jira issue types', () => {
   const catalog = qualityDashboardTemplateCatalog();
   assert.deepEqual(catalog.map((item) => item.id), ['executive', 'product', 'quality', 'automation']);
-  assert.ok(catalog.every((item) => item.gadget_count === 8));
+  assert.deepEqual(Object.fromEntries(catalog.map((item) => [item.id, item.gadget_count])), {
+    executive: 8,
+    product: 8,
+    quality: 12,
+    automation: 8
+  });
 
   const dashboard = qualityDashboardTemplate('quality', { release: 'R2', goal: 'Reduce checkout risk' });
-  assert.equal(dashboard.gadgets.length, 8);
+  assert.equal(dashboard.gadgets.length, 12);
   assert.ok(dashboard.gadgets.some((gadget) => gadget.type === 'line'));
   assert.ok(dashboard.gadgets.some((gadget) => gadget.type === 'stacked-bar'));
-  assert.ok(dashboard.gadgets.every((gadget) => gadget.jql.includes('fixVersion = "R2"')));
+  assert.ok(dashboard.gadgets.filter((gadget) => gadget.data_source === 'jira').every((gadget) => gadget.jql.includes('fixVersion = "R2"')));
+  assert.ok(dashboard.gadgets.some((gadget) => gadget.data_source === 'qaira' && gadget.metric === 'executionCycleHours'));
+  assert.ok(dashboard.gadgets.some((gadget) => gadget.data_source === 'qaira' && gadget.group_by === 'module'));
   assert.ok(dashboard.gadgets.some((gadget) => gadget.jql.includes('"Qaira Test Case"')));
   assert.match(dashboard.description, /Reduce checkout risk/);
 });

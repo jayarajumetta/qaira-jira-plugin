@@ -24,6 +24,7 @@ export type WorkspaceSectionItem = {
 
 export const DASHBOARD_SECTION_ITEMS: WorkspaceSectionItem[] = [
   { to: "/?view=analytics", label: "Quality analytics", shortLabel: "Analytics", icon: "analytics" },
+  { to: "/?view=readiness", label: "Release readiness", shortLabel: "Readiness", icon: "analytics" },
   { to: "/?view=custom", label: "Custom dashboards", shortLabel: "Custom", icon: "dashboard" }
 ];
 
@@ -91,6 +92,7 @@ export const WORKSPACE_PAGE_LABELS: Record<string, string> = {
 
 export const WORKSPACE_SECTION_LABEL_KEYS: Record<string, string> = {
   "/?view=analytics": "workspace.qualityAnalytics",
+  "/?view=readiness": "workspace.releaseReadiness",
   "/?view=custom": "workspace.customDashboards",
   "/requirements": "workspace.requirements",
   "/test-cases": "workspace.testCases",

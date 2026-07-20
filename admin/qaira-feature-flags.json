@@ -13,6 +13,8 @@
     "qaira.manual.test_data": true,
     "qaira.analytics.dashboards": true,
     "qaira.automation.workspace": false,
+    "qaira.automation.preview": false,
+    "qaira.automation.analytics": false,
     "qaira.automation.assets": false,
     "qaira.automation.builder": false,
     "qaira.automation.step_code": false,

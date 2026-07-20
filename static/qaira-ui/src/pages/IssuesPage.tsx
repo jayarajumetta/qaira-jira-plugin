@@ -1,8 +1,8 @@
 import { FormEvent, useDeferredValue, useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useSearchParams } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
-import { BugIcon, ClearSelectionIcon, ExportIcon, SearchIcon, SelectAllIcon, SparkIcon } from "../components/AppIcons";
+import { ClearSelectionIcon, ExportIcon, SearchIcon, SelectAllIcon, SparkIcon } from "../components/AppIcons";
 import { AiPromptContextPanel } from "../components/AiPromptContextPanel";
 import { CatalogSelectionControls } from "../components/CatalogSelectionControls";
 import { CatalogSearchFilter } from "../components/CatalogSearchFilter";
@@ -12,10 +12,12 @@ import { DialogCloseButton } from "../components/DialogCloseButton";
 import { DisplayIdBadge } from "../components/DisplayIdBadge";
 import { FormField } from "../components/FormField";
 import { JiraAttachmentPanel } from "../components/JiraAttachmentPanel";
+import { JiraRequiredFields } from "../components/JiraRequiredFields";
 import { LoadingState } from "../components/LoadingState";
 import { PageHeader } from "../components/PageHeader";
 import { Panel } from "../components/Panel";
 import { RichTextContent, RichTextEditor, richTextToPlainText } from "../components/RichTextEditor";
+import { ReportBugSplitActionButton } from "../components/ReportBugSplitActionButton";
 import { TileCardSkeletonGrid } from "../components/TileCardSkeletonGrid";
 import { TileCardStatusIndicator, formatTileCardLabel, getTileCardTone } from "../components/TileCardPrimitives";
 import { WorkspaceBackButton, WorkspaceMasterDetail } from "../components/WorkspaceMasterDetail";
@@ -23,9 +25,11 @@ import { useDeleteConfirmation } from "../components/DeleteConfirmationDialog";
 import { useDomainMetadata } from "../hooks/useDomainMetadata";
 import { useFeatureFlags } from "../hooks/useFeatureFlags";
 import { useCurrentProject } from "../hooks/useCurrentProject";
-import { api, type JiraCreateFieldMetadata } from "../lib/api";
+import { api } from "../lib/api";
+import { isJiraCoreFieldRequired } from "../lib/jiraCreateMetadata";
 import { mergeAiReferenceImagesWithinBudget, parseExternalLinks, readImageFiles } from "../lib/aiDesignStudio";
 import { areFeatureFlagsEnabled } from "../lib/featureFlags";
+import { safeBugReportReturnRoute } from "../lib/bugReportNavigation";
 import { hasPermission } from "../lib/permissions";
 import { getJiraBrowseUrl } from "../lib/jiraBrowseUrl";
 import { readDefaultCatalogViewMode } from "../lib/viewPreferences";
@@ -45,6 +49,8 @@ type IssueDraft = {
   jira_bug_key: string;
   linked_test_run_id: string;
   linked_test_case_ids: string[];
+  linked_test_suite_ids: string[];
+  linked_module_ids: string[];
   linked_requirement_ids: string[];
   assignee_id: string;
   root_cause: string;
@@ -56,11 +62,15 @@ type IssueDraft = {
 };
 
 const DEFAULT_ISSUE_STATUS_OPTIONS = [
-  { value: "open", label: "Open" },
-  { value: "reviewed", label: "Reviewed" },
-  { value: "planned", label: "Planned" },
-  { value: "closed", label: "Closed" }
+  { value: "To Do", label: "To Do", category_key: "new", category_name: "To Do" },
+  { value: "In Progress", label: "In Progress", category_key: "indeterminate", category_name: "In Progress" },
+  { value: "Done", label: "Done", category_key: "done", category_name: "Done" }
 ];
+
+function jiraStatusOptionLabel(option: { label: string; category_name?: string | null; current?: boolean }) {
+  const category = String(option.category_name || "").trim();
+  return `${option.label}${category && category.toLowerCase() !== option.label.toLowerCase() ? ` · ${category}` : ""}${option.current ? " · current" : ""}`;
+}
 
 const ISSUE_SEVERITY_OPTIONS = [
   { value: "", label: "Not set" },
@@ -79,7 +89,7 @@ const ISSUE_PRIORITY_OPTIONS = [
   { value: "Lowest", label: "Lowest" }
 ];
 
-const createEmptyIssueDraft = (defaultStatus = "open"): IssueDraft => ({
+const createEmptyIssueDraft = (defaultStatus = "To Do"): IssueDraft => ({
   title: "",
   message: "",
   steps_to_reproduce: "",
@@ -92,6 +102,8 @@ const createEmptyIssueDraft = (defaultStatus = "open"): IssueDraft => ({
   jira_bug_key: "",
   linked_test_run_id: "",
   linked_test_case_ids: [],
+  linked_test_suite_ids: [],
+  linked_module_ids: [],
   linked_requirement_ids: [],
   assignee_id: "",
   root_cause: "",
@@ -128,6 +140,18 @@ const createIssueDraftFromQuery = (searchParams: URLSearchParams, defaultStatus:
     searchParams.get("linked_requirement_ids"),
     searchParams.get("requirements")
   );
+  const linkedTestSuiteIds = parseQueryIdList(
+    searchParams.get("suite"),
+    searchParams.get("suiteId"),
+    searchParams.get("linked_test_suite_ids"),
+    searchParams.get("suites")
+  );
+  const linkedModuleIds = parseQueryIdList(
+    searchParams.get("module"),
+    searchParams.get("moduleId"),
+    searchParams.get("linked_module_ids"),
+    searchParams.get("modules")
+  );
   const title = searchParams.get("title") || (runId ? `Run bug: ${runId}` : "");
   const message = searchParams.get("message") || [
     "Reported from run details.",
@@ -152,6 +176,8 @@ const createIssueDraftFromQuery = (searchParams: URLSearchParams, defaultStatus:
     jira_bug_key: searchParams.get("jira") || searchParams.get("jiraBugKey") || "",
     linked_test_run_id: runId,
     linked_test_case_ids: linkedTestCaseIds,
+    linked_test_suite_ids: linkedTestSuiteIds,
+    linked_module_ids: linkedModuleIds,
     linked_requirement_ids: linkedRequirementIds,
     assignee_id: "",
     root_cause: "",
@@ -181,6 +207,8 @@ const buildIssuePayload = (draft: IssueDraft, userId: string) => ({
   jira_bug_key: optionalDraftValue(draft.jira_bug_key),
   linked_test_run_id: optionalDraftValue(draft.linked_test_run_id),
   linked_test_case_ids: draft.linked_test_case_ids,
+  linked_test_suite_ids: draft.linked_test_suite_ids,
+  linked_module_ids: draft.linked_module_ids,
   linked_requirement_ids: draft.linked_requirement_ids,
   assignee_id: optionalDraftValue(draft.assignee_id),
   root_cause: optionalDraftValue(draft.root_cause),
@@ -313,6 +341,7 @@ function ImpactCheckboxPicker({
 
 export function IssuesPage() {
   const queryClient = useQueryClient();
+  const navigate = useNavigate();
   const { session } = useAuth();
   const [projectId] = useCurrentProject();
   const featureFlagsQuery = useFeatureFlags(Boolean(session));
@@ -324,8 +353,10 @@ export function IssuesPage() {
   const canUseAiBugTriage = hasPermission(session, "feedback.manage")
     && areFeatureFlagsEnabled(featureFlagsQuery.data, ["qaira.ai.bug_triage"]);
   const [searchParams, setSearchParams] = useSearchParams();
+  const bugReturnTo = safeBugReportReturnRoute(searchParams.get("returnTo"));
+  const bugReturnLabel = String(searchParams.get("returnLabel") || "previous QA screen").slice(0, 80);
   const issueMetadata = domainMetadataQuery.data?.issues || domainMetadataQuery.data?.feedback;
-  const defaultIssueStatus = issueMetadata?.default_status || "open";
+  const defaultIssueStatus = issueMetadata?.default_status || "To Do";
   const issueStatusOptions = issueMetadata?.statuses?.length ? issueMetadata.statuses : DEFAULT_ISSUE_STATUS_OPTIONS;
   const jiraSprints = domainMetadataQuery.data?.jira?.sprints || [];
   const jiraVersions = (domainMetadataQuery.data?.jira?.versions || []).filter((version) => !version.archived);
@@ -339,7 +370,6 @@ export function IssuesPage() {
   const [selectedActionIssueIds, setSelectedActionIssueIds] = useState<string[]>([]);
   const [issueSearch, setIssueSearch] = useState("");
   const deferredIssueSearch = useDeferredValue(issueSearch);
-  const [isReportMenuOpen, setIsReportMenuOpen] = useState(false);
   const [isAiBugDraftOpen, setIsAiBugDraftOpen] = useState(false);
   const [aiIntent, setAiIntent] = useState("");
   const [aiEvidence, setAiEvidence] = useState("");
@@ -353,13 +383,14 @@ export function IssuesPage() {
   const [aiDraftMessage, setAiDraftMessage] = useState("");
   const [isAiContextCollapsed, setIsAiContextCollapsed] = useState(false);
   const [hasAppliedBugContextDefaults, setHasAppliedBugContextDefaults] = useState(true);
+  const [hasAppliedAiBugContextDefaults, setHasAppliedAiBugContextDefaults] = useState(true);
   const shouldLoadBugContext = isCreating || Boolean(selectedIssueId) || isAiBugDraftOpen;
-  const { issues, users, executions, testCases, requirements } = useWorkspaceData({
+  const { issues, users, executions, testCases, testSuites, requirements } = useWorkspaceData({
     roles: false,
     projects: false,
     projectMembers: false,
     appTypes: false,
-    testSuites: false,
+    testSuites: shouldLoadBugContext,
     executionResults: false,
     issuesProjection: "summary",
     users: shouldLoadBugContext,
@@ -367,6 +398,12 @@ export function IssuesPage() {
     testCases: shouldLoadBugContext,
     requirements: shouldLoadBugContext,
     testCasesProjection: "summary"
+  });
+  const testCaseModulesQuery = useQuery({
+    queryKey: ["test-case-modules", projectId, "bug-scope"],
+    queryFn: () => api.testCaseModules.list(),
+    enabled: Boolean(projectId && shouldLoadBugContext),
+    staleTime: 30_000
   });
   const selectedIssueQuery = useQuery({
     queryKey: ["bug-detail", projectId, selectedIssueId],
@@ -380,11 +417,19 @@ export function IssuesPage() {
     enabled: Boolean(projectId && isCreating),
     staleTime: 5 * 60_000
   });
+  const bugEditMetadataQuery = useQuery({
+    queryKey: ["bug-edit-metadata", projectId, selectedIssueId],
+    queryFn: () => api.issues.editMetadata(selectedIssueId, { project_id: projectId }),
+    enabled: Boolean(projectId && selectedIssueId && !isCreating),
+    staleTime: 60_000
+  });
 
   const items = issues.data || [];
   const userItems = users.data || [];
   const executionItems = executions.data || [];
   const testCaseItems = testCases.data || [];
+  const testSuiteItems = testSuites.data || [];
+  const testCaseModuleItems = testCaseModulesQuery.data || [];
   const requirementItems = requirements.data || [];
   const executionById = useMemo(() => new Map(executionItems.map((execution) => [execution.id, execution])), [executionItems]);
   const testCaseById = useMemo(() => new Map(testCaseItems.map((testCase) => [testCase.id, testCase])), [testCaseItems]);
@@ -403,11 +448,30 @@ export function IssuesPage() {
   const updateDraftLinkedTestCases = (nextIds: string[]) => {
     const uniqueIds = [...new Set(nextIds)];
     const autoRequirementIds = requirementIdsFromTestCases(uniqueIds);
+    const selectedCases = uniqueIds.map((testCaseId) => testCaseById.get(testCaseId)).filter(Boolean);
+    const autoSuiteIds = selectedCases.flatMap((testCase) => testCase?.suite_ids || (testCase?.suite_id ? [testCase.suite_id] : []));
+    const autoModuleIds = selectedCases.flatMap((testCase) => testCase?.module_ids || []);
 
     setDraft((current) => ({
       ...current,
       linked_test_case_ids: uniqueIds,
+      linked_test_suite_ids: [...new Set([...current.linked_test_suite_ids, ...autoSuiteIds])],
+      linked_module_ids: [...new Set([...current.linked_module_ids, ...autoModuleIds])],
       linked_requirement_ids: [...new Set([...current.linked_requirement_ids, ...autoRequirementIds])]
+    }));
+  };
+  const updateDraftLinkedSuites = (nextIds: string[]) => {
+    const uniqueIds = [...new Set(nextIds)];
+    setDraft((current) => ({
+      ...current,
+      linked_test_suite_ids: uniqueIds
+    }));
+  };
+  const updateDraftLinkedModules = (nextIds: string[]) => {
+    const uniqueIds = [...new Set(nextIds)];
+    setDraft((current) => ({
+      ...current,
+      linked_module_ids: uniqueIds
     }));
   };
   const updateDraftLinkedRequirements = (nextIds: string[]) => {
@@ -446,6 +510,24 @@ export function IssuesPage() {
         ].filter(Boolean).join(" · ")
       })),
     [requirementItems]
+  );
+  const suiteImpactOptions = useMemo<ImpactPickerOption[]>(
+    () => testSuiteItems.map((suite) => ({
+      id: suite.id,
+      displayId: suite.display_id,
+      title: suite.name,
+      meta: `${testCaseItems.filter((testCase) => (testCase.suite_ids || (testCase.suite_id ? [testCase.suite_id] : [])).includes(suite.id)).length} test cases`
+    })),
+    [testCaseItems, testSuiteItems]
+  );
+  const moduleImpactOptions = useMemo<ImpactPickerOption[]>(
+    () => testCaseModuleItems.map((module) => ({
+      id: module.id,
+      displayId: module.display_id,
+      title: module.name,
+      meta: `${module.test_case_count || module.test_case_ids?.length || 0} test cases`
+    })),
+    [testCaseModuleItems]
   );
   const assigneeLabelById = useMemo(
     () => new Map(userItems.map((user) => [user.id, user.name || user.email || user.id])),
@@ -503,10 +585,31 @@ export function IssuesPage() {
   }, [assigneeLabelById, deferredIssueSearch, items, runLabelById]);
   const visibleIssueIds = useMemo(() => filteredItems.map((item) => item.id), [filteredItems]);
   const areAllFilteredIssuesSelected = visibleIssueIds.length > 0 && visibleIssueIds.every((id) => selectedActionIssueIds.includes(id));
-  const openIssueCount = items.filter((item) => (item.status || defaultIssueStatus) === defaultIssueStatus).length;
+  const statusCategoryByName = useMemo(
+    () => new Map(issueStatusOptions.map((option) => [option.value.toLowerCase(), String(option.category_key || option.category_name || "").toLowerCase()])),
+    [issueStatusOptions]
+  );
+  const openIssueCount = items.filter((item) => {
+    const category = String(item.status_category || statusCategoryByName.get(String(item.status || defaultIssueStatus).toLowerCase()) || "").toLowerCase();
+    return category !== "done";
+  }).length;
   const selectedItem = selectedIssueQuery.data
     || (!selectedIssueQuery.isLoading ? items.find((item) => item.id === selectedIssueId) || null : null);
-  const requiredJiraBugFields = bugCreateMetadataQuery.data?.required_fields || [];
+  const activeBugMetadata = isCreating ? bugCreateMetadataQuery.data : bugEditMetadataQuery.data;
+  const activeBugStatusOptions = useMemo(() => {
+    const workflowOptions = activeBugMetadata?.workflow_statuses?.statuses || [];
+    const baseOptions = workflowOptions.length ? workflowOptions : issueStatusOptions;
+    if (!draft.status || baseOptions.some((option) => option.value === draft.status)) return baseOptions;
+    return [{ value: draft.status, label: draft.status, current: !isCreating }, ...baseOptions];
+  }, [activeBugMetadata?.workflow_statuses?.statuses, draft.status, isCreating, issueStatusOptions]);
+  const requiredJiraBugFields = activeBugMetadata?.required_fields || [];
+  const jiraBugCoreRequired = {
+    priority: isJiraCoreFieldRequired(activeBugMetadata, "priority"),
+    assignee: isJiraCoreFieldRequired(activeBugMetadata, "assignee"),
+    labels: isJiraCoreFieldRequired(activeBugMetadata, "labels"),
+    sprint: isJiraCoreFieldRequired(activeBugMetadata, "sprint"),
+    release: isJiraCoreFieldRequired(activeBugMetadata, "fixVersions", "versions")
+  };
   const updateAdditionalJiraField = (fieldId: string, value: unknown) => {
     setDraft((current) => ({
       ...current,
@@ -515,126 +618,6 @@ export function IssuesPage() {
         [fieldId]: value
       }
     }));
-  };
-  const renderAdditionalJiraField = (field: JiraCreateFieldMetadata) => {
-    const schemaType = String(field.schema?.type || "").toLowerCase();
-    const itemType = String(field.schema?.items || "").toLowerCase();
-    const customType = String(field.schema?.custom || "").toLowerCase();
-    const allowedValues = field.allowed_values || [];
-    const value = draft.additional_fields[field.id];
-
-    if (allowedValues.length && (schemaType === "array" || itemType)) {
-      const selectedValues = Array.isArray(value) ? value.map(String) : [];
-      return (
-        <FormField
-          hint={`Required by Jira Bug create metadata. Field ID: ${field.id}`}
-          key={field.id}
-          label={field.name}
-          required
-        >
-          <select
-            multiple
-            onChange={(event) => updateAdditionalJiraField(field.id, Array.from(event.currentTarget.selectedOptions, (option) => option.value))}
-            size={Math.min(6, Math.max(3, allowedValues.length))}
-            value={selectedValues}
-          >
-            {allowedValues.map((option) => (
-              <option key={option.id || option.value || option.name || option.label} value={option.id || option.value || option.name || option.label || ""}>
-                {option.label || option.name || option.value || option.id}
-              </option>
-            ))}
-          </select>
-        </FormField>
-      );
-    }
-
-    if (allowedValues.length) {
-      return (
-        <FormField
-          hint={`Required by Jira Bug create metadata. Field ID: ${field.id}`}
-          key={field.id}
-          label={field.name}
-          required
-        >
-          <select value={String(value || "")} onChange={(event) => updateAdditionalJiraField(field.id, event.target.value)}>
-            <option value="">Select {field.name}</option>
-            {allowedValues.map((option) => (
-              <option key={option.id || option.value || option.name || option.label} value={option.id || option.value || option.name || option.label || ""}>
-                {option.label || option.name || option.value || option.id}
-              </option>
-            ))}
-          </select>
-        </FormField>
-      );
-    }
-
-    if (schemaType === "user") {
-      return (
-        <FormField
-          hint={`Required by Jira Bug create metadata. Field ID: ${field.id}`}
-          key={field.id}
-          label={field.name}
-          required
-        >
-          <select value={String(value || "")} onChange={(event) => updateAdditionalJiraField(field.id, event.target.value)}>
-            <option value="">Select user</option>
-            {userItems.map((user) => (
-              <option key={user.id} value={user.id}>{user.name || user.email || user.id}</option>
-            ))}
-          </select>
-        </FormField>
-      );
-    }
-
-    if (schemaType === "number") {
-      return (
-        <FormField
-          hint={`Required by Jira Bug create metadata. Field ID: ${field.id}`}
-          key={field.id}
-          label={field.name}
-          required
-        >
-          <input type="number" value={String(value || "")} onChange={(event) => updateAdditionalJiraField(field.id, event.target.value)} />
-        </FormField>
-      );
-    }
-
-    if (schemaType === "date" || schemaType === "datetime") {
-      return (
-        <FormField
-          hint={`Required by Jira Bug create metadata. Field ID: ${field.id}`}
-          key={field.id}
-          label={field.name}
-          required
-        >
-          <input type={schemaType === "date" ? "date" : "datetime-local"} value={String(value || "")} onChange={(event) => updateAdditionalJiraField(field.id, event.target.value)} />
-        </FormField>
-      );
-    }
-
-    if (customType.includes(":textarea")) {
-      return (
-        <FormField
-          hint={`Required by Jira Bug create metadata. Field ID: ${field.id}`}
-          key={field.id}
-          label={field.name}
-          required
-        >
-          <textarea rows={4} value={String(value || "")} onChange={(event) => updateAdditionalJiraField(field.id, event.target.value)} />
-        </FormField>
-      );
-    }
-
-    return (
-      <FormField
-        hint={`Required by Jira Bug create metadata. Field ID: ${field.id}`}
-        key={field.id}
-        label={field.name}
-        required
-      >
-        <input value={String(value || "")} onChange={(event) => updateAdditionalJiraField(field.id, event.target.value)} />
-      </FormField>
-    );
   };
   const syncIssueSearchParams = (issueId?: string | null) => {
     const currentIssueId = searchParams.get("issue") || "";
@@ -862,6 +845,8 @@ export function IssuesPage() {
         jira_bug_key: selectedItem.jira_bug_key || "",
         linked_test_run_id: selectedItem.linked_test_run_id || "",
         linked_test_case_ids: selectedItem.linked_test_case_ids || [],
+        linked_test_suite_ids: selectedItem.linked_test_suite_ids || [],
+        linked_module_ids: selectedItem.linked_module_ids || [],
         linked_requirement_ids: selectedItem.linked_requirement_ids || [],
         assignee_id: selectedItem.assignee_id || "",
         root_cause: selectedItem.root_cause || "",
@@ -881,19 +866,32 @@ export function IssuesPage() {
   }, [defaultIssueStatus, emptyDraft, isCreating, selectedIssueId, selectedItem]);
 
   useEffect(() => {
-    if (!isCreating || hasAppliedBugContextDefaults || !draft.linked_test_case_ids.length || !testCaseItems.length) {
+    if (isCreating || !selectedItem || !bugEditMetadataQuery.data) return;
+    setDraft((current) => ({
+      ...current,
+      additional_fields: { ...(bugEditMetadataQuery.data.current_values || {}) }
+    }));
+  }, [bugEditMetadataQuery.data, isCreating, selectedItem]);
+
+  useEffect(() => {
+    if (!isCreating || hasAppliedBugContextDefaults || !testCaseItems.length) {
       return;
     }
 
-    const autoRequirementIds = requirementIdsFromTestCases(draft.linked_test_case_ids);
-    if (autoRequirementIds.length) {
-      setDraft((current) => ({
-        ...current,
-        linked_requirement_ids: [...new Set([...current.linked_requirement_ids, ...autoRequirementIds])]
-      }));
-    }
+    const scopedCases = testCaseItems.filter((testCase) => draft.linked_test_case_ids.includes(testCase.id));
+    const scopedCaseIds = scopedCases.map((testCase) => testCase.id);
+    const autoRequirementIds = requirementIdsFromTestCases(scopedCaseIds);
+    const autoSuiteIds = scopedCases.flatMap((testCase) => testCase.suite_ids || (testCase.suite_id ? [testCase.suite_id] : []));
+    const autoModuleIds = scopedCases.flatMap((testCase) => testCase.module_ids || []);
+    setDraft((current) => ({
+      ...current,
+      linked_test_case_ids: [...new Set([...current.linked_test_case_ids, ...scopedCaseIds])],
+      linked_test_suite_ids: [...new Set([...current.linked_test_suite_ids, ...autoSuiteIds])],
+      linked_module_ids: [...new Set([...current.linked_module_ids, ...autoModuleIds])],
+      linked_requirement_ids: [...new Set([...current.linked_requirement_ids, ...autoRequirementIds])]
+    }));
     setHasAppliedBugContextDefaults(true);
-  }, [draft.linked_test_case_ids, hasAppliedBugContextDefaults, isCreating, testCaseItems]);
+  }, [draft.linked_module_ids, draft.linked_test_case_ids, draft.linked_test_suite_ids, hasAppliedBugContextDefaults, isCreating, testCaseItems]);
 
   const refresh = async () => {
     await Promise.all([
@@ -910,11 +908,9 @@ export function IssuesPage() {
     setSelectedIssueId("");
     setDraft(emptyDraft);
     setHasAppliedBugContextDefaults(true);
-    setIsReportMenuOpen(false);
   };
 
   const openAiBugReport = () => {
-    setIsReportMenuOpen(false);
     setAiDraftPreview(null);
     setAiDraftMessage("");
     setAiIntent("");
@@ -923,10 +919,41 @@ export function IssuesPage() {
     setAiExternalLinksText("");
     setAiReferenceImages([]);
     setAiLinkedRunId(searchParams.get("run") || "");
-    setAiLinkedCaseIds([]);
-    setAiLinkedRequirementIds([]);
+    setAiLinkedCaseIds(parseQueryIdList(searchParams.get("linked_test_case_ids"), searchParams.get("testCase")));
+    setAiLinkedRequirementIds(parseQueryIdList(searchParams.get("linked_requirement_ids"), searchParams.get("requirement")));
+    setHasAppliedAiBugContextDefaults(false);
     setIsAiBugDraftOpen(true);
   };
+
+  useEffect(() => {
+    if (!isAiBugDraftOpen || hasAppliedAiBugContextDefaults || !testCaseItems.length) return;
+    const explicitCaseIds = parseQueryIdList(searchParams.get("linked_test_case_ids"), searchParams.get("testCase"));
+    const moduleIds = parseQueryIdList(searchParams.get("linked_module_ids"), searchParams.get("module"));
+    const suiteIds = parseQueryIdList(searchParams.get("linked_test_suite_ids"), searchParams.get("suite"));
+    const scopedCases = explicitCaseIds.length
+      ? testCaseItems.filter((testCase) => explicitCaseIds.includes(testCase.id))
+      : moduleIds.length
+        ? testCaseItems.filter((testCase) => (testCase.module_ids || []).some((moduleId) => moduleIds.includes(moduleId)))
+        : suiteIds.length
+          ? testCaseItems.filter((testCase) => (testCase.suite_ids || (testCase.suite_id ? [testCase.suite_id] : [])).some((suiteId) => suiteIds.includes(suiteId)))
+          : [];
+    const scopedCaseIds = scopedCases.map((testCase) => testCase.id);
+    setAiLinkedCaseIds((current) => [...new Set([...current, ...scopedCaseIds])]);
+    setAiLinkedRequirementIds((current) => [...new Set([...current, ...requirementIdsFromTestCases(scopedCaseIds)])]);
+    setHasAppliedAiBugContextDefaults(true);
+  }, [hasAppliedAiBugContextDefaults, isAiBugDraftOpen, searchParams, testCaseItems]);
+
+  useEffect(() => {
+    if (searchParams.get("ai") !== "1") return;
+    openAiBugReport();
+    setSearchParams((previous) => {
+      const next = new URLSearchParams(previous);
+      next.delete("ai");
+      return next;
+    }, { replace: true });
+  // Query-driven launch should run once; the callback intentionally reads the captured URL context.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchParams, setSearchParams]);
 
   const handleAddAiReferenceImages = async (files: FileList | null) => {
     try {
@@ -975,6 +1002,13 @@ export function IssuesPage() {
       return;
     }
     const candidate = aiDraftPreview.draft;
+    const contextualCaseIds = parseQueryIdList(searchParams.get("linked_test_case_ids"), searchParams.get("testCase"));
+    const isHierarchyScopedContext = !contextualCaseIds.length && Boolean(
+      searchParams.get("linked_module_ids")
+      || searchParams.get("module")
+      || searchParams.get("linked_test_suite_ids")
+      || searchParams.get("suite")
+    );
     setDraft({
       ...emptyDraft,
       title: candidate.title,
@@ -988,7 +1022,9 @@ export function IssuesPage() {
       build: candidate.build,
       labelsText: candidate.labels.join(", "),
       linked_test_run_id: candidate.linked_test_run_id,
-      linked_test_case_ids: candidate.linked_test_case_ids,
+      linked_test_case_ids: isHierarchyScopedContext ? [] : candidate.linked_test_case_ids,
+      linked_test_suite_ids: parseQueryIdList(searchParams.get("linked_test_suite_ids"), searchParams.get("suite")),
+      linked_module_ids: parseQueryIdList(searchParams.get("linked_module_ids"), searchParams.get("module")),
       linked_requirement_ids: candidate.linked_requirement_ids
     });
     setHasAppliedBugContextDefaults(false);
@@ -1002,9 +1038,11 @@ export function IssuesPage() {
 
   const createIssue = useMutation({
     mutationFn: api.issues.create,
-    onSuccess: async () => {
+    onSuccess: async (response) => {
       setMessageTone("success");
-      setMessage("Bug saved.");
+      setMessage(response.status_warning
+        ? `${response.status_warning.message} The bug was saved in Jira's current status.`
+        : "Bug saved.");
       await refresh();
     },
     onError: (error) => {
@@ -1051,9 +1089,15 @@ export function IssuesPage() {
       return;
     }
 
-    if (isCreating && bugCreateMetadataQuery.isLoading) {
+    if ((isCreating && bugCreateMetadataQuery.isLoading) || (!isCreating && bugEditMetadataQuery.isLoading)) {
       setMessageTone("success");
-      setMessage("Checking this Jira project's Bug create fields. Try again in a moment.");
+      setMessage(`Checking this Jira Bug's ${isCreating ? "create" : "edit"} fields. Try again in a moment.`);
+      return;
+    }
+
+    if ((isCreating && bugCreateMetadataQuery.isError) || (!isCreating && bugEditMetadataQuery.isError)) {
+      setMessageTone("error");
+      setMessage(`Qaira could not verify this Jira Bug ${isCreating ? "create" : "edit"} screen. Refresh before saving.`);
       return;
     }
 
@@ -1072,17 +1116,26 @@ export function IssuesPage() {
   };
 
   const closeIssueWorkspace = () => {
+    if (bugReturnTo) {
+      navigate(bugReturnTo);
+      return;
+    }
     syncIssueSearchParams(null);
     setSelectedIssueId("");
     setIsCreating(false);
     setDraft(emptyDraft);
   };
 
+  const closeAiBugReport = () => {
+    setIsAiBugDraftOpen(false);
+    if (bugReturnTo && !isCreating && !selectedIssueId) navigate(bugReturnTo);
+  };
+
   return (
     <div className="page-content">
       {confirmationDialog}
       {isAiBugDraftOpen ? (
-        <div className="modal-backdrop modal-backdrop--scroll" onClick={() => setIsAiBugDraftOpen(false)} role="presentation">
+        <div className="modal-backdrop modal-backdrop--scroll" onClick={closeAiBugReport} role="presentation">
           <div
             aria-labelledby="ai-bug-draft-title"
             aria-modal="true"
@@ -1099,7 +1152,7 @@ export function IssuesPage() {
               <DialogCloseButton
                 disabled={previewAiBugDraft.isPending}
                 label="Close AI bug draft"
-                onClick={() => setIsAiBugDraftOpen(false)}
+                onClick={closeAiBugReport}
               />
             </div>
 
@@ -1269,49 +1322,11 @@ export function IssuesPage() {
                 onSelectAll={() => setSelectedActionIssueIds((current) => Array.from(new Set([...current, ...visibleIssueIds])))}
                 selectedCount={selectedActionIssueIds.length}
               />
-              <div
-                className={[
-                  "create-run-action-button",
-                  "report-bug-split-action-button",
-                  "issue-report-split",
-                  canUseAiBugTriage ? "" : "is-single"
-                ].filter(Boolean).join(" ")}
-              >
-                <button
-                  className="run-action-main issue-report-split-main"
-                  onClick={openManualBugReport}
-                  type="button"
-                >
-                  <BugIcon />
-                  <span>Report Bug</span>
-                </button>
-                {canUseAiBugTriage ? (
-                  <>
-                    <button
-                      aria-expanded={isReportMenuOpen}
-                      aria-haspopup="menu"
-                      aria-label="More bug reporting options"
-                      className="run-action-toggle issue-report-split-toggle"
-                      onClick={() => setIsReportMenuOpen((current) => !current)}
-                      type="button"
-                    >
-                      <svg aria-hidden="true" fill="none" height="16" viewBox="0 0 24 24" width="16">
-                        <path d="m7 10 5 5 5-5" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" />
-                      </svg>
-                    </button>
-                    {isReportMenuOpen ? (
-                      <div className="issue-report-split-menu" role="menu">
-                        <button onClick={openAiBugReport} role="menuitem" type="button">
-                          <SparkIcon />
-                          <span>
-                            <strong>Report Bug using AI</strong>
-                          </span>
-                        </button>
-                      </div>
-                    ) : null}
-                  </>
-                ) : null}
-              </div>
+              <ReportBugSplitActionButton
+                canUseAi={canUseAiBugTriage}
+                onReportBug={openManualBugReport}
+                onReportBugWithAi={openAiBugReport}
+              />
               {selectedActionIssueIds.length ? (
                 <button className="ghost-button catalog-selection-button" onClick={handleExportIssuesCsv} type="button">
                   <ExportIcon />
@@ -1404,7 +1419,7 @@ export function IssuesPage() {
         )}
         detailView={(
           <Panel
-            actions={<WorkspaceBackButton label="Back to bug tiles" onClick={closeIssueWorkspace} />}
+            actions={<WorkspaceBackButton label={bugReturnTo ? `Back to ${bugReturnLabel}` : "Back to bug tiles"} onClick={closeIssueWorkspace} />}
             title={isCreating ? "Report bug" : selectedItem ? "Bug details" : "Bug editor"}
             subtitle="Capture the bug in a Jira-ready structure with run context, reproduction evidence, ownership, and root cause."
           >
@@ -1430,8 +1445,8 @@ export function IssuesPage() {
                   <div className="issue-form-compact-grid issue-form-classification-grid">
                     <FormField className="form-field--compact-enum bug-field-status" label="Status">
                       <select value={draft.status} onChange={(event) => setDraft((current) => ({ ...current, status: event.target.value }))}>
-                        {issueStatusOptions.map((option) => (
-                          <option key={option.value} value={option.value}>{option.label}</option>
+                        {activeBugStatusOptions.map((option) => (
+                          <option key={option.value} value={option.value}>{jiraStatusOptionLabel(option)}</option>
                         ))}
                       </select>
                     </FormField>
@@ -1442,15 +1457,15 @@ export function IssuesPage() {
                         ))}
                       </select>
                     </FormField>
-                    <FormField className="form-field--compact-enum bug-field-priority" label="Priority">
-                      <select value={draft.priority} onChange={(event) => setDraft((current) => ({ ...current, priority: event.target.value }))}>
+                    <FormField className="form-field--compact-enum bug-field-priority" label="Priority" required={jiraBugCoreRequired.priority}>
+                      <select required={jiraBugCoreRequired.priority} value={draft.priority} onChange={(event) => setDraft((current) => ({ ...current, priority: event.target.value }))}>
                         {ISSUE_PRIORITY_OPTIONS.map((option) => (
                           <option key={option.value || "none"} value={option.value}>{option.label}</option>
                         ))}
                       </select>
                     </FormField>
-                    <FormField className="bug-field-assignee" label="Assignee">
-                      <select value={draft.assignee_id} onChange={(event) => setDraft((current) => ({ ...current, assignee_id: event.target.value }))}>
+                    <FormField className="bug-field-assignee" label="Assignee" required={jiraBugCoreRequired.assignee}>
+                      <select required={jiraBugCoreRequired.assignee} value={draft.assignee_id} onChange={(event) => setDraft((current) => ({ ...current, assignee_id: event.target.value }))}>
                         <option value="">Unassigned</option>
                         {userItems.map((user) => (
                           <option key={user.id} value={user.id}>{user.name || user.email || user.id}</option>
@@ -1480,6 +1495,22 @@ export function IssuesPage() {
                   </div>
                   <div className="issue-form-grid issue-form-impact-grid">
                     <ImpactCheckboxPicker
+                      emptyText="No test suites are available for this project."
+                      items={suiteImpactOptions}
+                      label="Impacted Test Suites"
+                      onChange={updateDraftLinkedSuites}
+                      placeholder="Search test suites"
+                      selectedIds={draft.linked_test_suite_ids}
+                    />
+                    <ImpactCheckboxPicker
+                      emptyText="No test case modules are available for this project."
+                      items={moduleImpactOptions}
+                      label="Impacted Modules"
+                      onChange={updateDraftLinkedModules}
+                      placeholder="Search modules"
+                      selectedIds={draft.linked_module_ids}
+                    />
+                    <ImpactCheckboxPicker
                       emptyText="No test cases are available for this project."
                       items={testCaseImpactOptions}
                       label="Impacted Test Cases"
@@ -1497,17 +1528,17 @@ export function IssuesPage() {
                     />
                   </div>
                   <div className="issue-form-grid issue-form-grid--triple">
-                    <FormField label="Labels">
-                      <input placeholder="regression, checkout" value={draft.labelsText} onChange={(event) => setDraft((current) => ({ ...current, labelsText: event.target.value }))} />
+                    <FormField label="Labels" required={jiraBugCoreRequired.labels}>
+                      <input required={jiraBugCoreRequired.labels} placeholder="regression, checkout" value={draft.labelsText} onChange={(event) => setDraft((current) => ({ ...current, labelsText: event.target.value }))} />
                     </FormField>
-                    <FormField label="Sprint">
-                      <select value={draft.sprint} onChange={(event) => setDraft((current) => ({ ...current, sprint: event.target.value }))}>
+                    <FormField label="Sprint" required={jiraBugCoreRequired.sprint}>
+                      <select required={jiraBugCoreRequired.sprint} value={draft.sprint} onChange={(event) => setDraft((current) => ({ ...current, sprint: event.target.value }))}>
                         <option value="">No sprint</option>
                         {jiraSprints.map((sprint) => <option key={sprint.id} value={sprint.name}>{sprint.name}{sprint.state ? ` · ${sprint.state}` : ""}</option>)}
                       </select>
                     </FormField>
-                    <FormField label="Release / Fix version">
-                      <select value={draft.release} onChange={(event) => setDraft((current) => ({ ...current, release: event.target.value }))}>
+                    <FormField label="Release / Fix version" required={jiraBugCoreRequired.release}>
+                      <select required={jiraBugCoreRequired.release} value={draft.release} onChange={(event) => setDraft((current) => ({ ...current, release: event.target.value }))}>
                         <option value="">No release</option>
                         {jiraVersions.map((version) => <option key={version.id} value={version.name}>{version.name}{version.released ? " · released" : ""}</option>)}
                       </select>
@@ -1515,20 +1546,27 @@ export function IssuesPage() {
                   </div>
                 </section>
 
-                {isCreating && (bugCreateMetadataQuery.isLoading || requiredJiraBugFields.length) ? (
+                {(isCreating ? bugCreateMetadataQuery.isLoading || bugCreateMetadataQuery.isError : bugEditMetadataQuery.isLoading || bugEditMetadataQuery.isError) || requiredJiraBugFields.length ? (
                   <section className="issue-form-section">
                     <div className="issue-form-section-head">
                       <strong>Jira required fields</strong>
                       <span>
-                        These fields come from this project’s Jira Bug create screen. Qaira collects them before creating the Bug so Jira validation does not fail after submission.
+                        These fields come from the live Jira Bug {isCreating ? "create" : "edit"} screen and are written back to Jira with this save.
                       </span>
                     </div>
-                    {bugCreateMetadataQuery.isLoading ? (
-                      <LoadingState label="Checking Jira Bug create fields" />
+                    {(isCreating ? bugCreateMetadataQuery.isLoading : bugEditMetadataQuery.isLoading) ? (
+                      <LoadingState label={`Checking Jira Bug ${isCreating ? "create" : "edit"} fields`} />
+                    ) : (isCreating ? bugCreateMetadataQuery.isError : bugEditMetadataQuery.isError) ? (
+                      <p className="inline-message error-message">Qaira could not verify this Jira Bug {isCreating ? "create" : "edit"} screen. Refresh or ask a Jira administrator to check the app field-metadata permission.</p>
                     ) : (
-                      <div className="issue-form-grid issue-form-grid--triple">
-                        {requiredJiraBugFields.map(renderAdditionalJiraField)}
-                      </div>
+                      <JiraRequiredFields
+                        fields={requiredJiraBugFields}
+                        issueTypeName="Bug"
+                        mode={isCreating ? "create" : "edit"}
+                        onChange={updateAdditionalJiraField}
+                        users={userItems}
+                        values={draft.additional_fields}
+                      />
                     )}
                   </section>
                 ) : null}
@@ -1595,12 +1633,12 @@ export function IssuesPage() {
                 <div className="action-row">
                   <button
                     className="primary-button"
-                    disabled={createIssue.isPending || updateIssue.isPending || (isCreating && bugCreateMetadataQuery.isLoading)}
+                    disabled={createIssue.isPending || updateIssue.isPending || (isCreating ? bugCreateMetadataQuery.isLoading || bugCreateMetadataQuery.isError : bugEditMetadataQuery.isLoading || bugEditMetadataQuery.isError)}
                     type="submit"
                   >
                     {createIssue.isPending || updateIssue.isPending
                       ? (isCreating ? "Saving…" : "Updating…")
-                      : isCreating && bugCreateMetadataQuery.isLoading
+                      : (isCreating ? bugCreateMetadataQuery.isLoading : bugEditMetadataQuery.isLoading)
                         ? "Checking Jira fields…"
                         : isCreating ? "Save bug" : "Update bug"}
                   </button>

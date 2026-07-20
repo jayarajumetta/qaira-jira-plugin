@@ -23,6 +23,9 @@ const testEnvironmentSource = read('../static/qaira-ui/src/pages/TestEnvironment
 const recorderSource = read('../static/qaira-ui/src/components/RecorderStartControls.tsx');
 const stepAutomationSource = read('../static/qaira-ui/src/components/StepAutomationEditor.tsx');
 const integrationsSource = read('../static/qaira-ui/src/pages/IntegrationsPage.tsx');
+const overviewSource = read('../static/qaira-ui/src/pages/OverviewPage.tsx');
+const releaseReadinessSource = read('../static/qaira-ui/src/components/ReleaseReadinessDashboard.tsx');
+const releaseReadinessModelSource = read('../static/qaira-ui/src/lib/releaseReadiness.ts');
 const stylesSource = read('../static/qaira-ui/src/styles.css');
 
 test('AI requirement creation reuses the full test-design prompt context and remains review gated', () => {
@@ -44,13 +47,14 @@ test('AI requirement creation reuses the full test-design prompt context and rem
   assert.match(promptContextSource, /Attachment limit exceeded/);
 });
 
-test('hierarchy selection includes parents, grouped children, and unassigned records', () => {
+test('hierarchy selection includes sprint stories, legacy parents, and backlog records', () => {
   assert.match(requirementsSource, /setAllFilteredRequirementItemsSelected/);
   assert.match(requirementsSource, /setIterationAndChildrenSelected/);
   assert.match(requirementsSource, /setUnassignedRequirementsSelected/);
   assert.match(requirementsSource, /getScopedRequirementListColumns/);
   assert.match(requirementsSource, /getVisibleIterationRequirementIds/);
-  assert.match(requirementsSource, /requirementIterationGroups\.groups\.every\(\(\{ iteration \}\) => selectedIterationIds\.includes\(iteration\.id\)\)/);
+  assert.match(requirementsSource, /filter\(\(\{ iteration \}\) => iteration\.source !== "jira"\)/);
+  assert.match(requirementsSource, /iteration\.source === "jira"/);
 
   assert.match(testCasesSource, /setAllFilteredTestCaseItemsSelected/);
   assert.match(testCasesSource, /setModuleAndChildrenSelected/);
@@ -109,7 +113,7 @@ test('suite membership editing is compact, selectable, and supports safe unlink'
   assert.match(designSource, /append: false/);
   assert.match(frontendApiSource, /JSON\.stringify\(\{ test_case_ids, expected_revision, append \}\)/);
   assert.match(apiSource, /body\?\.append === false \? asArray\(body\?\.test_case_ids\)/);
-  assert.match(apiSource, /mapInBatches\(ids, \(testCaseId\) => loadScopedIssue\(testCaseId/);
+  assert.match(apiSource, /await loadScopedIssues\(ids, project, registry/);
 });
 
 test('shared-step automation tools fail closed and reuse icon-first step actions', () => {
@@ -158,6 +162,18 @@ test('run sections live in the sidebar and Jira owns profile and sign-out action
   assert.match(appShellSource, /subItem\.featureKeys/);
   assert.doesNotMatch(appShellSource, /UserProfileDialog/);
   assert.match(appShellSource, /className="ghost-button sidebar-signout"[\s\S]*disabled/);
+});
+
+test('release readiness is a Jira-scoped decision workspace with explainable traceability', () => {
+  assert.match(workspaceSectionsSource, /view=readiness[\s\S]*label: "Release readiness"/);
+  assert.match(overviewSource, /dashboardView === "readiness"[\s\S]*<ReleaseReadinessDashboard/);
+  assert.match(releaseReadinessSource, /Decision brief[\s\S]*Traceability[\s\S]*Execution evidence/);
+  assert.match(releaseReadinessSource, /Fix Version[\s\S]*Sprint/);
+  assert.match(releaseReadinessSource, /Explain with AI/);
+  assert.match(releaseReadinessSource, /Scores guide attention; people own the decision/);
+  assert.match(releaseReadinessModelSource, /latest result per scoped test case/i);
+  assert.match(releaseReadinessModelSource, /openCriticalBugCount/);
+  assert.match(releaseReadinessModelSource, /highPriorityUncoveredCount/);
 });
 
 test('feature flags are externally provisioned and read-only inside the app', () => {

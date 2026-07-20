@@ -1,13 +1,13 @@
 import { ChangeEvent, FormEvent, Fragment, useDeferredValue, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import { createPortal } from "react-dom";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useInfiniteQuery, useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
 import { AiCaseAuthoringModal } from "../components/AiCaseAuthoringModal";
 import { AiAssurancePanel } from "../components/AiAssurancePanel";
 import { AiDesignStudioModal } from "../components/AiDesignStudioModal";
 import { AiInsightPreviewDialog, type AiPreviewFinding } from "../components/AiInsightPreviewDialog";
-import { ActivityIcon, AddIcon, BugIcon, ClearSelectionIcon, CopyIcon, ExportIcon, FolderIcon, MoveIcon, OpenIcon, PauseIcon, PencilIcon, RecordIcon, SelectAllIcon, TrashIcon } from "../components/AppIcons";
+import { ActivityIcon, AddIcon, BugIcon, ClearSelectionIcon, CollapseExpandIcon, CopyIcon, ExportIcon, FolderAddIcon, FolderIcon, MoveIcon, OpenIcon, PauseIcon, PencilIcon, RecordIcon, SelectAllIcon, TrashIcon } from "../components/AppIcons";
 import { CatalogActionMenu } from "../components/CatalogActionMenu";
 import { CatalogViewToggle } from "../components/CatalogViewToggle";
 import { CatalogSearchFilter } from "../components/CatalogSearchFilter";
@@ -20,6 +20,7 @@ import { ExecutionContextSelector } from "../components/ExecutionContextSelector
 import { FormField } from "../components/FormField";
 import { InfoTooltip } from "../components/InfoTooltip";
 import { HierarchyMetricStrip } from "../components/HierarchyMetricStrip";
+import { HierarchyLoadMoreButton } from "../components/HierarchyLoadMoreButton";
 import { JiraAttachmentIcon, JiraAttachmentPanel } from "../components/JiraAttachmentPanel";
 import { LinkedTestCaseModal } from "../components/LinkedTestCaseModal";
 import { LinkedDefectsPanel } from "../components/LinkedDefectsPanel";
@@ -943,6 +944,7 @@ type TestCaseSplitAction = {
 function TestCaseSplitActionButton({
   label,
   icon,
+  iconOnly = false,
   className = "",
   tone = "blue",
   disabled,
@@ -952,6 +954,7 @@ function TestCaseSplitActionButton({
 }: {
   label: string;
   icon: ReactNode;
+  iconOnly?: boolean;
   className?: string;
   tone?: "blue" | "green";
   disabled?: boolean;
@@ -1047,10 +1050,10 @@ function TestCaseSplitActionButton({
   ) : null;
 
   return (
-    <div className={["create-run-action-button", tone === "blue" ? "test-case-split-action-button" : "test-case-run-split-action-button", canOpenMenu ? "" : "is-single", className].filter(Boolean).join(" ")} ref={triggerRef}>
-      <button className="run-action-main issue-report-split-main" disabled={disabled} onClick={onClick} type="button">
+    <div className={["create-run-action-button", tone === "blue" ? "test-case-split-action-button" : "test-case-run-split-action-button", canOpenMenu ? "" : "is-single", iconOnly ? "is-explorer-compact" : "", className].filter(Boolean).join(" ")} ref={triggerRef}>
+      <button aria-label={iconOnly ? label : undefined} className="run-action-main issue-report-split-main" disabled={disabled} onClick={onClick} title={iconOnly ? label : undefined} type="button">
         {icon}
-        <span>{label}</span>
+        {iconOnly ? null : <span>{label}</span>}
       </button>
       {canOpenMenu ? (
         <button
@@ -1256,6 +1259,8 @@ export function TestCasesPage() {
   const [moduleDraftName, setModuleDraftName] = useState("");
   const [moduleDraftDescription, setModuleDraftDescription] = useState("");
   const [collapsedModuleIds, setCollapsedModuleIds] = useState<string[]>([]);
+  const [isModuleHierarchySeeded, setIsModuleHierarchySeeded] = useState(false);
+  const [modulePageCursorsById, setModulePageCursorsById] = useState<Record<string, Array<string | null>>>({});
   const [selectedModuleIds, setSelectedModuleIds] = useState<string[]>([]);
   const [renamingModuleId, setRenamingModuleId] = useState("");
   const [renamingModuleName, setRenamingModuleName] = useState("");
@@ -1416,9 +1421,11 @@ export function TestCasesPage() {
     staleTime: 30_000
   });
   const requestedCaseRouteId = searchParams.get("case") || "";
-  const testCasesQuery = useQuery({
+  const testCasesQuery = useInfiniteQuery({
     queryKey: ["global-test-cases", appTypeId, projectId],
-    queryFn: () => api.testCases.list({ app_type_id: appTypeId, page_size: 25, projection: "detail" }),
+    queryFn: ({ pageParam }) => api.testCases.listPage({ app_type_id: appTypeId, unassigned_module: true, page_size: 15, cursor: pageParam, projection: "detail" }),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (lastPage) => lastPage.next_cursor || undefined,
     enabled: Boolean(appTypeId),
     staleTime: 30_000
   });
@@ -1428,6 +1435,49 @@ export function TestCasesPage() {
     enabled: Boolean(appTypeId),
     staleTime: 30_000
   });
+  useEffect(() => {
+    if (!testCaseModulesQuery.data || isModuleHierarchySeeded) return;
+    setCollapsedModuleIds(testCaseModulesQuery.data.map((module) => module.id));
+    setIsModuleHierarchySeeded(true);
+  }, [isModuleHierarchySeeded, testCaseModulesQuery.data]);
+  useEffect(() => {
+    setIsModuleHierarchySeeded(false);
+    setCollapsedModuleIds([]);
+    setModulePageCursorsById({});
+  }, [appTypeId, projectId]);
+  const expandedModuleHeaders = (testCaseModulesQuery.data || []).filter((module) =>
+    isModuleHierarchySeeded && !collapsedModuleIds.includes(module.id)
+  );
+  const modulePageRequests = expandedModuleHeaders.flatMap((module) =>
+    (modulePageCursorsById[module.id] || [null]).map((cursor, pageIndex) => ({ module, cursor, pageIndex }))
+  );
+  const moduleCaseQueries = useQueries({
+    queries: modulePageRequests.map(({ module, cursor, pageIndex }) => ({
+      queryKey: ["test-case-module-children", projectId, appTypeId, module.id, pageIndex, cursor || "first"],
+      queryFn: () => api.testCaseModules.listCases(module.id, { page_size: 25, cursor: cursor || undefined, projection: "summary" as const }),
+      staleTime: 30_000
+    }))
+  });
+  const modulePageStateById = useMemo(() => modulePageRequests.reduce<Record<string, { loaded: number; total: number; nextCursor: string | null; isFetching: boolean }>>((state, request, index) => {
+    const response = moduleCaseQueries[index];
+    const current = state[request.module.id] || { loaded: 0, total: request.module.test_case_count || 0, nextCursor: null, isFetching: false };
+    current.loaded += response.data?.items.length || 0;
+    current.total = response.data?.total ?? current.total;
+    current.nextCursor = response.data?.next_cursor || null;
+    current.isFetching = current.isFetching || response.isFetching;
+    state[request.module.id] = current;
+    return state;
+  }, {}), [moduleCaseQueries, modulePageRequests]);
+  const loadNextModulePage = (moduleId: string) => {
+    const nextCursor = modulePageStateById[moduleId]?.nextCursor;
+    if (!nextCursor) return;
+    setModulePageCursorsById((current) => ({
+      ...current,
+      [moduleId]: (current[moduleId] || [null]).includes(nextCursor)
+        ? (current[moduleId] || [null])
+        : [...(current[moduleId] || [null]), nextCursor]
+    }));
+  };
   const deepLinkTestCasesQuery = useQuery({
     queryKey: ["global-test-cases", "deep-link", requestedCaseRouteId, projectId],
     queryFn: () => api.testCases.get(requestedCaseRouteId, { project_id: projectId }),
@@ -1435,10 +1485,16 @@ export function TestCasesPage() {
       session
       && projectId
       && requestedCaseRouteId
-      && !(testCasesQuery.data || []).some((testCase) => [testCase.id, testCase.display_id].filter(Boolean).includes(requestedCaseRouteId))
+      && !(testCasesQuery.data?.pages.flatMap((page) => page.items) || []).some((testCase) => [testCase.id, testCase.display_id].filter(Boolean).includes(requestedCaseRouteId))
     ),
     staleTime: 60_000,
     retry: false
+  });
+  const selectedTestCaseDetailQuery = useQuery({
+    queryKey: ["global-test-cases", "selected-detail", selectedTestCaseId, projectId],
+    queryFn: () => api.testCases.get(selectedTestCaseId, { project_id: projectId }),
+    enabled: Boolean(projectId && selectedTestCaseId),
+    staleTime: 30_000
   });
   const generationJobsQuery = useQuery({
     queryKey: ["ai-test-case-generation-jobs", appTypeId, projectId],
@@ -1464,7 +1520,7 @@ export function TestCasesPage() {
   });
   const executionResultsQuery = useQuery({
     queryKey: ["global-test-case-results", appTypeId, projectId],
-    queryFn: () => api.executionResults.list({ app_type_id: appTypeId }),
+    queryFn: () => api.executionResults.list({ app_type_id: appTypeId, run_limit: 10, limit: 100 }),
     enabled: Boolean(appTypeId),
     refetchInterval: (query) => (query.state.data as ExecutionResult[] | undefined)
       ?.some((result) => String(result.status).toLowerCase() === "running")
@@ -1640,7 +1696,16 @@ export function TestCasesPage() {
   const allAppTypes = (allAppTypesQuery.data || appTypes).filter((item) => accessibleProjectIds.has(String(item.project_id)));
   const requirements = requirementsQuery.data || [];
   const suites = suitesQuery.data || [];
-  const testCases = testCasesQuery.data || [];
+  const testCases = useMemo(() => {
+    const byId = new Map<string, TestCase>();
+    for (const testCase of testCasesQuery.data?.pages.flatMap((page) => page.items) || []) byId.set(testCase.id, testCase);
+    for (const query of moduleCaseQueries) {
+      for (const testCase of query.data?.items || []) byId.set(testCase.id, testCase);
+    }
+    if (deepLinkTestCasesQuery.data) byId.set(deepLinkTestCasesQuery.data.id, deepLinkTestCasesQuery.data);
+    if (selectedTestCaseDetailQuery.data) byId.set(selectedTestCaseDetailQuery.data.id, selectedTestCaseDetailQuery.data);
+    return [...byId.values()];
+  }, [deepLinkTestCasesQuery.data, moduleCaseQueries, selectedTestCaseDetailQuery.data, testCasesQuery.data]);
   const testCaseModules = testCaseModulesQuery.data || [];
   const deepLinkTestCases = deepLinkTestCasesQuery.data ? [deepLinkTestCasesQuery.data] : [];
   const generationJobs = generationJobsQuery.data || [];
@@ -2143,6 +2208,13 @@ export function TestCasesPage() {
       ]}
     />
   );
+  const renderDeferredModuleMetrics = (count: number) => (
+    <HierarchyMetricStrip
+      count={count}
+      noun="case"
+      metrics={[{ label: "Metrics", value: "On expand", tone: "neutral", title: "Open this module to load its bounded child page and calculate live module metrics." }]}
+    />
+  );
 	  const moduleTileEntries = useMemo(() => {
     const entries: Array<
       | { kind: "module"; module: TestCaseModule; count: number }
@@ -2162,13 +2234,13 @@ export function TestCasesPage() {
       }
     });
 
-    if (moduleCaseGroups.unassignedCases.length) {
+    if (moduleCaseGroups.unassignedCases.length || testCasesQuery.hasNextPage) {
       entries.push({ kind: "unassigned", count: moduleCaseGroups.unassignedCases.length });
       moduleCaseGroups.unassignedCases.forEach((testCase) => entries.push({ kind: "case", testCase }));
     }
 
 	    return entries;
-	  }, [collapsedModuleIds, deferredSearchTerm, moduleCaseGroups]);
+	  }, [collapsedModuleIds, deferredSearchTerm, moduleCaseGroups, testCasesQuery.hasNextPage]);
   const visibleModuleTileEntries = useMemo(
     () => moduleTileEntries.slice(0, visibleTestCaseCount),
     [moduleTileEntries, visibleTestCaseCount]
@@ -7478,7 +7550,8 @@ export function TestCasesPage() {
               <TestCaseSplitActionButton
                 className="test-case-toolbar-secondary-action"
                 disabled={!canCreateTestCases || !appTypeId}
-                icon={<FolderIcon />}
+                icon={<FolderAddIcon />}
+                iconOnly={true}
                 label="Create Module"
                 menuLabel="Open create module options"
                 onClick={() => {
@@ -7488,7 +7561,7 @@ export function TestCasesPage() {
                 actions={selectedActionTestCaseIds.length ? [{
                   label: "Create empty module",
                   description: "Create a module without moving the currently selected test cases.",
-                  icon: <FolderIcon />,
+                  icon: <FolderAddIcon />,
                   onClick: () => {
                     setIncludeSelectedCasesInNewModule(false);
                     setIsCreateModuleModalOpen(true);
@@ -7656,12 +7729,13 @@ export function TestCasesPage() {
             <TileBrowserPane className="test-case-library-scroll">
               {isLibraryLoading ? <TileCardSkeletonGrid /> : null}
 
-              {!isLibraryLoading && filteredCases.length && catalogViewMode === "tile" ? (
+              {!isLibraryLoading && (filteredCases.length || moduleCaseGroups.groups.length) && catalogViewMode === "tile" ? (
                 <div className="tile-browser-grid">
 	                  {visibleModuleTileEntries.map((entry) => {
                     if (entry.kind === "module") {
                       const isCollapsed = collapsedModuleIds.includes(entry.module.id);
                       const moduleChildIds = getVisibleModuleCaseIds(entry.module.id);
+                      const modulePageState = modulePageStateById[entry.module.id];
                       const isSelected = selectedModuleIds.includes(entry.module.id)
                         && moduleChildIds.every((id) => selectedActionTestCaseIds.includes(id));
 
@@ -7714,7 +7788,9 @@ export function TestCasesPage() {
                           ) : (
                             <strong>{entry.module.name}</strong>
                           )}
-                          {renderModuleMetrics(moduleHealth.byId.get(entry.module.id)!)}
+                          {isCollapsed
+                            ? renderDeferredModuleMetrics(entry.module.test_case_count ?? entry.count)
+                            : renderModuleMetrics(moduleHealth.byId.get(entry.module.id)!)}
                           <div className="action-row">
                             {renamingModuleId === entry.module.id ? (
                               <button className="primary-button compact" onClick={() => void handleRenameModule(entry.module.id)} type="button">Save</button>
@@ -7732,6 +7808,16 @@ export function TestCasesPage() {
                                 <ModulePencilIcon />
                               </button>
                             )}
+                            {!isCollapsed && (modulePageState?.isFetching || modulePageState?.nextCursor) ? (
+                              <HierarchyLoadMoreButton
+                                batchSize={25}
+                                isLoading={Boolean(modulePageState?.isFetching)}
+                                loaded={modulePageState?.loaded}
+                                onLoad={() => loadNextModulePage(entry.module.id)}
+                                scopeLabel={`test cases in ${entry.module.name}`}
+                                total={modulePageState?.total}
+                              />
+                            ) : null}
                           </div>
                         </div>
                       );
@@ -7752,6 +7838,14 @@ export function TestCasesPage() {
                           </span>
                           <strong>Unassigned module</strong>
                           {renderModuleMetrics(moduleHealth.unassigned)}
+                          {testCasesQuery.hasNextPage ? (
+                            <HierarchyLoadMoreButton
+                              batchSize={15}
+                              isLoading={testCasesQuery.isFetchingNextPage}
+                              onLoad={() => testCasesQuery.fetchNextPage()}
+                              scopeLabel="unassigned test cases"
+                            />
+                          ) : null}
                         </div>
                       );
                     }
@@ -7799,12 +7893,12 @@ export function TestCasesPage() {
                       : testCase.ai_quality_score;
                     const aiInsightTone = isFailedCase ? "danger" : isUnlinkedCase || stabilityScore < 60 ? "warning" : "success";
                     const aiInsight = isFailedCase
-                      ? "AI: Recent failures point to unstable execution evidence. Review latest run details and add negative coverage."
+                      ? "Signal: Recent failures point to unstable execution evidence. Review latest run details and add negative coverage."
                       : isUnlinkedCase
-                        ? "AI: Link this case to a requirement so release scope and risk coverage stay traceable."
+                        ? "Signal: Link this case to a requirement so release scope and risk coverage stay traceable."
                         : canUseAutomationWorkspace && testCase.automated !== "yes" && automationReadiness >= 70
-                          ? "AI: Strong automation candidate with clear scope and repeatable validation steps."
-                          : "AI: Stable recent coverage. Keep it in the release gate for confidence tracking.";
+                          ? "Signal: Strong automation candidate with clear scope and repeatable validation steps."
+                          : "Signal: Stable recent coverage. Keep it in the release gate for confidence tracking.";
                     const tileActions = [
 	                      {
 	                        label: "Open case",
@@ -7994,7 +8088,7 @@ export function TestCasesPage() {
                               </div>
                             </div>
                             <div className={`test-case-ai-note ${aiInsightTone}`}>
-                              <span aria-hidden="true">{isFailedCase ? "!" : "AI"}</span>
+                              <span aria-hidden="true">{isFailedCase ? "!" : "S"}</span>
                               <p>{aiInsight}</p>
                             </div>
                           </div>
@@ -8004,13 +8098,14 @@ export function TestCasesPage() {
                   })}
                 </div>
               ) : null}
-              {!isLibraryLoading && filteredCases.length && catalogViewMode === "list" ? (
+              {!isLibraryLoading && (filteredCases.length || moduleCaseGroups.groups.length) && catalogViewMode === "list" ? (
                 <div className="test-case-module-list">
                   {moduleCaseGroups.groups
                     .filter(({ cases }) => cases.length || !deferredSearchTerm.trim())
                     .map(({ module, cases }) => {
                       const isCollapsed = collapsedModuleIds.includes(module.id);
                       const moduleChildIds = cases.map((testCase) => testCase.id);
+                      const modulePageState = modulePageStateById[module.id];
                       const isSelected = selectedModuleIds.includes(module.id)
                         && moduleChildIds.every((id) => selectedActionTestCaseIds.includes(id));
 
@@ -8060,7 +8155,9 @@ export function TestCasesPage() {
                             ) : (
                               <strong>{module.name}</strong>
                             )}
-                            {renderModuleMetrics(moduleHealth.byId.get(module.id)!)}
+                            {isCollapsed
+                              ? renderDeferredModuleMetrics(module.test_case_count ?? cases.length)
+                              : renderModuleMetrics(moduleHealth.byId.get(module.id)!)}
                             <div className="action-row">
                               {renamingModuleId === module.id ? (
                                 <button className="primary-button compact" onClick={() => void handleRenameModule(module.id)} type="button">Save</button>
@@ -8078,6 +8175,16 @@ export function TestCasesPage() {
                                   <ModulePencilIcon />
                                 </button>
                               )}
+                              {!isCollapsed && (modulePageState?.isFetching || modulePageState?.nextCursor) ? (
+                                <HierarchyLoadMoreButton
+                                  batchSize={25}
+                                  isLoading={Boolean(modulePageState?.isFetching)}
+                                  loaded={modulePageState?.loaded}
+                                  onLoad={() => loadNextModulePage(module.id)}
+                                  scopeLabel={`test cases in ${module.name}`}
+                                  total={modulePageState?.total}
+                                />
+                              ) : null}
                             </div>
                           </div>
                           {!isCollapsed ? (
@@ -8102,7 +8209,7 @@ export function TestCasesPage() {
                         </section>
                       );
                     })}
-                  {moduleCaseGroups.unassignedCases.length ? (
+                  {moduleCaseGroups.unassignedCases.length || testCasesQuery.hasNextPage ? (
                     <section className="test-case-module-list-section">
                       <div className="test-case-module-header is-unassigned">
                         <label className="checkbox-field">
@@ -8117,6 +8224,14 @@ export function TestCasesPage() {
                         </span>
                         <strong>Unassigned module</strong>
                         {renderModuleMetrics(moduleHealth.unassigned)}
+                        {testCasesQuery.hasNextPage ? (
+                          <HierarchyLoadMoreButton
+                            batchSize={15}
+                            isLoading={testCasesQuery.isFetchingNextPage}
+                            onLoad={() => testCasesQuery.fetchNextPage()}
+                            scopeLabel="unassigned test cases"
+                          />
+                        ) : null}
                       </div>
                       <DataTable
                         columns={getScopedTestCaseListColumns(unassignedCaseIds, "Select all unassigned test cases")}
@@ -8151,7 +8266,7 @@ export function TestCasesPage() {
 	                  </button>
 	                </div>
 	              ) : null}
-	              {!isLibraryLoading && !filteredCases.length ? (
+	              {!isLibraryLoading && !filteredCases.length && !moduleCaseGroups.groups.length ? (
                 testCases.length ? (
                   <div className="empty-state compact">No test cases match the current search.</div>
                 ) : (
@@ -10680,8 +10795,14 @@ function EditorAccordionSection({
         <div className="editor-accordion-toggle-meta">
           <span className="editor-accordion-toggle-count">{countLabel}</span>
           {actions ? <div className="editor-accordion-actions">{actions}</div> : null}
-          <button className="editor-accordion-toggle-state" onClick={onToggle} type="button">
-            {isExpanded ? "Collapse" : "Expand"}
+          <button
+            aria-label={isExpanded ? "Collapse section" : "Expand section"}
+            className="editor-accordion-toggle-state explorer-icon-button"
+            onClick={onToggle}
+            title={isExpanded ? "Collapse section" : "Expand section"}
+            type="button"
+          >
+            <CollapseExpandIcon isExpanded={isExpanded} />
           </button>
         </div>
       </div>

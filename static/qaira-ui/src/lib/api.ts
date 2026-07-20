@@ -32,6 +32,7 @@ import type {
   Issue,
   Integration,
   JiraAttachment,
+  JiraComment,
   KeyValueEntry,
   Permission,
   PermissionGroup,
@@ -71,6 +72,13 @@ import type {
   WorkspaceTransactionArtifact,
   WorkspaceTransactionEvent
 } from "../types";
+
+export type PagedResult<T> = {
+  items: T[];
+  total: number;
+  next_cursor: string | null;
+  is_last: boolean;
+};
 import type { ExecutionStartResponse } from "./executionStartSummary";
 import type { ExecutionAiAnalysis } from "./executionLogs";
 import { appendCurrentProjectScope } from "./currentScope";
@@ -212,6 +220,37 @@ function normalizeJiraAttachment(value: unknown): JiraAttachment {
   };
 }
 
+function jiraAdfToPlainText(value: unknown): string {
+  if (!value) return "";
+  if (typeof value === "string") return value;
+  if (Array.isArray(value)) return value.map(jiraAdfToPlainText).filter(Boolean).join("");
+  if (typeof value !== "object") return "";
+  const node = value as { type?: string; text?: string; content?: unknown[] };
+  if (typeof node.text === "string") return node.text;
+  const content = (node.content || []).map(jiraAdfToPlainText).join("");
+  return ["paragraph", "heading", "listItem", "blockquote", "codeBlock"].includes(node.type || "") ? `${content}\n` : content;
+}
+
+function normalizeJiraComment(value: unknown): JiraComment {
+  const comment = value && typeof value === "object" ? value as Record<string, unknown> : {};
+  const authorValue = comment.author && typeof comment.author === "object"
+    ? comment.author as Record<string, unknown>
+    : null;
+  return {
+    id: String(comment.id || ""),
+    body: jiraAdfToPlainText(comment.body).trim(),
+    created: typeof comment.created === "string" ? comment.created : null,
+    updated: typeof comment.updated === "string" ? comment.updated : null,
+    author: authorValue ? {
+      accountId: typeof authorValue.accountId === "string" ? authorValue.accountId : undefined,
+      displayName: typeof authorValue.displayName === "string" ? authorValue.displayName : undefined,
+      avatarUrls: authorValue.avatarUrls && typeof authorValue.avatarUrls === "object"
+        ? authorValue.avatarUrls as Record<string, string>
+        : undefined
+    } : null
+  };
+}
+
 type IssuePayload = {
   user_id: string;
   title: string;
@@ -226,6 +265,8 @@ type IssuePayload = {
   jira_bug_key?: string;
   linked_test_run_id?: string;
   linked_test_case_ids?: string[];
+  linked_test_suite_ids?: string[];
+  linked_module_ids?: string[];
   linked_requirement_ids?: string[];
   assignee_id?: string;
   root_cause?: string;
@@ -263,6 +304,7 @@ export type JiraCreateFieldMetadata = {
 };
 
 export type JiraIssueCreateMetadata = {
+  mode?: "create" | "edit";
   project_id: string;
   project_key: string;
   issue_type_id: string;
@@ -271,12 +313,38 @@ export type JiraIssueCreateMetadata = {
   required_fields: JiraCreateFieldMetadata[];
   core_fields: JiraCreateFieldMetadata[];
   fields: JiraCreateFieldMetadata[];
+  current_values?: Record<string, unknown>;
+  current_status?: JiraWorkflowStatus | null;
+  workflow_statuses?: JiraWorkflowStatusCatalog;
   strategy?: {
     requirements_source: string;
     bugs_source: string;
     synced_fields: string[];
     note: string;
   };
+};
+
+export type JiraWorkflowStatus = {
+  id?: string | null;
+  value: string;
+  label: string;
+  description?: string;
+  category_key?: string | null;
+  category_name?: string | null;
+  category_color?: string | null;
+  current?: boolean;
+  can_transition?: boolean;
+  transition_id?: string | null;
+};
+
+export type JiraWorkflowStatusCatalog = {
+  source: "jira-project-workflow" | "jira-issue-transitions" | "jira-current-status" | "compatibility-fallback" | string;
+  issue_type_id?: string | null;
+  issue_type_name?: string | null;
+  default_status?: string | null;
+  current_status?: JiraWorkflowStatus | null;
+  transition_lookup_unavailable?: boolean;
+  statuses: JiraWorkflowStatus[];
 };
 
 export type JiraBugCreateMetadata = JiraIssueCreateMetadata;
@@ -604,7 +672,7 @@ export const api = {
       request<QualityDashboardGadgetResult>("/analytics/jql", { method: "POST", body: JSON.stringify(input) }),
     queryBatch: (input: { project_id: string; gadgets: QualityDashboardGadget[]; limit?: number }) =>
       request<QualityDashboardBatchResponse>("/analytics/jql-batch", { method: "POST", body: JSON.stringify(input) }),
-    designDashboard: (input: { project_id: string; stakeholder: "executive" | "product" | "quality" | "automation"; release?: string; goal?: string; name?: string }) =>
+    designDashboard: (input: { project_id: string; stakeholder: "executive" | "product" | "quality" | "automation"; release?: string; goal?: string; prompt?: string; name?: string }) =>
       request<QualityDashboardDesignPreviewResponse>("/analytics/dashboard-design-preview", { method: "POST", body: JSON.stringify(input) })
   },
   qualityDashboards: {
@@ -684,6 +752,37 @@ export const api = {
       );
       await ensureJiraResponse(response, "Deleting attachment");
       return { deleted: true, id: attachmentId };
+    }
+  },
+  comments: {
+    list: async (issueKey: string) => {
+      const response = await requestJira(
+        `/rest/api/3/issue/${encodeURIComponent(issueKey)}/comment?maxResults=50&orderBy=-created`,
+        { headers: { Accept: "application/json" } }
+      );
+      await ensureJiraResponse(response, "Loading comments");
+      const payload = await response.json() as { comments?: unknown[] };
+      return (payload.comments || []).map(normalizeJiraComment).filter((comment) => comment.id);
+    },
+    create: async (issueKey: string, body: string) => {
+      const text = body.trim();
+      if (!text) throw new Error("Write a comment before posting.");
+      const response = await requestJira(
+        `/rest/api/3/issue/${encodeURIComponent(issueKey)}/comment`,
+        {
+          method: "POST",
+          headers: { Accept: "application/json", "Content-Type": "application/json" },
+          body: JSON.stringify({
+            body: {
+              type: "doc",
+              version: 1,
+              content: [{ type: "paragraph", content: [{ type: "text", text }] }]
+            }
+          })
+        }
+      );
+      await ensureJiraResponse(response, "Posting comment");
+      return normalizeJiraComment(await response.json());
     }
   },
   settings: {
@@ -815,10 +914,14 @@ export const api = {
     delete: (id: string) => request<{ deleted: boolean }>(`/app-types/${id}`, { method: "DELETE" })
   },
   requirements: {
-    list: (query?: { project_id?: string; status?: string; priority?: number; page_size?: number; limit?: number; cursor?: string; projection?: "summary" | "detail" }) =>
+    list: (query?: { project_id?: string; status?: string; priority?: number; sprint_id?: string; unassigned?: boolean; page_size?: number; limit?: number; cursor?: string; projection?: "summary" | "detail" }) =>
       request<Requirement[]>(`/requirements${toQueryString(query)}`),
+    listPage: (query?: { project_id?: string; status?: string; priority?: number; sprint_id?: string; unassigned?: boolean; page_size?: number; cursor?: string; projection?: "summary" | "detail" }) =>
+      request<PagedResult<Requirement>>(`/requirements${toQueryString({ ...query, include_page: true })}`),
     createMetadata: (query?: { project_id?: string }) =>
       request<JiraIssueCreateMetadata>(`/requirements/create-metadata${toQueryString(query)}`),
+    editMetadata: (id: string, query?: { project_id?: string }) =>
+      request<JiraIssueCreateMetadata>(`/requirements/${id}/edit-metadata${toQueryString(query)}`),
     create: (input: { project_id: string; title: string; description?: string; external_references?: string[]; labels?: string[]; sprint?: string; fix_version?: string; release?: string; iteration_id?: string; priority?: number; status?: string; additional_fields?: Record<string, unknown> }) =>
       request<{ id: string; status_warning?: { code: string; message: string; requested_status?: string | null; current_status?: string | null; issue_key?: string | null } }>("/requirements", { method: "POST", body: JSON.stringify(input) }),
     get: (id: string, query?: { project_id?: string }) =>
@@ -911,7 +1014,7 @@ export const api = {
         method: "POST",
         body: JSON.stringify(input)
       }),
-    update: (id: string, input: Partial<{ project_id: string; title: string; description: string; external_references: string[]; labels: string[]; sprint: string; fix_version: string; release: string; iteration_id: string; priority: number; status: string; expected_revision: number }>) =>
+    update: (id: string, input: Partial<{ project_id: string; title: string; description: string; external_references: string[]; labels: string[]; sprint: string; fix_version: string; release: string; iteration_id: string; priority: number; status: string; additional_fields: Record<string, unknown>; expected_revision: number }>) =>
       request<{ updated: boolean; revision: number }>(`/requirements/${id}`, { method: "PUT", body: JSON.stringify(input) }),
     delete: (id: string) => request<{ deleted: boolean }>(`/requirements/${id}`, { method: "DELETE" })
   },
@@ -920,9 +1023,11 @@ export const api = {
       request<RequirementIteration[]>(`/requirement-iterations${toQueryString(query)}`),
     get: (id: string) =>
       request<RequirementIteration>(`/requirement-iterations/${id}`),
-    create: (input: { project_id: string; name: string; description?: string; requirement_ids?: string[]; jira_sprint_id?: string; jira_sprint_name?: string }) =>
-      request<{ id: string }>("/requirement-iterations", { method: "POST", body: JSON.stringify(input) }),
-    update: (id: string, input: Partial<{ name: string; description: string; requirement_ids: string[]; jira_sprint_id: string; jira_sprint_name: string }>) =>
+    listRequirements: (id: string, query?: { page_size?: number; cursor?: string; projection?: "summary" | "detail" }) =>
+      request<PagedResult<Requirement>>(`/requirement-iterations/${id}/requirements${toQueryString({ ...query, include_page: true })}`),
+    create: (input: { project_id: string; name: string; description?: string; goal?: string; board_id: string; start_date: string; end_date: string; state: "future" | "active"; requirement_ids?: string[] }) =>
+      request<{ id: string; sprint?: RequirementIteration }>("/requirement-iterations", { method: "POST", body: JSON.stringify(input) }),
+    update: (id: string, input: Partial<{ name: string; description: string; goal: string; state: "future" | "active" | "closed"; start_date: string; end_date: string; requirement_ids: string[]; jira_sprint_id: string; jira_sprint_name: string }>) =>
       request<{ updated: boolean }>(`/requirement-iterations/${id}`, { method: "PUT", body: JSON.stringify(input) }),
     assignRequirements: (id: string, requirement_ids: string[], append = true) =>
       request<{ updated: boolean; assigned: number }>(`/requirement-iterations/${id}/requirements`, {
@@ -953,8 +1058,10 @@ export const api = {
       request<Issue>(`/feedback/${id}${toQueryString(query)}`),
     createMetadata: (query?: { project_id?: string }) =>
       request<JiraBugCreateMetadata>(`/feedback/create-metadata${toQueryString(query)}`),
+    editMetadata: (id: string, query?: { project_id?: string }) =>
+      request<JiraBugCreateMetadata>(`/feedback/${id}/edit-metadata${toQueryString(query)}`),
     create: (input: IssuePayload) =>
-      request<{ id: string }>("/feedback", { method: "POST", body: JSON.stringify(input) }),
+      request<{ id: string; status_warning?: { code: string; message: string; requested_status?: string | null; current_status?: string | null; issue_key?: string | null } }>("/feedback", { method: "POST", body: JSON.stringify(input) }),
     previewAiDraft: (input: {
       project_id: string;
       intent: string;
@@ -1054,8 +1161,8 @@ export const api = {
       request<TestCaseModule[]>(`/test-case-modules${toQueryString(query)}`),
     get: (id: string) =>
       request<TestCaseModule>(`/test-case-modules/${id}`),
-    listCases: (id: string) =>
-      request<TestCase[]>(`/test-case-modules/${id}/test-cases`),
+    listCases: (id: string, query?: { page_size?: number; cursor?: string; projection?: "summary" | "detail" }) =>
+      request<PagedResult<TestCase>>(`/test-case-modules/${id}/test-cases${toQueryString({ ...query, include_page: true })}`),
     create: (input: { app_type_id: string; name: string; description?: string; test_case_ids?: string[] }) =>
       request<{ id: string }>("/test-case-modules", { method: "POST", body: JSON.stringify(input) }),
     update: (id: string, input: Partial<{ name: string; description: string; test_case_ids: string[] }>) =>
@@ -1087,8 +1194,10 @@ export const api = {
     delete: (id: string) => request<{ deleted: boolean }>(`/test-suites/${id}`, { method: "DELETE" })
   },
   testCases: {
-    list: (query?: { suite_id?: string; requirement_id?: string; status?: string; app_type_id?: string; page_size?: number; limit?: number; cursor?: string; projection?: "summary" | "detail" }) =>
+    list: (query?: { suite_id?: string; requirement_id?: string; module_id?: string; unassigned_module?: boolean; status?: string; app_type_id?: string; page_size?: number; limit?: number; cursor?: string; projection?: "summary" | "detail" }) =>
       request<TestCase[]>(`/test-cases${toQueryString(query)}`),
+    listPage: (query?: { suite_id?: string; requirement_id?: string; module_id?: string; unassigned_module?: boolean; status?: string; app_type_id?: string; page_size?: number; cursor?: string; projection?: "summary" | "detail" }) =>
+      request<PagedResult<TestCase>>(`/test-cases${toQueryString({ ...query, include_page: true })}`),
     get: (id: string, query?: { project_id?: string }) =>
       request<TestCase>(`/test-cases/${id}${toQueryString(query)}`),
     create: (input: { app_type_id?: string; suite_id?: string; suite_ids?: string[]; title: string; description?: string; external_references?: string[]; labels?: string[]; parameter_values?: Record<string, string>; automated?: "yes" | "no"; automation_status?: "not_automated" | "ready" | "incomplete"; priority?: number; status?: string; requirement_id?: string; requirement_ids?: string[]; reviewer_id?: string | null; review_status?: TestCase["review_status"]; ai_quality_score?: number | null; steps?: Array<{ step_order?: number; action?: string; expected_result?: string; step_type?: TestStep["step_type"]; automation_code?: string; api_request?: TestStep["api_request"]; group_id?: string; group_name?: string; group_kind?: "local" | "reusable"; reusable_group_id?: string }> }) =>
@@ -1579,6 +1688,8 @@ export const api = {
       ),
     updateCaseAssignment: (executionId: string, testCaseId: string, input: { assigned_to?: string; expected_revision?: number }) =>
       request<{ updated: boolean; revision: number }>(`/executions/${executionId}/cases/${testCaseId}/assignment`, { method: "PUT", body: JSON.stringify(input) }),
+    updateScopeAssignment: (executionId: string, level: "suites" | "modules" | "cases", scopeId: string, input: { assigned_to_ids?: string[]; assigned_to?: string; expected_revision?: number }) =>
+      request<{ updated: boolean; revision: number }>(`/executions/${executionId}/${level}/${scopeId}/assignment`, { method: "PUT", body: JSON.stringify(input) }),
     rerun: (id: string, input: { failed_only?: boolean; created_by: string; name?: string }) =>
       request<{ id: string }>(`/executions/${id}/rerun`, { method: "POST", body: JSON.stringify(input) }),
     start: (id: string, input?: { execution_mode?: "local" | "remote"; engine_base_url?: string; expected_revision?: number }) =>
@@ -1675,7 +1786,7 @@ export const api = {
       request<AgenticWorkflowRun>(`/agentic-workflow-runs/${id}`)
   },
   executionResults: {
-    list: (query?: { execution_id?: string; test_case_id?: string; app_type_id?: string }) =>
+    list: (query?: { execution_id?: string; test_case_id?: string; app_type_id?: string; run_limit?: number; limit?: number }) =>
       request<ExecutionResult[]>(`/execution-results${toQueryString(query)}`),
     create: (input: { execution_id: string; test_case_id: string; app_type_id: string; status: ExecutionResult["status"]; duration_ms?: number; error?: string; logs?: string; external_references?: string[]; defects?: string[]; executed_by?: string }) =>
       request<{ id: string }>("/execution-results", { method: "POST", body: JSON.stringify(input) }),

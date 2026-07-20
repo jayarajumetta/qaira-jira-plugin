@@ -139,6 +139,19 @@ const writeCurrentAppTypeId = (projectId: string, appTypeId: string) => {
   dispatchScopedEvent(CURRENT_APP_TYPE_EVENT, { projectId, appTypeId });
 };
 
+export const setCurrentScope = (projectId: string | number, appTypeId = "") => {
+  const normalizedProjectId = projectId == null ? "" : String(projectId);
+  if (!normalizedProjectId) {
+    writeCurrentProjectId("");
+    return;
+  }
+
+  // Persist the child scope first so every project-change listener observes a
+  // coherent project/app-space pair on its first render.
+  if (appTypeId) writeCurrentAppTypeId(normalizedProjectId, appTypeId);
+  writeCurrentProjectId(normalizedProjectId);
+};
+
 export function useCurrentAppType(projectId: string) {
   const [scopeState, setScopeState] = useState<AppTypeScopeState>(() => ({
     projectId,

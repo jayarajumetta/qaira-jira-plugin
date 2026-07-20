@@ -24,8 +24,8 @@ export type NormalizedColumnPreference = {
   visibleColumnKeys: string[];
 };
 
-export const DEFAULT_COLUMN_WIDTH = 160;
-export const DEFAULT_MIN_COLUMN_WIDTH = 72;
+export const DEFAULT_COLUMN_WIDTH = 136;
+export const DEFAULT_MIN_COLUMN_WIDTH = 64;
 export const DEFAULT_MAX_COLUMN_WIDTH = 640;
 
 let workspacePreferenceCache: Record<string, unknown> | null = null;

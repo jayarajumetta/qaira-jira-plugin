@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { FormField } from "./FormField";
 import { InfoTooltip } from "./InfoTooltip";
+import { RefreshIcon } from "./AppIcons";
 import { api } from "../lib/api";
 import { countGeneratedTestDataFields, materializeTestDataRows } from "../lib/testDataGenerators";
 import type { TestConfiguration, TestDataSet, TestEnvironment } from "../types";
@@ -192,8 +193,8 @@ export function ExecutionContextSelector({
                 />
               </div>
             </div>
-            <button className="ghost-button" onClick={() => setDataPreviewRevision((current) => current + 1)} type="button">
-              Refresh sample
+            <button aria-label="Refresh generated sample" className="ghost-button explorer-icon-button" onClick={() => setDataPreviewRevision((current) => current + 1)} title="Refresh generated sample" type="button">
+              <RefreshIcon />
             </button>
           </div>
           <div className="execution-generated-data-preview-rows">

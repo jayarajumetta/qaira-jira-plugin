@@ -1,7 +1,7 @@
 import { type ChangeEvent, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useSearchParams } from "react-router-dom";
-import { AddIcon, CopyIcon, ExportIcon, ImportIcon, LayersIcon, MousePointerIcon, OpenIcon, PauseIcon, PencilIcon, PlayIcon, SparkIcon, TrashIcon } from "../components/AppIcons";
+import { AddIcon, CopyIcon, ExportIcon, ImportIcon, LayersIcon, MousePointerIcon, OpenIcon, PauseIcon, PencilIcon, PlayIcon, RefreshIcon, SparkIcon, TrashIcon } from "../components/AppIcons";
 import { AiAssurancePanel } from "../components/AiAssurancePanel";
 import { CatalogSearchFilter } from "../components/CatalogSearchFilter";
 import { CatalogSelectionControls } from "../components/CatalogSelectionControls";
@@ -4833,13 +4833,14 @@ export function AutomationPage({ initialView = "cases" }: { initialView?: Automa
                         <span>{inspectRecorderSession?.status === "running" ? "Use browser" : isLaunchingInspectBrowser ? "Connecting..." : "Launch browser"}</span>
                       </button>
                       <button
-                        className="ghost-button"
+                        aria-label="Refresh browser tabs"
+                        className="ghost-button explorer-icon-button"
                         disabled={!inspectRecorderSession?.id}
                         onClick={() => void loadInspectTabs().catch((error) => setInspectMessage(error instanceof Error ? error.message : "Unable to refresh tabs."))}
+                        title="Refresh browser tabs"
                         type="button"
                       >
-                        <LayersIcon />
-                        <span>Refresh tabs</span>
+                        <RefreshIcon />
                       </button>
                         <button
                           className="primary-button"

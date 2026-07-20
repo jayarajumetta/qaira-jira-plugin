@@ -55,6 +55,20 @@ modules:
         - path: trigger
           type: string
           searchAlias: qairaRunTrigger
+    - key: qaira-suite-index
+      entityType: issue
+      propertyKey: qaira.suiteDefinition.v1
+      values:
+        - path: app_type_id
+          type: string
+          searchAlias: qairaSuiteAppType
+    - key: qaira-test-module-assignment-index
+      entityType: issue
+      propertyKey: qaira.module.v1
+      values:
+        - path: id
+          type: string
+          searchAlias: qairaTestModuleId
   rovo:agent:
     - key: qaira-qa-agent
       name: Qaira QA Agent
@@ -235,7 +249,9 @@ permissions:
     - read:attachment:jira
     - write:attachment:jira
     - read:board-scope:jira-software
+    - write:board-scope:jira-software
     - read:sprint:jira-software
+    - write:sprint:jira-software
     - read:chat:rovo
   content:
     styles:

@@ -55,6 +55,25 @@ modules:
         - path: trigger
           type: string
           searchAlias: qairaRunTrigger
+        - path: release
+          type: string
+          searchAlias: qairaRunRelease
+        - path: sprint
+          type: string
+          searchAlias: qairaRunSprint
+        - path: build
+          type: string
+          searchAlias: qairaRunBuild
+    - key: qaira-defect-index
+      entityType: issue
+      propertyKey: qaira.defect.v1
+      values:
+        - path: build
+          type: string
+          searchAlias: qairaBugBuild
+        - path: linked_test_run_id
+          type: string
+          searchAlias: qairaBugRun
     - key: qaira-suite-index
       entityType: issue
       propertyKey: qaira.suiteDefinition.v1
@@ -72,13 +91,13 @@ modules:
   rovo:agent:
     - key: qaira-qa-agent
       name: Qaira QA Agent
-      description: Requirement coverage, test design, planning, run triage, automation and release-risk assistant.
+      description: Story coverage, test design, planning, run triage, automation and release-risk assistant.
       icon: resource:qaira-ui;assets/icon.svg
       prompt: resource:qaira-agent-resource;prompts/qa-agent.txt
       conversationStarters:
         - What is blocking this release?
-        - Generate tests for the current requirement.
-        - Find uncovered critical requirements.
+        - Generate tests for the current Story.
+        - Find uncovered critical Stories.
         - Summarize failed automation runs.
       actions:
         - qaira-read-qa-context
@@ -92,7 +111,7 @@ modules:
       name: Read Qaira QA context
       function: rovoAction
       actionVerb: GET
-      description: Read Jira-native Qaira project, requirement, coverage, run, defect, and release context.
+      description: Read Jira-native Qaira project, Story, coverage, run, defect, and release context.
       inputs:
         projectKey:
           title: Project key
@@ -113,7 +132,7 @@ modules:
       name: Draft Qaira test cases
       function: rovoAction
       actionVerb: CREATE
-      description: Draft Jira-native Qaira Test Cases from a requirement, with human approval expected before use.
+      description: Draft Jira-native Qaira Test Cases from a Story, with human approval expected before use.
       inputs:
         projectKey:
           title: Project key
@@ -121,10 +140,10 @@ modules:
           required: true
           description: Jira project key where tests should be drafted.
         requirementKey:
-          title: Requirement key
+          title: Story key
           type: string
           required: true
-          description: Jira story/requirement issue key to test.
+          description: Jira Story issue key to test.
         count:
           title: Count
           type: integer
@@ -203,7 +222,7 @@ modules:
           title: Report type
           type: string
           required: false
-          description: business-metrics, requirements, runs, automation.
+          description: Use business-metrics, requirements (shown as Story coverage), runs, or automation.
   function:
     - key: resolver
       handler: index.handler
@@ -252,6 +271,7 @@ permissions:
     - write:board-scope:jira-software
     - read:sprint:jira-software
     - write:sprint:jira-software
+    - delete:sprint:jira-software
     - read:chat:rovo
   content:
     styles:

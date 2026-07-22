@@ -1,4 +1,8 @@
 import { api } from "../api";
+import {
+  clampColumnWidth,
+  type ColumnDensity
+} from "./columnSizing";
 
 export type ColumnPreferenceColumn = {
   canToggle?: boolean;
@@ -12,30 +16,20 @@ export type ColumnPreferenceColumn = {
 
 export type StoredColumnPreference = {
   columnWidths?: Record<string, number>;
-  density?: "comfortable" | "compact";
+  density?: ColumnDensity;
   orderedColumnKeys?: string[];
   visibleColumnKeys?: string[];
 };
 
 export type NormalizedColumnPreference = {
   columnWidths: Record<string, number>;
-  density: "comfortable" | "compact";
+  density: ColumnDensity;
   orderedColumnKeys: string[];
   visibleColumnKeys: string[];
 };
 
-export const DEFAULT_COLUMN_WIDTH = 136;
-export const DEFAULT_MIN_COLUMN_WIDTH = 64;
-export const DEFAULT_MAX_COLUMN_WIDTH = 640;
-
 let workspacePreferenceCache: Record<string, unknown> | null = null;
 let workspacePreferenceRequest: Promise<Record<string, unknown>> | null = null;
-
-export const clampColumnWidth = <Column extends ColumnPreferenceColumn>(column: Column, width: number) => {
-  const minWidth = column.minWidth || DEFAULT_MIN_COLUMN_WIDTH;
-  const maxWidth = column.maxWidth || DEFAULT_MAX_COLUMN_WIDTH;
-  return Math.min(maxWidth, Math.max(minWidth, Math.round(width)));
-};
 
 export const readStoredColumnPreference = (storageKey: string) => {
   if (typeof window === "undefined") {
@@ -101,8 +95,12 @@ export const saveWorkspacePreference = async (storageKey: string, value: Normali
   });
 };
 
-const getDefaultVisibleColumnKeys = <Column extends ColumnPreferenceColumn>(columns: Column[]) =>
-  columns.filter((column) => column.canToggle !== false && column.defaultVisible !== false).map((column) => column.key);
+// Default restores each column definition. "Show all" is a separate explicit
+// action, while a persisted list remains authoritative for user-hidden columns.
+export const getDefaultVisibleColumnKeys = <Column extends ColumnPreferenceColumn>(columns: Column[]) =>
+  columns
+    .filter((column) => column.canToggle !== false && column.defaultVisible !== false)
+    .map((column) => column.key);
 
 const getDefaultOrderedColumnKeys = <Column extends ColumnPreferenceColumn>(columns: Column[]) =>
   columns.map((column) => column.key);
@@ -151,7 +149,7 @@ export const normalizeColumnPreference = <Column extends ColumnPreferenceColumn>
 };
 
 export const moveColumnKey = (keys: string[], draggedKey: string, targetKey: string) => {
-  if (draggedKey === targetKey) {
+  if (draggedKey === targetKey || isSelectionColumnKey(draggedKey) || isSelectionColumnKey(targetKey)) {
     return keys;
   }
 

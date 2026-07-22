@@ -108,6 +108,14 @@ const AGENT_CREDENTIAL_LOCATIONS: Array<{ value: AgenticCredential["location"]; 
 
 const API_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE"];
 
+const presentKnowledgeScope = (value: string) => value
+  .replace(/\brequirements\b/gi, "stories")
+  .replace(/\brequirement\b/gi, "story");
+
+const persistKnowledgeScope = (value: string) => value
+  .replace(/\bstories\b/gi, "requirements")
+  .replace(/\bstory\b/gi, "requirement");
+
 const RESPONSE_STYLE_OPTIONS: Array<{ value: AgenticApiResponseStyle; label: string }> = [
   { value: "json", label: "JSON object" },
   { value: "items", label: "Items array" },
@@ -431,7 +439,7 @@ const getDefaultWorkflowNodes = (): AgenticWorkflowNode[] => [
       kind: "agent",
       summary: "Use release stories to propose impacted tests.",
       model: "Default workspace LLM",
-      prompt: "Take release_story_payload and return impacted requirements, tests, and risk notes.",
+      prompt: "Take release_story_payload and return impacted stories, tests, and risk notes.",
       outputKey: "test_plan",
       sampleOutput: "Prioritized test plan"
     }
@@ -1518,7 +1526,7 @@ export function AgenticWorkflowsPage() {
               <strong>{draft.name}</strong>
               <p>Design the agent graph, assign credentials and LLMs, then run a saved snapshot.</p>
             </div>
-            <div className="agentic-page-heading-metrics">
+            <div className="agentic-page-heading-metrics metric-strip page-metric-strip metric-strip-inline" aria-label="Workflow facts" role="group">
               <span><strong>{nodes.length}</strong> nodes</span>
               <span><strong>{edges.length}</strong> links</span>
               <span><strong>{workflowCredentials.length}</strong> credentials</span>
@@ -1799,7 +1807,7 @@ export function AgenticWorkflowsPage() {
                           </label>
                           <label className="agentic-api-agent-wide">
                             <span>RAG context</span>
-                            <input onChange={(event) => updateSelectedNode("knowledgeScope", event.target.value)} value={String(selectedNode.data.knowledgeScope || "requirements,test-cases,test-runs,knowledge")} />
+                            <input onChange={(event) => updateSelectedNode("knowledgeScope", persistKnowledgeScope(event.target.value))} value={presentKnowledgeScope(String(selectedNode.data.knowledgeScope || "requirements,test-cases,test-runs,knowledge"))} />
                           </label>
                           <label>
                             <span>Top results</span>
@@ -1988,7 +1996,7 @@ export function AgenticWorkflowsPage() {
                           </label>
                           <label className="agentic-api-agent-wide">
                             <span>Knowledge scope</span>
-                            <input onChange={(event) => updateSelectedNode("knowledgeScope", event.target.value)} placeholder="requirements,test-cases" value={String(selectedNode.data.knowledgeScope || "")} />
+                            <input onChange={(event) => updateSelectedNode("knowledgeScope", persistKnowledgeScope(event.target.value))} placeholder="stories,test-cases" value={presentKnowledgeScope(String(selectedNode.data.knowledgeScope || ""))} />
                           </label>
                           <label className="agentic-api-agent-wide">
                             <span>Repository scope</span>
@@ -2082,7 +2090,7 @@ export function AgenticWorkflowsPage() {
               <strong>{selectedRun.workflow_name}</strong>
               <p>Review the frozen workflow graph captured at execution time and inspect each step result.</p>
             </div>
-            <div className="agentic-page-heading-metrics">
+            <div className="agentic-page-heading-metrics metric-strip page-metric-strip metric-strip-inline" aria-label="Workflow run facts" role="group">
               <span><strong>{selectedRun.node_results.length}</strong> steps</span>
               <span><strong>{selectedRun.trigger_kind}</strong> trigger</span>
               <span><strong>{formatTimestamp(selectedRun.created_at)}</strong></span>

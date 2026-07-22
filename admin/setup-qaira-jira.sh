@@ -507,7 +507,7 @@ search_fields_by_query() {
 
 create_or_get_fields() {
   log "Creating/reusing Qaira custom fields"
-  local existing_qaira existing_legacy name legacy desc alias type searcher id legacy_id body resp update_resp update_status field_key hint_id duplicate_count
+  local existing_qaira existing_legacy name legacy desc alias type searcher id legacy_id body resp update_resp update_status field_key hint_id hint_field hint_name duplicate_count
   load_existing_registry_field_hints
   existing_qaira=$(search_fields_by_query "Qaira")
   existing_legacy='{"values":[]}'
@@ -531,15 +531,47 @@ create_or_get_fields() {
     type=$(jq -r --arg a "$alias" '.fieldTypeAliases[$a].type' "$SCHEMA_PATH")
     searcher=$(jq -r --arg a "$alias" '.fieldTypeAliases[$a].searcherKey' "$SCHEMA_PATH")
     hint_id=$(jq -r --arg k "$field_key" '.[$k] // empty' "$TMP_DIR/registry-field-hints.json")
+    id=''
+    hint_field=''
+    hint_name=''
+    if [[ -n "$hint_id" && "$hint_id" != "null" ]]; then
+      if [[ "$hint_id" =~ ^customfield_[0-9]+$ ]]; then
+        hint_field=$(echo "$existing_qaira" | jq -c --arg hint "$hint_id" '[.values[]? | select(.id==$hint)][0] // empty')
+        id="$hint_id"
+        if [[ -n "$hint_field" && "$hint_field" != "null" ]]; then
+          hint_name=$(echo "$hint_field" | jq -r '.name // empty')
+        fi
+        if [[ "$hint_name" != "$name" ]]; then
+          if [[ -n "$hint_name" ]]; then
+            warn "Reusing registry field $field_key -> $id with current name '$hint_name' for '$name'"
+          else
+            warn "Registry field $field_key -> $id was outside the Jira Qaira name search. Reconciling it directly by ID to '$name'."
+          fi
+          body=$(jq -n --arg name "$name" --arg desc "$desc" '{name:$name, description:$desc}')
+          update_resp=$(api_no_fail PUT "/rest/api/3/field/${id}" "$body")
+          update_status=$(echo "$update_resp" | jq -r '.status // 0')
+          if [[ "$update_status" =~ ^2 ]]; then
+            log "Renamed registry field ${hint_name:-$id} -> $name"
+          elif [[ "$update_status" == "404" && -z "$hint_name" ]]; then
+            warn "Registry field hint $field_key -> $id no longer exists. Falling back to name-based reconciliation."
+            id=''
+          else
+            warn "Could not rename registry field ${hint_name:-$id} -> $name. Reusing ID $id to avoid creating a duplicate."
+          fi
+        fi
+      else
+        warn "Ignoring invalid registry field hint $field_key -> $hint_id. Expected a Jira customfield_<number> ID."
+      fi
+    fi
     duplicate_count=$(echo "$existing_qaira" | jq --arg name "$name" '[.values[]? | select(.name==$name)] | length')
     if [[ "$duplicate_count" -gt 1 ]]; then
       warn "Multiple Jira fields exist with exact name '$name'. Preferring current registry ID when available."
     fi
-    id=$(echo "$existing_qaira" | jq -r --arg name "$name" --arg hint "$hint_id" '
-      ([.values[]? | select(.name==$name and .id==$hint)][0].id)
-      //
-      ([.values[]? | select(.name==$name)] | sort_by((.id | sub("customfield_";"") | tonumber? // 999999999)) | .[0].id)
-      // empty')
+    if [[ -z "$id" || "$id" == "null" ]]; then
+      id=$(echo "$existing_qaira" | jq -r --arg name "$name" '
+        ([.values[]? | select(.name==$name)] | sort_by((.id | sub("customfield_";"") | tonumber? // 999999999)) | .[0].id)
+        // empty')
+    fi
     if [[ -z "$id" || "$id" == "null" ]] && [[ "$REUSE_LEGACY_QATM" == "true" ]]; then
       legacy=$(legacy_name "$name")
       legacy_id=$(echo "$existing_legacy" | jq -r --arg legacy "$legacy" '.values[]? | select(.name==$legacy) | .id' | head -n1)

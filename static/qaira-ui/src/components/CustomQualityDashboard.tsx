@@ -2,9 +2,10 @@ import { type CSSProperties, type FormEvent, useEffect, useMemo, useRef, useStat
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toJpeg } from "html-to-image";
 import { api } from "../lib/api";
+import { asArray } from "../lib/collectionGuards";
 import { getJiraBrowseUrl, readAtlassianSiteUrl } from "../lib/jiraBrowseUrl";
-import type { QualityDashboard, QualityDashboardGadget, QualityDashboardGadgetResult } from "../types";
-import { RefreshIcon, SparkIcon } from "./AppIcons";
+import type { QualityDashboard, QualityDashboardBatchResponse, QualityDashboardGadget, QualityDashboardGadgetResult } from "../types";
+import { OpenIcon, RefreshIcon, SparkIcon } from "./AppIcons";
 import { DialogCloseButton } from "./DialogCloseButton";
 import { useDeleteConfirmation } from "./DeleteConfirmationDialog";
 import { FormField } from "./FormField";
@@ -24,7 +25,7 @@ const EMPTY_GADGET: QualityDashboardGadget = {
   accent: "blue"
 };
 
-const DEFAULT_COMPLEX_DASHBOARD_PROMPT = "Build a release-quality command center for QA leadership. Include release confidence, requirement traceability and coverage gaps, effective automation, open bug exposure and a 90-day bug trend, QA throughput over 30 days, actual test-run cycle time, execution workflow, test distribution by module, requirement flow, ownership/productivity, and a prioritized action table. Keep every signal project-scoped, explainable, drillable, and useful at a glance.";
+const DEFAULT_COMPLEX_DASHBOARD_PROMPT = "Build a release-quality command center for QA leadership. Include release confidence, story traceability and coverage gaps, effective automation, open bug exposure and a 90-day bug trend, QA throughput over 30 days, actual test-run cycle time, execution workflow, test distribution by module, story flow, ownership/productivity, and a prioritized action table. Keep every signal project-scoped, explainable, drillable, and useful at a glance.";
 
 function emptyDashboard(projectId: string): QualityDashboard {
   return {
@@ -34,6 +35,29 @@ function emptyDashboard(projectId: string): QualityDashboard {
     description: "",
     layout: "two-column",
     gadgets: []
+  };
+}
+
+function migrateLegacyStoryTitle(value: string) {
+  if (value === "Requirement traceability") return "Story traceability";
+  if (value === "Requirement coverage") return "Story coverage";
+  return value;
+}
+
+function normalizeDashboard(value: unknown, projectId: string): QualityDashboard {
+  const candidate = value && typeof value === "object" ? value as Partial<QualityDashboard> : {};
+  return {
+    ...emptyDashboard(projectId),
+    ...candidate,
+    id: typeof candidate.id === "string" ? candidate.id : "",
+    project_id: typeof candidate.project_id === "string" ? candidate.project_id : projectId,
+    name: typeof candidate.name === "string" && candidate.name.trim() ? candidate.name : "Release quality",
+    description: typeof candidate.description === "string" ? candidate.description : "",
+    layout: candidate.layout === "single" || candidate.layout === "three-column" ? candidate.layout : "two-column",
+    gadgets: asArray<QualityDashboardGadget>(candidate.gadgets).map((gadget) => ({
+      ...gadget,
+      title: migrateLegacyStoryTitle(gadget.title)
+    }))
   };
 }
 
@@ -108,9 +132,9 @@ const DASHBOARD_WIDGET_PRESETS: Array<{
   },
   {
     id: "traceability",
-    label: "Requirement traceability",
-    description: "Jira requirements with and without linked QAira tests.",
-    gadget: { id: "", title: "Requirement traceability", data_source: "qaira", type: "metric", jql: "", group_by: "status", metric: "requirementCoverage", accent: "green" }
+    label: "Story traceability",
+    description: "Jira stories with and without linked QAira tests.",
+    gadget: { id: "", title: "Story traceability", data_source: "qaira", type: "metric", jql: "", group_by: "status", metric: "requirementCoverage", accent: "green" }
   },
   {
     id: "cycle-time",
@@ -283,7 +307,7 @@ async function captureDashboardSnapshot(node: HTMLElement, dashboardName: string
     canvasWidth: Math.max(1, Math.round(width * pixelRatio)),
     filter: (candidate) => {
       if (!(candidate instanceof HTMLElement)) return true;
-      return !candidate.matches("input, select, textarea, .quality-gadget-actions, .quality-drilldown-button, .quality-gadget-remove");
+      return !candidate.matches("input, select, textarea, .quality-gadget-actions, .quality-gadget-control, .quality-gadget-remove");
     },
     height,
     pixelRatio: 1,
@@ -316,13 +340,18 @@ export function CustomQualityDashboard({ projectId, canManage, canUseAi, canUseA
   const [reportEmailDraft, setReportEmailDraft] = useState("");
   const [message, setMessage] = useState("");
   const [messageTone, setMessageTone] = useState<"success" | "error">("success");
+  const [gadgetResultOverrides, setGadgetResultOverrides] = useState<Record<string, QualityDashboardBatchResponse["results"][number]>>({});
+  const [refreshingGadgetIds, setRefreshingGadgetIds] = useState<string[]>([]);
+  const activeGadgetRefreshesRef = useRef(new Map<string, symbol>());
+  const activeDashboardScopeRef = useRef("");
   const dashboardAudiences = useMemo(
     () => canUseAutomation ? DASHBOARD_AUDIENCES : DASHBOARD_AUDIENCES.filter((audience) => audience.id !== "automation"),
     [canUseAutomation]
   );
   const dashboards = useQuery({
     queryKey: ["quality-dashboards", projectId],
-    queryFn: () => api.qualityDashboards.list({ project_id: projectId }),
+    queryFn: async () => asArray(await api.qualityDashboards.list({ project_id: projectId }))
+      .map((dashboard) => normalizeDashboard(dashboard, projectId)),
     enabled: Boolean(projectId)
   });
   const selected = useMemo(
@@ -348,23 +377,42 @@ export function CustomQualityDashboard({ projectId, canManage, canUseAi, canUseA
     }
   }, [canUseAutomation, designerDraft.stakeholder]);
 
-  const activeDashboard = editorMode ? draft : selected;
+  const activeDashboard = editorMode ? normalizeDashboard(draft, projectId) : selected;
+  const activeGadgets = asArray(activeDashboard?.gadgets);
+  const activeDashboardScope = `${projectId}:${activeDashboard?.id || "draft"}:${activeGadgets
+    .map((gadget) => [gadget.id, gadget.data_source, gadget.type, gadget.metric, gadget.group_by, gadget.jql].join(":"))
+    .join("|")}`;
+  activeDashboardScopeRef.current = activeDashboardScope;
   const recommendedJql = useMemo(
     () => buildDefaultDashboardJql(gadgetDraft, designerDraft.release),
     [designerDraft.release, gadgetDraft.group_by, gadgetDraft.metric, gadgetDraft.title, gadgetDraft.type]
   );
 
   const dashboardResults = useQuery({
-    queryKey: ["quality-dashboard-results", projectId, activeDashboard?.id || "draft", activeDashboard?.gadgets || []],
-    queryFn: () => api.analytics.queryBatch({ project_id: projectId, gadgets: activeDashboard?.gadgets || [], limit: 100 }),
-    enabled: Boolean(projectId && activeDashboard?.gadgets.length),
+    queryKey: ["quality-dashboard-results", projectId, activeDashboard?.id || "draft", activeGadgets],
+    queryFn: () => api.analytics.queryBatch({ project_id: projectId, gadgets: activeGadgets, limit: 100 }),
+    enabled: Boolean(projectId && activeGadgets.length),
     staleTime: 30_000,
     retry: 1
   });
   const resultByGadgetId = useMemo(
-    () => new Map((dashboardResults.data?.results || []).map((entry) => [entry.gadget_id, entry])),
-    [dashboardResults.data]
+    () => {
+      const entries = new Map<string, QualityDashboardBatchResponse["results"][number]>(
+        asArray(dashboardResults.data?.results).map((entry) => [entry.gadget_id, entry])
+      );
+      Object.entries(gadgetResultOverrides).forEach(([gadgetId, entry]) => entries.set(gadgetId, entry));
+      return entries;
+    },
+    [dashboardResults.data, gadgetResultOverrides]
   );
+  useEffect(() => {
+    setGadgetResultOverrides({});
+  }, [dashboardResults.dataUpdatedAt, projectId, selectedId]);
+  useEffect(() => {
+    activeGadgetRefreshesRef.current.clear();
+    setRefreshingGadgetIds([]);
+    setGadgetResultOverrides({});
+  }, [activeDashboardScope]);
   useEffect(() => {
     if (!editorMode || isGadgetJqlDirty || !recommendedJql || gadgetDraft.jql === recommendedJql) return;
     setGadgetDraft((current) => ({ ...current, jql: recommendedJql }));
@@ -432,12 +480,13 @@ export function CustomQualityDashboard({ projectId, canManage, canUseAi, canUseA
       prompt: designerDraft.prompt.trim() || undefined
     }),
     onSuccess: (response) => {
-      setDraft({ ...response.dashboard, id: "", project_id: projectId });
+      const designedDashboard = normalizeDashboard(response.dashboard, projectId);
+      setDraft({ ...designedDashboard, id: "", project_id: projectId });
       setEditingGadgetId("");
       setGadgetDraft(EMPTY_GADGET);
       setIsGadgetJqlDirty(false);
       setMessageTone("success");
-      setMessage(`Designed ${response.dashboard.gadgets.length} reviewable gadgets. Review the JQL, then save.`);
+      setMessage(`Designed ${designedDashboard.gadgets.length} reviewable gadgets. Review the JQL, then save.`);
     },
     onError: (error) => {
       setMessageTone("error");
@@ -578,6 +627,46 @@ export function CustomQualityDashboard({ projectId, canManage, canUseAi, canUseA
       setMessage(error instanceof Error ? error.message : "Unable to open the dashboard drill-down.");
     }
   };
+  const refreshGadget = async (gadget: QualityDashboardGadget) => {
+    if (!projectId || dashboardResults.isFetching || activeGadgetRefreshesRef.current.has(gadget.id)) return;
+    if (activeGadgetRefreshesRef.current.size >= 2) {
+      setMessageTone("error");
+      setMessage("Two dashboard widgets are already refreshing. Wait for one to finish, then retry.");
+      return;
+    }
+    const requestToken = Symbol(gadget.id);
+    const requestScope = activeDashboardScopeRef.current;
+    activeGadgetRefreshesRef.current.set(gadget.id, requestToken);
+    setRefreshingGadgetIds((current) => [...new Set([...current, gadget.id])]);
+    try {
+      const result = await api.analytics.query({ project_id: projectId, jql: gadget.jql, gadget, limit: 100 });
+      if (activeDashboardScopeRef.current === requestScope && activeGadgetRefreshesRef.current.get(gadget.id) === requestToken) {
+        setGadgetResultOverrides((current) => ({
+          ...current,
+          [gadget.id]: { gadget_id: gadget.id, result }
+        }));
+      }
+    } catch (error) {
+      if (activeDashboardScopeRef.current === requestScope && activeGadgetRefreshesRef.current.get(gadget.id) === requestToken) {
+        setMessageTone("error");
+        setMessage(error instanceof Error ? error.message : `Unable to refresh ${gadget.title}.`);
+      }
+    } finally {
+      if (activeGadgetRefreshesRef.current.get(gadget.id) === requestToken) {
+        activeGadgetRefreshesRef.current.delete(gadget.id);
+        setRefreshingGadgetIds((current) => current.filter((gadgetId) => gadgetId !== gadget.id));
+      }
+    }
+  };
+  const refreshDashboards = async () => {
+    setGadgetResultOverrides({});
+    await Promise.all([
+      dashboards.refetch(),
+      activeGadgets.length ? dashboardResults.refetch() : Promise.resolve()
+    ]);
+  };
+  const isDashboardRefreshPending = dashboards.isFetching || dashboardResults.isFetching || refreshingGadgetIds.length > 0;
+  const isGadgetRefreshPending = (gadgetId: string) => dashboardResults.isFetching || refreshingGadgetIds.includes(gadgetId);
 
   if (dashboards.isLoading) return <LoadingState label="Loading quality dashboards" />;
 
@@ -599,14 +688,17 @@ export function CustomQualityDashboard({ projectId, canManage, canUseAi, canUseA
           <button className="ghost-button" disabled={!selected || downloadReport.isPending} onClick={() => void handleDownloadReport()} type="button">{downloadReport.isPending ? "Exporting…" : "Export PDF"}</button>
           <button className="ghost-button" disabled={!canManage || !selected || shareReport.isPending} onClick={handleOpenReportEmailModal} type="button">Email report</button>
           <button
-            aria-busy={dashboards.isFetching || dashboardResults.isFetching}
-            aria-label={dashboards.isFetching || dashboardResults.isFetching ? "Refreshing dashboards" : "Refresh dashboards"}
-            className={`ghost-button explorer-icon-button${dashboards.isFetching || dashboardResults.isFetching ? " is-loading" : ""}`}
-            disabled={dashboards.isFetching || dashboardResults.isFetching}
-            onClick={() => {
-            void dashboards.refetch();
-            if (selected) void dashboardResults.refetch();
-          }} title="Refresh dashboards" type="button"><RefreshIcon /></button>
+            aria-busy={isDashboardRefreshPending}
+            aria-label={isDashboardRefreshPending ? "Refreshing dashboards" : "Refresh dashboards"}
+            className={`ghost-button compact custom-dashboard-refresh${isDashboardRefreshPending ? " is-loading" : ""}`}
+            disabled={isDashboardRefreshPending}
+            onClick={() => void refreshDashboards()}
+            title="Refresh dashboards"
+            type="button"
+          >
+            <RefreshIcon size={20} />
+            <span>{isDashboardRefreshPending ? "Refreshing…" : "Refresh"}</span>
+          </button>
         </div>
       </div>
 
@@ -621,8 +713,8 @@ export function CustomQualityDashboard({ projectId, canManage, canUseAi, canUseA
               return (
                 <div className="quality-gadget-shell" key={gadget.id}>
                   {dashboardResults.isLoading ? <LoadingState label={`Loading ${gadget.title}`} /> : null}
-                  {evaluated?.result ? <QualityGadget onDrilldown={(groupLabel) => handleGadgetDrilldown(evaluated.result!, groupLabel)} result={evaluated.result} /> : null}
-                  {evaluated?.error ? <div className="dashboard-gadget-error" role="alert"><strong>{evaluated.error.code}</strong><span>{evaluated.error.message}</span><button className="ghost-button compact" onClick={() => void dashboardResults.refetch()} type="button">Retry</button></div> : null}
+                  {evaluated?.result ? <QualityGadget isRefreshing={isGadgetRefreshPending(gadget.id)} onDrilldown={(groupLabel) => handleGadgetDrilldown(evaluated.result!, groupLabel)} onRefresh={() => void refreshGadget(gadget)} result={evaluated.result} /> : null}
+                  {evaluated?.error ? <div className="dashboard-gadget-error" role="alert"><strong>{evaluated.error.code}</strong><span>{evaluated.error.message}</span><button className="ghost-button compact" disabled={isGadgetRefreshPending(gadget.id)} onClick={() => void refreshGadget(gadget)} type="button">{isGadgetRefreshPending(gadget.id) ? "Refreshing…" : "Retry widget"}</button></div> : null}
                 </div>
               );
             })}
@@ -662,7 +754,7 @@ export function CustomQualityDashboard({ projectId, canManage, canUseAi, canUseA
                     <FormField className="dashboard-designer-prompt" label="Dashboard build prompt" hint="Use this rich default, erase it, or write your own bounded quality-dashboard brief."><textarea maxLength={2000} rows={5} value={designerDraft.prompt} onChange={(event) => setDesignerDraft((current) => ({ ...current, prompt: event.target.value }))} /></FormField>
                     <button className="primary-button" disabled={!canManage || design.isPending} onClick={() => design.mutate()} type="button"><SparkIcon />{design.isPending ? "Designing…" : "Design draft"}</button>
                   </div>
-                  {design.data ? <div className="dashboard-design-assurance"><span>{Math.round(design.data.confidence * 100)}% design confidence</span><span>{design.data.dashboard.gadgets.length} bounded gadgets</span><span>Human approval required</span></div> : null}
+                  {design.data ? <div className="dashboard-design-assurance"><span>{Math.round(design.data.confidence * 100)}% design confidence</span><span>{asArray(design.data.dashboard?.gadgets).length} bounded gadgets</span><span>Human approval required</span></div> : null}
                 </section>
               ) : null}
 
@@ -737,12 +829,12 @@ export function CustomQualityDashboard({ projectId, canManage, canUseAi, canUseA
                             }}
                           >
                             <optgroup label="Jira issue metrics"><option value="count">Count</option><option value="resolved">Resolved</option><option value="unresolved">Unresolved</option><option value="highPriority">High priority</option><option value="unassigned">Unassigned</option><option value="overdue">Overdue</option><option value="stale30d">Stale 30+ days</option><option value="created30d">Created in 30 days</option><option value="resolved30d">Resolved in 30 days</option><option value="resolutionRate">Resolution rate</option><option value="averageAgeDays">Average age</option><option value="averageResolutionDays">Average resolution time</option></optgroup>
-                            <optgroup label="QAira derived metrics"><option value="releaseConfidence">Release confidence</option><option value="requirementCoverage">Requirement coverage</option><option value="coverageGaps">Coverage gaps</option><option value="automationCoverage">Automation coverage</option><option value="openDefects">Open defects</option><option value="failedRuns">Failed runs</option><option value="executionCycleHours">Execution cycle time</option><option value="completedRuns30d">QA throughput · 30 days</option><option value="testCases">Test cases</option><option value="testSuites">Test suites</option><option value="testRuns">Test runs</option><option value="moduleCaseCount">Cases by module</option></optgroup>
+                            <optgroup label="QAira derived metrics"><option value="releaseConfidence">Release confidence</option><option value="requirementCoverage">Story coverage</option><option value="coverageGaps">Coverage gaps</option><option value="automationCoverage">Automation coverage</option><option value="openDefects">Open defects</option><option value="failedRuns">Failed runs</option><option value="executionCycleHours">Execution cycle time</option><option value="completedRuns30d">QA throughput · 30 days</option><option value="testCases">Test cases</option><option value="testSuites">Test suites</option><option value="testRuns">Test runs</option><option value="moduleCaseCount">Cases by module</option></optgroup>
                           </select>
                         </FormField>
                         <FormField label="Accent"><select value={gadgetDraft.accent || "blue"} onChange={(event) => setGadgetDraft((current) => ({ ...current, accent: event.target.value as QualityDashboardGadget["accent"] }))}>{DASHBOARD_ACCENTS.map((accent) => <option key={accent.id} value={accent.id}>{accent.label}</option>)}</select></FormField>
                       </div>
-                      {gadgetDraft.data_source !== "qaira" ? <><FormField label="JQL" hint="Auto-filled from the gadget title, chart, metric, grouping and release; Qaira always adds the active Jira project server-side."><textarea maxLength={2000} rows={4} value={gadgetDraft.jql} onChange={(event) => { setIsGadgetJqlDirty(true); setGadgetDraft((current) => ({ ...current, jql: event.target.value })); }} /></FormField><div className="dashboard-jql-recommendation"><span>Suggested JQL: <code>{recommendedJql}</code></span><button className="ghost-button compact" onClick={() => { setIsGadgetJqlDirty(false); setGadgetDraft((current) => ({ ...current, jql: recommendedJql })); }} type="button">Use suggested JQL</button></div></> : <div className="dashboard-derived-note"><strong>Derived QAira signal</strong><span>Computed from bounded Jira-native requirements, tests, suites, modules, runs, and Bugs. No free-form query is executed.</span></div>}
+                      {gadgetDraft.data_source !== "qaira" ? <><FormField label="JQL" hint="Auto-filled from the gadget title, chart, metric, grouping and release; Qaira always adds the active Jira project server-side."><textarea maxLength={2000} rows={4} value={gadgetDraft.jql} onChange={(event) => { setIsGadgetJqlDirty(true); setGadgetDraft((current) => ({ ...current, jql: event.target.value })); }} /></FormField><div className="dashboard-jql-recommendation"><span>Suggested JQL: <code>{recommendedJql}</code></span><button className="ghost-button compact" onClick={() => { setIsGadgetJqlDirty(false); setGadgetDraft((current) => ({ ...current, jql: recommendedJql })); }} type="button">Use suggested JQL</button></div></> : <div className="dashboard-derived-note"><strong>Derived QAira signal</strong><span>Computed from bounded Jira-native stories, tests, suites, modules, runs, and Bugs. No free-form query is executed.</span></div>}
                       <div className="action-row"><button className="ghost-button" disabled={preview.isPending} onClick={() => preview.mutate({ ...gadgetDraft, id: gadgetDraft.id || "preview" })} type="button">{preview.isPending ? "Running…" : "Preview"}</button><button className="primary-button" disabled={!gadgetDraft.title.trim() || (!editingGadgetId && draft.gadgets.length >= 12)} onClick={addGadget} type="button">{editingGadgetId ? "Update gadget" : "Add gadget"}</button>{editingGadgetId ? <button className="ghost-button" onClick={() => { setEditingGadgetId(""); setGadgetDraft({ ...EMPTY_GADGET, title: "" }); setIsGadgetJqlDirty(false); }} type="button">Cancel edit</button> : null}</div>
                     </div>
                     {preview.data ? <QualityGadget onDrilldown={(groupLabel) => handleGadgetDrilldown(preview.data!, groupLabel)} result={preview.data} /> : null}
@@ -753,7 +845,7 @@ export function CustomQualityDashboard({ projectId, canManage, canUseAi, canUseA
                   <div className={`quality-gadget-grid layout-${draft.layout}`}>
                     {draft.gadgets.map((gadget, index) => {
                       const evaluated = resultByGadgetId.get(gadget.id);
-                      return <div className="quality-gadget-shell" key={gadget.id}><div className="quality-gadget-actions"><button aria-label={`Move ${gadget.title} left`} disabled={index === 0} onClick={() => moveGadget(gadget.id, -1)} type="button">←</button><button aria-label={`Move ${gadget.title} right`} disabled={index === draft.gadgets.length - 1} onClick={() => moveGadget(gadget.id, 1)} type="button">→</button><button onClick={() => { setEditingGadgetId(gadget.id); setGadgetDraft(gadget); setIsGadgetJqlDirty(true); }} type="button">Edit</button><button disabled={draft.gadgets.length >= 12} onClick={() => duplicateGadget(gadget)} type="button">Copy</button><button aria-label={`Remove ${gadget.title}`} className="danger" onClick={() => setDraft((current) => ({ ...current, gadgets: current.gadgets.filter((item) => item.id !== gadget.id) }))} type="button">×</button></div>{dashboardResults.isLoading ? <LoadingState label={`Loading ${gadget.title}`} /> : null}{evaluated?.result ? <QualityGadget onDrilldown={(groupLabel) => handleGadgetDrilldown(evaluated.result!, groupLabel)} result={evaluated.result} /> : null}{evaluated?.error ? <div className="dashboard-gadget-error" role="alert"><strong>{evaluated.error.code}</strong><span>{evaluated.error.message}</span><button className="ghost-button compact" onClick={() => void dashboardResults.refetch()} type="button">Retry</button></div> : null}</div>;
+                      return <div className="quality-gadget-shell" key={gadget.id}><div className="quality-gadget-actions"><button aria-label={`Move ${gadget.title} left`} disabled={index === 0} onClick={() => moveGadget(gadget.id, -1)} type="button">←</button><button aria-label={`Move ${gadget.title} right`} disabled={index === draft.gadgets.length - 1} onClick={() => moveGadget(gadget.id, 1)} type="button">→</button><button onClick={() => { setEditingGadgetId(gadget.id); setGadgetDraft(gadget); setIsGadgetJqlDirty(true); }} type="button">Edit</button><button disabled={draft.gadgets.length >= 12} onClick={() => duplicateGadget(gadget)} type="button">Copy</button><button aria-label={`Remove ${gadget.title}`} className="danger" onClick={() => setDraft((current) => ({ ...current, gadgets: current.gadgets.filter((item) => item.id !== gadget.id) }))} type="button">×</button></div>{dashboardResults.isLoading ? <LoadingState label={`Loading ${gadget.title}`} /> : null}{evaluated?.result ? <QualityGadget isRefreshing={isGadgetRefreshPending(gadget.id)} onDrilldown={(groupLabel) => handleGadgetDrilldown(evaluated.result!, groupLabel)} onRefresh={() => void refreshGadget(gadget)} result={evaluated.result} /> : null}{evaluated?.error ? <div className="dashboard-gadget-error" role="alert"><strong>{evaluated.error.code}</strong><span>{evaluated.error.message}</span><button className="ghost-button compact" disabled={isGadgetRefreshPending(gadget.id)} onClick={() => void refreshGadget(gadget)} type="button">{isGadgetRefreshPending(gadget.id) ? "Refreshing…" : "Retry widget"}</button></div> : null}</div>;
                     })}
                     {!draft.gadgets.length ? <div className="empty-state compact">Add a validated JQL gadget or generate an AI-assisted draft.</div> : null}
                   </div>
@@ -800,56 +892,85 @@ export function CustomQualityDashboard({ projectId, canManage, canUseAi, canUseA
   );
 }
 
-function QualityGadget({ result, onDrilldown }: { result: QualityDashboardGadgetResult; onDrilldown?: (groupLabel?: string) => void }) {
-  const maximum = Math.max(...result.series.map((item) => item.value), 1);
-  const accent = result.gadget.accent || "blue";
+function QualityGadget({
+  result,
+  onDrilldown,
+  onRefresh,
+  isRefreshing = false
+}: {
+  result: QualityDashboardGadgetResult;
+  onDrilldown?: (groupLabel?: string) => void;
+  onRefresh?: () => void;
+  isRefreshing?: boolean;
+}) {
+  const gadget = result.gadget && typeof result.gadget === "object" ? result.gadget : EMPTY_GADGET;
+  const series = asArray(result.series);
+  const rows = asArray(result.rows);
+  const maximum = Math.max(...series.map((item) => Number(item.value) || 0), 1);
+  const accent = gadget.accent || "blue";
   const palette = GADGET_ACCENT_PALETTES[accent] || GADGET_ACCENT_PALETTES.blue;
   const gadgetStyle = {
     "--qaira-gadget-accent": palette[0],
     "--qaira-gadget-accent-soft": `${palette[0]}18`
   } as CSSProperties;
-  const seriesTotal = Math.max(result.series.reduce((sum, item) => sum + item.value, 0), 1);
+  const seriesTotal = Math.max(series.reduce((sum, item) => sum + (Number(item.value) || 0), 0), 1);
   let cursor = 0;
-  const donutStops = result.series.map((item, index) => {
+  const donutStops = series.map((item, index) => {
     const start = cursor;
     cursor += (item.value / seriesTotal) * 100;
     return `${palette[index % palette.length]} ${start}% ${cursor}%`;
   }).join(", ");
-  const linePoints = result.series.map((item, index) => {
-    const x = result.series.length <= 1 ? 150 : (index / (result.series.length - 1)) * 280 + 10;
+  const linePoints = series.map((item, index) => {
+    const x = series.length <= 1 ? 150 : (index / (series.length - 1)) * 280 + 10;
     const y = 108 - (item.value / maximum) * 92;
     return `${x},${y}`;
   }).join(" ");
-  const isPercentageMetric = ["resolutionRate", "requirementCoverage", "automationCoverage"].includes(result.gadget.metric || "");
+  const isPercentageMetric = ["resolutionRate", "requirementCoverage", "automationCoverage"].includes(gadget.metric || "");
   return (
-    <article className={`quality-gadget type-${result.gadget.type} tone-${resultTone(result)} accent-${accent}`} style={gadgetStyle}>
-      <div className="quality-gadget-head"><strong>{result.gadget.title}</strong><div><span>{result.total}{result.truncated ? "+" : ""}</span>{onDrilldown ? <button aria-label={`Open ${result.gadget.title} drill-down in a new tab`} className="quality-drilldown-button" onClick={() => onDrilldown()} title="Open drill-down in a new tab" type="button">↗</button> : null}</div></div>
-      {result.gadget.type === "metric" ? <div className="quality-metric-value"><strong>{isPercentageMetric ? `${result.value}%` : result.value}</strong><span>{result.value_label}</span></div> : null}
-      {result.gadget.type === "bar" ? (
-        <div className="quality-series-list">{result.series.map((item) => <button disabled={!onDrilldown} key={item.label} onClick={() => onDrilldown?.(item.label)} title={`Open ${item.label} in a new tab`} type="button"><span>{item.label}</span><i><em style={{ width: `${Math.round((item.value / maximum) * 100)}%` }} /></i><strong>{item.value}</strong></button>)}</div>
+    <article className={`quality-gadget type-${gadget.type} tone-${resultTone(result)} accent-${accent}`} style={gadgetStyle}>
+      <div className="quality-gadget-head">
+        <strong>{gadget.title}</strong>
+        <div className="quality-gadget-controls">
+          <span>{Number(result.total) || 0}{result.truncated ? "+" : ""}</span>
+          {onRefresh ? (
+            <button aria-busy={isRefreshing} aria-label={isRefreshing ? `Refreshing ${gadget.title}` : `Refresh ${gadget.title}`} className={`quality-gadget-control${isRefreshing ? " is-loading" : ""}`} disabled={isRefreshing} onClick={onRefresh} title={`Refresh ${gadget.title}`} type="button">
+              <RefreshIcon size={15} />
+            </button>
+          ) : null}
+          {onDrilldown ? (
+            <button aria-label={`Open ${gadget.title} drill-down in a new tab`} className="quality-gadget-control quality-gadget-open" onClick={() => onDrilldown()} title="Open drill-down in a new tab" type="button">
+              <OpenIcon size={14} />
+              <span>Open</span>
+            </button>
+          ) : null}
+        </div>
+      </div>
+      {gadget.type === "metric" ? <div className="quality-metric-value"><strong>{isPercentageMetric ? `${Number(result.value) || 0}%` : Number(result.value) || 0}</strong><span>{result.value_label || "Result"}</span></div> : null}
+      {gadget.type === "bar" ? (
+        <div className="quality-series-list">{series.map((item) => <button disabled={!onDrilldown} key={item.label} onClick={() => onDrilldown?.(item.label)} title={`Open ${item.label} in a new tab`} type="button"><span>{item.label}</span><i><em style={{ width: `${Math.round(((Number(item.value) || 0) / maximum) * 100)}%` }} /></i><strong>{item.value}</strong></button>)}</div>
       ) : null}
-      {result.gadget.type === "donut" ? (
+      {gadget.type === "donut" ? (
         <div className="quality-donut-layout">
-          <div className="quality-donut" style={{ background: result.series.length ? `conic-gradient(${donutStops})` : "var(--ds-background-neutral, #dfe1e6)" }}><span><strong>{result.total}</strong><small>Total</small></span></div>
-          <div className="quality-chart-legend">{result.series.slice(0, 8).map((item, index) => <button disabled={!onDrilldown} key={item.label} onClick={() => onDrilldown?.(item.label)} title={`Open ${item.label} in a new tab`} type="button"><i style={{ background: palette[index % palette.length] }} /><small>{item.label}</small><strong>{item.value}</strong></button>)}</div>
+          <div className="quality-donut" style={{ background: series.length ? `conic-gradient(${donutStops})` : "var(--ds-background-neutral, #dfe1e6)" }}><span><strong>{Number(result.total) || 0}</strong><small>Total</small></span></div>
+          <div className="quality-chart-legend">{series.slice(0, 8).map((item, index) => <button disabled={!onDrilldown} key={item.label} onClick={() => onDrilldown?.(item.label)} title={`Open ${item.label} in a new tab`} type="button"><i style={{ background: palette[index % palette.length] }} /><small>{item.label}</small><strong>{item.value}</strong></button>)}</div>
         </div>
       ) : null}
-      {result.gadget.type === "stacked-bar" ? (
+      {gadget.type === "stacked-bar" ? (
         <div className="quality-stacked-chart">
-          <div>{result.series.slice(0, 8).map((item, index) => <span key={item.label} style={{ background: palette[index % palette.length], width: `${(item.value / seriesTotal) * 100}%` }} title={`${item.label}: ${item.value}`} />)}</div>
-          <div className="quality-chart-legend">{result.series.slice(0, 8).map((item, index) => <button disabled={!onDrilldown} key={item.label} onClick={() => onDrilldown?.(item.label)} title={`Open ${item.label} in a new tab`} type="button"><i style={{ background: palette[index % palette.length] }} /><small>{item.label}</small><strong>{item.value}</strong></button>)}</div>
+          <div>{series.slice(0, 8).map((item, index) => <span key={item.label} style={{ background: palette[index % palette.length], width: `${((Number(item.value) || 0) / seriesTotal) * 100}%` }} title={`${item.label}: ${item.value}`} />)}</div>
+          <div className="quality-chart-legend">{series.slice(0, 8).map((item, index) => <button disabled={!onDrilldown} key={item.label} onClick={() => onDrilldown?.(item.label)} title={`Open ${item.label} in a new tab`} type="button"><i style={{ background: palette[index % palette.length] }} /><small>{item.label}</small><strong>{item.value}</strong></button>)}</div>
         </div>
       ) : null}
-      {result.gadget.type === "line" ? (
+      {gadget.type === "line" ? (
         <button className="quality-line-chart quality-chart-drilldown" disabled={!onDrilldown} onClick={() => onDrilldown?.()} title="Open trend drill-down in a new tab" type="button">
-          <svg aria-label={`${result.gadget.title} trend`} role="img" viewBox="0 0 300 120"><path d="M10 108 H290" /><polyline points={linePoints} /></svg>
-          <div><span>{result.series[0]?.label || "—"}</span><strong>{result.series.map((item) => item.value).join(" · ") || "No data"}</strong><span>{result.series[result.series.length - 1]?.label || "—"}</span></div>
+          <svg aria-label={`${gadget.title} trend`} role="img" viewBox="0 0 300 120"><path d="M10 108 H290" /><polyline points={linePoints} /></svg>
+          <div><span>{series[0]?.label || "—"}</span><strong>{series.map((item) => item.value).join(" · ") || "No data"}</strong><span>{series[series.length - 1]?.label || "—"}</span></div>
         </button>
       ) : null}
-      {result.gadget.type === "table" ? (
-        <div className="quality-table-wrap"><table><thead><tr><th>Key</th><th>Title</th><th>Type</th><th>Priority</th><th>Status</th><th>Owner</th></tr></thead><tbody>{result.rows.map((row) => { const issueUrl = result.gadget.data_source !== "qaira" ? getJiraBrowseUrl(row.key) : null; return <tr key={row.id}><td>{issueUrl ? <a href={issueUrl} rel="noreferrer" target="_blank">{row.key}</a> : row.key}</td><td>{issueUrl ? <a href={issueUrl} rel="noreferrer" target="_blank">{row.title}</a> : <button className="quality-table-drilldown" onClick={() => onDrilldown?.()} type="button">{row.title}</button>}</td><td>{row.type || "—"}</td><td>{row.priority || "—"}</td><td>{row.status || "—"}</td><td>{row.assignee || "Unassigned"}</td></tr>; })}</tbody></table></div>
+      {gadget.type === "table" ? (
+        <div className="quality-table-wrap"><table><thead><tr><th>Key</th><th>Title</th><th>Type</th><th>Priority</th><th>Status</th><th>Owner</th></tr></thead><tbody>{rows.map((row) => { const issueUrl = gadget.data_source !== "qaira" ? getJiraBrowseUrl(row.key) : null; return <tr key={row.id}><td>{issueUrl ? <a href={issueUrl} rel="noreferrer" target="_blank">{row.key}</a> : row.key}</td><td>{issueUrl ? <a href={issueUrl} rel="noreferrer" target="_blank">{row.title}</a> : <button className="quality-table-drilldown" onClick={() => onDrilldown?.()} type="button">{row.title}</button>}</td><td>{row.type || "—"}</td><td>{row.priority || "—"}</td><td>{row.status || "—"}</td><td>{row.assignee || "Unassigned"}</td></tr>; })}</tbody></table></div>
       ) : null}
-      <small className="quality-gadget-foot">{result.gadget.data_source === "qaira" ? "QAira derived · bounded project portfolio" : "Jira JQL · project scoped"} · {result.returned} inspected</small>
+      <small className="quality-gadget-foot">{gadget.data_source === "qaira" ? "QAira derived · bounded project portfolio" : "Jira JQL · project scoped"} · {Number(result.returned) || 0} inspected</small>
     </article>
   );
 }

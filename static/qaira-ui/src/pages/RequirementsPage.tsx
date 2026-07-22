@@ -1,4 +1,4 @@
-import { ChangeEvent, CSSProperties, Dispatch, FormEvent, Fragment, ReactNode, SetStateAction, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
+import { ChangeEvent, CSSProperties, Dispatch, DragEvent as ReactDragEvent, FormEvent, Fragment, ReactNode, SetStateAction, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useInfiniteQuery, useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useSearchParams } from "react-router-dom";
@@ -53,10 +53,24 @@ import { assessRequirementAiReadiness } from "../lib/aiAssurance";
 import { formatAuditTimestamp, resolveAuditUserLabel } from "../lib/auditDisplay";
 import { formatReferenceList, parseReferenceList } from "../lib/externalReferences";
 import { areFeatureFlagsEnabled } from "../lib/featureFlags";
+import { asArray, getVerifiedNextPageCursor, normalizePagedResult } from "../lib/collectionGuards";
 import { downloadCsvRecords } from "../lib/csvExport";
 import { hasPermission } from "../lib/permissions";
 import { getJiraBrowseUrl } from "../lib/jiraBrowseUrl";
 import { deriveIterationHealth } from "../lib/hierarchyHealth";
+import { chunkHierarchyMoveIds, readHierarchyDragPayload, resolveHierarchyDragIds, writeHierarchyDragPayload } from "../lib/hierarchyDrag";
+import { getHierarchyPageSize, getUnassignedPageSize } from "../lib/hierarchyPagination";
+import { queryKeys } from "../lib/queryKeys";
+import {
+  JIRA_SPRINT_MOVE_BATCH_SIZE,
+  createConfirmedRequirementSprintMove,
+  projectConfirmedRequirementSprintMove,
+  readPersistedRequirementSprintMoves,
+  requirementSprintMoveIsSettled,
+  resolveRequirementSprintIteration,
+  writePersistedRequirementSprintMoves,
+  type ConfirmedRequirementSprintMove
+} from "../lib/requirementSprintMove";
 import { parseRequirementCsv } from "../lib/requirementImport";
 import { findByRoutableId, getRoutableId } from "../lib/urlSelection";
 import { readDefaultCatalogViewMode } from "../lib/viewPreferences";
@@ -65,6 +79,7 @@ import type { AiDesignImageInput, AiDesignedTestCaseCandidate, Execution, Execut
 type RequirementDraft = {
   title: string;
   description: string;
+  gherkinScenariosText: string;
   externalReferencesText: string;
   labelsText: string;
   sprint: string;
@@ -84,6 +99,8 @@ type RequirementCoverageMetric = {
   total: number;
   covered: number;
   percent: number;
+  known?: number;
+  complete?: boolean;
 };
 
 type RequirementRunHistoryRow = {
@@ -107,6 +124,15 @@ type RequirementAiMode = "create" | "improve";
 
 const RECOVERABLE_REQUIREMENT_AI_JOB_WINDOW_MS = 30 * 60_000;
 
+const getRequirementSprintMoveStorage = () => {
+  if (typeof window === "undefined") return null;
+  try {
+    return window.localStorage;
+  } catch {
+    return null;
+  }
+};
+
 const isRecoverableRequirementAiJob = (job: RequirementGenerationJob) => {
   const status = String(job.status || "").toLowerCase();
   if (!["queued", "running", "completed"].includes(status)) return false;
@@ -118,6 +144,7 @@ const isRecoverableRequirementAiJob = (job: RequirementGenerationJob) => {
 const createEmptyRequirementDraft = (defaultStatus = "To Do"): RequirementDraft => ({
   title: "",
   description: "",
+  gherkinScenariosText: "",
   externalReferencesText: "",
   labelsText: "",
   sprint: "",
@@ -172,16 +199,37 @@ const createDefaultRequirementSections = (): Record<RequirementSectionKey, boole
 const getRequirementCreationDraftId = (draft: Pick<RequirementCreationSuggestion, "client_id" | "title">, index: number) =>
   draft.client_id || `ai-req-${index + 1}-${draft.title}`;
 
-const composeAiRequirementDescription = (suggestion: Pick<RequirementCreationSuggestion, "description" | "acceptance_criteria" | "risks" | "open_questions">) =>
-  [
+const composeAiRequirementDescription = (suggestion: Pick<RequirementCreationSuggestion, "description" | "acceptance_criteria" | "risks" | "open_questions">) => {
+  const acceptanceCriteria = asArray(suggestion.acceptance_criteria);
+  const risks = asArray(suggestion.risks);
+  const openQuestions = asArray(suggestion.open_questions);
+  return [
     suggestion.description,
-    suggestion.acceptance_criteria.length ? "Acceptance criteria:" : "",
-    ...suggestion.acceptance_criteria.map((item) => `- ${item}`),
-    suggestion.risks.length ? "\nRisks:" : "",
-    ...suggestion.risks.map((item) => `- ${item}`),
-    suggestion.open_questions.length ? "\nOpen questions:" : "",
-    ...suggestion.open_questions.map((item) => `- ${item}`)
+    acceptanceCriteria.length ? "Acceptance criteria:" : "",
+    ...acceptanceCriteria.map((item) => `- ${item}`),
+    risks.length ? "\nRisks:" : "",
+    ...risks.map((item) => `- ${item}`),
+    openQuestions.length ? "\nOpen questions:" : "",
+    ...openQuestions.map((item) => `- ${item}`)
   ].filter(Boolean).join("\n");
+};
+
+const formatGherkinScenarios = (scenarios?: string[]) =>
+  asArray(scenarios).map((scenario) => String(scenario).trim()).filter(Boolean).join("\n\n");
+
+const parseGherkinScenarios = (value: string) => {
+  const normalized = String(value || "").trim();
+  if (!normalized) return [];
+  const featureMatch = normalized.match(/^Feature:[^\n]*(?:\n+|$)/i);
+  const featureHeader = featureMatch?.[0].trim() || "";
+  const scenarioBody = featureMatch ? normalized.slice(featureMatch[0].length).trim() : normalized;
+  const scenarios = scenarioBody
+    .split(/(?=^\s*(?:Scenario|Scenario Outline):)/gim)
+    .map((scenario) => scenario.trim())
+    .filter(Boolean);
+  if (!scenarios.length) return [];
+  return scenarios.map((scenario, index) => index === 0 && featureHeader ? `${featureHeader}\n\n${scenario}` : scenario);
+};
 
 const getRequirementCoverageTone = (covered: number, total: number) => {
   if (!total) {
@@ -209,15 +257,16 @@ function RequirementProgressBar({
   detail: string;
 }) {
   const safeValue = Math.max(0, Math.min(100, Math.round(metric.percent)));
-  const tone = getRequirementCoverageTone(metric.covered, metric.total);
+  const isComplete = metric.complete !== false;
+  const tone = isComplete ? getRequirementCoverageTone(metric.covered, metric.total) : "neutral";
 
   return (
-    <div className="requirement-progress-meter" aria-label={`${label} ${safeValue}%`} title={detail}>
+    <div className="requirement-progress-meter" aria-label={isComplete ? `${label} ${safeValue}%` : `${label} unavailable until linked cases are loaded`} title={detail}>
       <div className="requirement-progress-meter-header">
         <span>{label}</span>
-        <strong>{safeValue}%</strong>
+        <strong>{isComplete ? `${safeValue}%` : "—"}</strong>
       </div>
-      <ProgressMeter hideCopy tone={tone} value={safeValue} />
+      <ProgressMeter hideCopy tone={tone} value={isComplete ? safeValue : 0} />
     </div>
   );
 }
@@ -375,7 +424,22 @@ function ChevronDownIcon() {
 }
 
 function HierarchyToggleIcon({ isExpanded }: { isExpanded: boolean }) {
-  return <span aria-hidden="true" className="hierarchy-toggle-glyph">{isExpanded ? "−" : "+"}</span>;
+  return (
+    <span aria-hidden="true" className="hierarchy-toggle-glyph">
+      <CollapseExpandIcon isExpanded={isExpanded} />
+    </span>
+  );
+}
+
+function getKnownSprintRequirementCount(iteration: RequirementIteration) {
+  const count = iteration.requirement_count;
+  if (!Number.isFinite(count)) return undefined;
+
+  // Jira Sprint headers are discovered independently from their Story JQL, so
+  // the local assignment list can be absent or partial. Only the expanded child
+  // response can prove the native Sprint count and whether its scope is empty.
+  if (iteration.source === "jira") return undefined;
+  return Number(count);
 }
 
 export function RequirementsPage() {
@@ -409,6 +473,7 @@ export function RequirementsPage() {
   const [selectedDefectIds, setSelectedDefectIds] = useState<string[]>([]);
   const [linkedPreviewCaseId, setLinkedPreviewCaseId] = useState("");
   const [deleteSelectedRequirementIds, setDeleteSelectedRequirementIds] = useState<string[]>([]);
+  const selectedRequirementSnapshotsRef = useRef<Map<string, Requirement>>(new Map());
   const [isDeletingSelectedRequirements, setIsDeletingSelectedRequirements] = useState(false);
   const [isCreateIterationModalOpen, setIsCreateIterationModalOpen] = useState(false);
   const [editingIteration, setEditingIteration] = useState<RequirementIteration | null>(null);
@@ -420,11 +485,31 @@ export function RequirementsPage() {
   const [iterationDraftStatus, setIterationDraftStatus] = useState<"future" | "active">("future");
   const [sprintDraftRequirementIds, setSprintDraftRequirementIds] = useState<string[]>([]);
   const [iterationRequirementSearch, setIterationRequirementSearch] = useState("");
-  const [collapsedIterationIds, setCollapsedIterationIds] = useState<string[]>([]);
-  const [isSprintHierarchySeeded, setIsSprintHierarchySeeded] = useState(false);
+  const [expandedIterationIds, setExpandedIterationIds] = useState<string[]>([]);
   const [sprintPageCursorsById, setSprintPageCursorsById] = useState<Record<string, Array<string | null>>>({});
   const [selectedIterationIds, setSelectedIterationIds] = useState<string[]>([]);
+  const [deletingIterationId, setDeletingIterationId] = useState("");
   const [draggingRequirementIds, setDraggingRequirementIds] = useState<string[]>([]);
+  const confirmedSprintMoveScope = session?.user.id && projectId ? `${session.user.id}:${projectId}` : "";
+  const [confirmedSprintMoveState, setConfirmedSprintMoveState] = useState<{
+    scope: string;
+    moves: Record<string, ConfirmedRequirementSprintMove>;
+  }>({ scope: "", moves: {} });
+  const confirmedSprintMovesByRequirementId = confirmedSprintMoveState.scope === confirmedSprintMoveScope
+    ? confirmedSprintMoveState.moves
+    : {};
+  const setConfirmedSprintMovesByRequirementId: Dispatch<SetStateAction<Record<string, ConfirmedRequirementSprintMove>>> = (value) => {
+    setConfirmedSprintMoveState((current) => {
+      const scopedCurrent = current.scope === confirmedSprintMoveScope ? current.moves : {};
+      return {
+        scope: confirmedSprintMoveScope,
+        moves: typeof value === "function" ? value(scopedCurrent) : value
+      };
+    });
+  };
+  const requirementMovePendingRef = useRef(false);
+  const requirementMoveScopeRef = useRef(`${projectId}:${appTypeId}`);
+  const requirementMoveRevalidationTimerRef = useRef<number | null>(null);
   const [requirementSearchTerm, setRequirementSearchTerm] = useState("");
   const deferredRequirementSearchTerm = useDeferredValue(requirementSearchTerm);
   const [requirementStatusFilter, setRequirementStatusFilter] = useState("all");
@@ -456,6 +541,7 @@ export function RequirementsPage() {
   );
   const emptyRequirementDraft = useMemo(() => createEmptyRequirementDraft(defaultRequirementStatus), [defaultRequirementStatus]);
   const [draft, setDraft] = useState<RequirementDraft>(() => createEmptyRequirementDraft());
+  const seededRequirementDraftKeyRef = useRef("");
   const [isCreateModalOpen, setIsCreateModalOpen] = useState(false);
   const [createDraft, setCreateDraft] = useState<RequirementDraft>(() => createEmptyRequirementDraft());
   const [isAiStudioOpen, setIsAiStudioOpen] = useState(false);
@@ -485,6 +571,9 @@ export function RequirementsPage() {
   const [selectedRequirementCreationDraftIds, setSelectedRequirementCreationDraftIds] = useState<string[]>([]);
   const [expandedRequirementCreationDraftIds, setExpandedRequirementCreationDraftIds] = useState<string[]>([]);
   const [requirementCreationJobId, setRequirementCreationJobId] = useState("");
+  const [includeGherkin, setIncludeGherkin] = useState(true);
+  const [isGeneratingGherkin, setIsGeneratingGherkin] = useState(false);
+  const gherkinGenerationKeyRef = useRef("");
   const [optimizationFields, setOptimizationFields] = useState({
     title: true,
     description: true,
@@ -495,18 +584,29 @@ export function RequirementsPage() {
 
   const projectsQuery = useQuery({
     queryKey: ["projects"],
-    queryFn: api.projects.list
+    queryFn: async () => asArray(await api.projects.list())
   });
   const appTypesQuery = useQuery({
     queryKey: ["app-types", projectId],
-    queryFn: () => api.appTypes.list({ project_id: projectId }),
+    queryFn: async () => asArray(await api.appTypes.list({ project_id: projectId })),
     enabled: Boolean(projectId)
   });
   const requirementsQuery = useInfiniteQuery({
-    queryKey: ["requirements", projectId],
-    queryFn: ({ pageParam }) => api.requirements.listPage({ project_id: projectId, unassigned: true, page_size: 15, cursor: pageParam, projection: "summary" }),
+    queryKey: queryKeys.requirementsPages(projectId),
+    queryFn: async ({ pageParam }) => normalizePagedResult<Requirement>(
+      await api.requirements.listPage({
+        project_id: projectId,
+        unassigned: true,
+        page_size: getUnassignedPageSize(Boolean(pageParam)),
+        cursor: pageParam,
+        projection: "summary"
+      })
+    ),
     initialPageParam: undefined as string | undefined,
-    getNextPageParam: (lastPage) => lastPage.next_cursor || undefined,
+    getNextPageParam: (lastPage, _allPages, _lastPageParam, allPageParams) => {
+      const nextCursor = getVerifiedNextPageCursor(lastPage);
+      return nextCursor && !allPageParams.includes(nextCursor) ? nextCursor : undefined;
+    },
     enabled: Boolean(projectId)
   });
   const requirementDetailQuery = useQuery({
@@ -529,44 +629,117 @@ export function RequirementsPage() {
   });
   const requirementIterationsQuery = useQuery({
     queryKey: ["requirement-iterations", projectId],
-    queryFn: () => api.requirementIterations.list({ project_id: projectId }),
+    queryFn: async () => asArray(await api.requirementIterations.list({ project_id: projectId })),
     enabled: Boolean(projectId && canViewRequirementIterations)
   });
   useEffect(() => {
-    if (!requirementIterationsQuery.data || isSprintHierarchySeeded) return;
-    setCollapsedIterationIds(requirementIterationsQuery.data.map((iteration) => iteration.id));
-    setIsSprintHierarchySeeded(true);
-  }, [isSprintHierarchySeeded, requirementIterationsQuery.data]);
-  useEffect(() => {
-    setIsSprintHierarchySeeded(false);
-    setCollapsedIterationIds([]);
+    requirementMoveScopeRef.current = `${projectId}:${appTypeId}`;
+    if (requirementMoveRevalidationTimerRef.current !== null) {
+      window.clearTimeout(requirementMoveRevalidationTimerRef.current);
+      requirementMoveRevalidationTimerRef.current = null;
+    }
+    selectedRequirementSnapshotsRef.current.clear();
+    setExpandedIterationIds([]);
     setSprintPageCursorsById({});
-  }, [projectId]);
-  const expandedSprintHeaders = (requirementIterationsQuery.data || []).filter((iteration) =>
-    isSprintHierarchySeeded && !collapsedIterationIds.includes(iteration.id)
+    setDeleteSelectedRequirementIds([]);
+    setSelectedIterationIds([]);
+    setDraggingRequirementIds([]);
+    return () => {
+      if (requirementMoveRevalidationTimerRef.current !== null) {
+        window.clearTimeout(requirementMoveRevalidationTimerRef.current);
+        requirementMoveRevalidationTimerRef.current = null;
+      }
+    };
+  }, [appTypeId, projectId]);
+  useEffect(() => {
+    setConfirmedSprintMoveState({
+      scope: confirmedSprintMoveScope,
+      moves: readPersistedRequirementSprintMoves(
+        getRequirementSprintMoveStorage(),
+        confirmedSprintMoveScope
+      )
+    });
+  }, [confirmedSprintMoveScope]);
+  useEffect(() => {
+    if (!confirmedSprintMoveScope || confirmedSprintMoveState.scope !== confirmedSprintMoveScope) return;
+    writePersistedRequirementSprintMoves(
+      getRequirementSprintMoveStorage(),
+      confirmedSprintMoveScope,
+      confirmedSprintMoveState.moves
+    );
+  }, [confirmedSprintMoveScope, confirmedSprintMoveState]);
+  useEffect(() => {
+    if (confirmedSprintMoveState.scope !== confirmedSprintMoveScope) return;
+    const targetIterationIds = Object.values(confirmedSprintMoveState.moves).map((move) => move.targetIterationId);
+    if (!targetIterationIds.length) return;
+    // Keep a just-moved Story visibly under its destination after a browser
+    // refresh and activate the scoped Jira query that will retire the bridge.
+    setExpandedIterationIds((current) => [...new Set([...current, ...targetIterationIds])]);
+  }, [confirmedSprintMoveScope, confirmedSprintMoveState]);
+  const expandedSprintHeaders = useMemo(
+    () => asArray(requirementIterationsQuery.data).filter((iteration) => expandedIterationIds.includes(iteration.id)),
+    [expandedIterationIds, requirementIterationsQuery.data]
   );
-  const sprintPageRequests = expandedSprintHeaders.flatMap((iteration) =>
-    (sprintPageCursorsById[iteration.id] || [null]).map((cursor, pageIndex) => ({ iteration, cursor, pageIndex }))
+  const sprintPageRequests = useMemo(
+    () => expandedSprintHeaders.flatMap((iteration) =>
+      (sprintPageCursorsById[iteration.id] || [null]).map((cursor, pageIndex) => ({ iteration, cursor, pageIndex }))
+    ),
+    [expandedSprintHeaders, sprintPageCursorsById]
   );
   const sprintRequirementQueries = useQueries({
     queries: sprintPageRequests.map(({ iteration, cursor, pageIndex }) => ({
       queryKey: ["sprint-requirement-children", projectId, iteration.id, pageIndex, cursor || "first"],
-      queryFn: () => api.requirementIterations.listRequirements(iteration.id, { page_size: 25, cursor: cursor || undefined, projection: "summary" as const }),
+      queryFn: async () => normalizePagedResult<Requirement>(
+        await api.requirementIterations.listRequirements(iteration.id, {
+          page_size: getHierarchyPageSize(iteration.requirement_count, pageIndex),
+          cursor: cursor || undefined,
+          projection: "summary" as const
+        })
+      ),
       staleTime: 30_000
     }))
   });
-  const sprintPageStateById = useMemo(() => sprintPageRequests.reduce<Record<string, { loaded: number; total: number; nextCursor: string | null; isFetching: boolean }>>((state, request, index) => {
+  const sprintPageStateById = useMemo(() => sprintPageRequests.reduce<Record<string, {
+    loaded: number;
+    total: number;
+    nextCursor: string | null;
+    isInitialLoading: boolean;
+    isLoadingMore: boolean;
+    failedPageIndex: number | null;
+  }>>((state, request, index) => {
     const response = sprintRequirementQueries[index];
-    const current = state[request.iteration.id] || { loaded: 0, total: request.iteration.requirement_count || 0, nextCursor: null, isFetching: false };
-    current.loaded += response.data?.items.length || 0;
-    current.total = response.data?.total ?? current.total;
-    current.nextCursor = response.data?.next_cursor || null;
-    current.isFetching = current.isFetching || response.isFetching;
+    const current = state[request.iteration.id] || {
+      loaded: 0,
+      total: request.iteration.requirement_count || 0,
+      nextCursor: null,
+      isInitialLoading: false,
+      isLoadingMore: false,
+      failedPageIndex: null
+    };
+    current.loaded += asArray(response.data?.items).length;
+    current.total = Math.max(current.total, response.data?.total ?? 0, current.loaded);
+    if (response.data) {
+      const nextCursor = getVerifiedNextPageCursor(response.data);
+      const requestedCursors = sprintPageCursorsById[request.iteration.id] || [null];
+      current.nextCursor = nextCursor && !requestedCursors.includes(nextCursor) ? nextCursor : null;
+    }
+    current.isInitialLoading = current.isInitialLoading || (request.pageIndex === 0 && response.isFetching && !response.data);
+    current.isLoadingMore = current.isLoadingMore || (request.pageIndex > 0 && response.isFetching);
+    if (response.isError) current.failedPageIndex = request.pageIndex;
     state[request.iteration.id] = current;
     return state;
-  }, {}), [sprintPageRequests, sprintRequirementQueries]);
+  }, {}), [sprintPageCursorsById, sprintPageRequests, sprintRequirementQueries]);
+  const retrySprintPage = (iterationId: string, pageIndex: number) => {
+    const queryIndex = sprintPageRequests.findIndex((request) => request.iteration.id === iterationId && request.pageIndex === pageIndex);
+    if (queryIndex >= 0) void sprintRequirementQueries[queryIndex]?.refetch();
+  };
   const loadNextSprintPage = (iterationId: string) => {
-    const nextCursor = sprintPageStateById[iterationId]?.nextCursor;
+    const pageState = sprintPageStateById[iterationId];
+    if (pageState?.failedPageIndex !== null && pageState?.failedPageIndex !== undefined) {
+      retrySprintPage(iterationId, pageState.failedPageIndex);
+      return;
+    }
+    const nextCursor = pageState?.nextCursor;
     if (!nextCursor) return;
     setSprintPageCursorsById((current) => ({
       ...current,
@@ -575,6 +748,36 @@ export function RequirementsPage() {
         : [...(current[iterationId] || [null]), nextCursor]
     }));
   };
+  const toggleSprintExpansion = (iterationId: string) => {
+    const isCollapsing = expandedIterationIds.includes(iterationId);
+    if (isCollapsing) {
+      setSprintPageCursorsById((current) => {
+        if (!(iterationId in current)) return current;
+        const next = { ...current };
+        delete next[iterationId];
+        return next;
+      });
+    }
+    setExpandedIterationIds((current) => current.includes(iterationId)
+      ? current.filter((id) => id !== iterationId)
+      : [...current, iterationId]);
+  };
+  useEffect(() => {
+    // This runs after useQueries has committed its smaller observer set. Never
+    // remove an observed continuation inside collapse/refresh handlers: doing
+    // so can recreate it and issue the same Forge request again.
+    const expandedIds = new Set(expandedIterationIds);
+    queryClient.removeQueries({
+      predicate: (candidate) => {
+        const key = candidate.queryKey;
+        const iterationId = String(key[2] || "");
+        return key[0] === "sprint-requirement-children"
+          && key[1] === projectId
+          && Number(key[3]) > 0
+          && (!expandedIds.has(iterationId) || !(iterationId in sprintPageCursorsById));
+      }
+    });
+  }, [expandedIterationIds, projectId, queryClient, sprintPageCursorsById]);
   const requestedRequirementRouteId = searchParams.get("requirement") || "";
   const requestedRequirementQuery = useQuery({
     queryKey: ["requirement-route-detail", projectId, requestedRequirementRouteId],
@@ -585,42 +788,44 @@ export function RequirementsPage() {
   });
   const testCasesQuery = useQuery({
     queryKey: ["requirements-test-cases", projectId, appTypeId],
-    queryFn: () => api.testCases.list({ app_type_id: appTypeId, page_size: 25, projection: "detail" }),
+    // This is a bounded suggestion page, not a project-wide source of truth.
+    // Selected records hydrate in their own workspaces; list rows stay compact.
+    queryFn: async () => asArray(await api.testCases.list({ app_type_id: appTypeId, page_size: 25, projection: "summary" })),
     enabled: Boolean(appTypeId)
   });
   const executionResultsQuery = useQuery({
     queryKey: ["requirements-execution-results", projectId, appTypeId],
-    queryFn: () => api.executionResults.list({ app_type_id: appTypeId, run_limit: 10, limit: 100 }),
+    queryFn: async () => asArray(await api.executionResults.list({ app_type_id: appTypeId, run_limit: 10, limit: 100 })),
     enabled: Boolean(appTypeId)
   });
   const executionsQuery = useQuery({
     queryKey: ["requirements-executions", projectId, appTypeId],
-    queryFn: () => api.executions.list({ project_id: projectId, app_type_id: appTypeId || undefined }),
+    queryFn: async () => asArray(await api.executions.list({ project_id: projectId, app_type_id: appTypeId || undefined })),
     enabled: Boolean(projectId)
   });
   const issuesQuery = useQuery({
     queryKey: ["requirements-issues", projectId],
-    queryFn: () => api.issues.list({ project_id: projectId, page_size: 25, projection: "summary" }),
+    queryFn: async () => asArray(await api.issues.list({ project_id: projectId, page_size: 25, projection: "summary" })),
     enabled: Boolean(session && projectId && isDefectSearchLoaded)
   });
   const sharedGroupsQuery = useQuery({
     queryKey: ["requirements-shared-step-groups", projectId, appTypeId],
-    queryFn: () => api.sharedStepGroups.list({ app_type_id: appTypeId }),
+    queryFn: async () => asArray(await api.sharedStepGroups.list({ app_type_id: appTypeId })),
     enabled: Boolean(appTypeId)
   });
   const suitesQuery = useQuery({
     queryKey: ["requirements-test-suites", projectId, appTypeId],
-    queryFn: () => api.testSuites.list({ app_type_id: appTypeId }),
+    queryFn: async () => asArray(await api.testSuites.list({ app_type_id: appTypeId })),
     enabled: Boolean(appTypeId)
   });
   const integrationsQuery = useQuery({
     queryKey: ["integrations", projectId, "llm"],
-    queryFn: () => api.integrations.list({ type: "llm", is_active: true }),
+    queryFn: async () => asArray(await api.integrations.list({ type: "llm", is_active: true })),
     enabled: Boolean(session)
   });
   const usersQuery = useQuery({
     queryKey: ["users", projectId],
-    queryFn: api.users.list,
+    queryFn: async () => asArray(await api.users.list()),
     enabled: Boolean(session)
   });
 
@@ -679,40 +884,77 @@ export function RequirementsPage() {
   });
   const recentRequirementCreationJobsQuery = useQuery({
     queryKey: ["ai-requirement-generation-jobs", projectId, "recent"],
-    queryFn: () => api.requirements.listGenerationJobs({ project_id: projectId, limit: 5 }),
+    queryFn: async () => asArray(await api.requirements.listGenerationJobs({ project_id: projectId, limit: 5 })),
     enabled: Boolean(projectId && !requirementCreationJobId && isOptimizeModalOpen && requirementAiMode === "create"),
-    refetchInterval: (query) => (query.state.data || []).some((job) => ["queued", "running"].includes(String(job.status || "").toLowerCase())) ? 3_000 : false
+    refetchInterval: (query) => asArray(query.state.data).some((job) => ["queued", "running"].includes(String(job.status || "").toLowerCase())) ? 3_000 : false
   });
   const recoveredRequirementCreationJob = useMemo(
     () => (!requirementCreationJobId && !requirementCreationDrafts.length
-      ? (recentRequirementCreationJobsQuery.data || []).find(isRecoverableRequirementAiJob) || null
+      ? asArray(recentRequirementCreationJobsQuery.data).find(isRecoverableRequirementAiJob) || null
       : null),
     [recentRequirementCreationJobsQuery.data, requirementCreationDrafts.length, requirementCreationJobId]
   );
   const requirementCreationJob = requirementCreationJobQuery.data || recoveredRequirementCreationJob || null;
   const isRequirementCreationJobRunning = ["queued", "running"].includes(String(requirementCreationJob?.status || "").toLowerCase());
 
-  const projects = projectsQuery.data || [];
-  const appTypes = appTypesQuery.data || [];
-  const requirements = useMemo(() => {
-    const byId = new Map<string, Requirement>();
-    for (const requirement of requirementsQuery.data?.pages.flatMap((page) => page.items) || []) byId.set(requirement.id, requirement);
-    for (const query of sprintRequirementQueries) {
-      for (const requirement of query.data?.items || []) byId.set(requirement.id, requirement);
-    }
-    if (requestedRequirementQuery.data) byId.set(requestedRequirementQuery.data.id, requestedRequirementQuery.data);
-    if (requirementDetailQuery.data) byId.set(requirementDetailQuery.data.id, requirementDetailQuery.data);
-    return [...byId.values()];
+  const projects = asArray(projectsQuery.data);
+  const appTypes = asArray(appTypesQuery.data);
+  const loadedRequirementEvidence = useMemo(() => {
+    const evidence = asArray(requirementsQuery.data?.pages).flatMap((page) => asArray(page.items));
+    for (const query of sprintRequirementQueries) evidence.push(...asArray(query.data?.items));
+    if (requestedRequirementQuery.data) evidence.push(requestedRequirementQuery.data);
+    if (requirementDetailQuery.data) evidence.push(requirementDetailQuery.data);
+    return evidence;
   }, [requirementDetailQuery.data, requestedRequirementQuery.data, requirementsQuery.data, sprintRequirementQueries]);
-  const requirementIterations = requirementIterationsQuery.data || [];
-  const testCases = testCasesQuery.data || [];
-  const executionResults = executionResultsQuery.data || [];
-  const executions = (executionsQuery.data || []) as Execution[];
-  const issues = (issuesQuery.data || []) as Issue[];
-  const sharedGroups = sharedGroupsQuery.data || [];
-  const suites = suitesQuery.data || [];
-  const integrations = integrationsQuery.data || [];
-  const users = (usersQuery.data || []) as User[];
+  const loadedRequirements = useMemo(() => {
+    const byId = new Map<string, Requirement>();
+    for (const requirement of loadedRequirementEvidence) byId.set(requirement.id, requirement);
+    return [...byId.values()];
+  }, [loadedRequirementEvidence]);
+  const requirements = useMemo(() => {
+    const byId = new Map(loadedRequirements.map((requirement) => [requirement.id, requirement]));
+    Object.entries(confirmedSprintMovesByRequirementId).forEach(([requirementId, move]) => {
+      byId.set(requirementId, projectConfirmedRequirementSprintMove(move, byId.get(requirementId)));
+    });
+    return [...byId.values()];
+  }, [confirmedSprintMovesByRequirementId, loadedRequirements]);
+  useEffect(() => {
+    setConfirmedSprintMovesByRequirementId((current) => {
+      let changed = false;
+      const next = { ...current };
+      Object.entries(current).forEach(([requirementId, move]) => {
+        if (requirementSprintMoveIsSettled(loadedRequirementEvidence, move)) {
+          delete next[requirementId];
+          changed = true;
+        }
+      });
+      return changed ? next : current;
+    });
+  }, [loadedRequirementEvidence]);
+  const selectedRequirementRecords = useMemo(() => {
+    const loadedById = new Map(requirements.map((requirement) => [requirement.id, requirement]));
+    return deleteSelectedRequirementIds
+      .map((requirementId) => loadedById.get(requirementId) || selectedRequirementSnapshotsRef.current.get(requirementId) || null)
+      .filter(Boolean) as Requirement[];
+  }, [deleteSelectedRequirementIds, requirements]);
+  useEffect(() => {
+    const selectedIds = new Set(deleteSelectedRequirementIds);
+    requirements.forEach((requirement) => {
+      if (selectedIds.has(requirement.id)) selectedRequirementSnapshotsRef.current.set(requirement.id, requirement);
+    });
+    selectedRequirementSnapshotsRef.current.forEach((_requirement, requirementId) => {
+      if (!selectedIds.has(requirementId)) selectedRequirementSnapshotsRef.current.delete(requirementId);
+    });
+  }, [deleteSelectedRequirementIds, requirements]);
+  const requirementIterations = asArray(requirementIterationsQuery.data);
+  const testCases = asArray(testCasesQuery.data);
+  const executionResults = asArray(executionResultsQuery.data);
+  const executions = asArray<Execution>(executionsQuery.data);
+  const issues = asArray<Issue>(issuesQuery.data);
+  const sharedGroups = asArray(sharedGroupsQuery.data);
+  const suites = asArray(suitesQuery.data);
+  const integrations = asArray(integrationsQuery.data);
+  const users = asArray<User>(usersQuery.data);
   const requiredJiraRequirementFields = requirementCreateMetadataQuery.data?.required_fields || [];
   const requiredJiraRequirementEditFields = requirementEditMetadataQuery.data?.required_fields || [];
   const jiraRequirementCoreRequired = {
@@ -768,7 +1010,7 @@ export function RequirementsPage() {
 
     setRequirementCreationJobId(recoveredRequirementCreationJob.id);
     setPreviewTone("success");
-    setPreviewMessage("Recovered a recent AI requirement generation job. Qaira is loading the generated drafts…");
+    setPreviewMessage("Recovered a recent AI Story generation job. Qaira is loading the generated drafts…");
   }, [isOptimizeModalOpen, recoveredRequirementCreationJob?.id, requirementAiMode, requirementCreationJobId]);
 
   useEffect(() => {
@@ -779,47 +1021,83 @@ export function RequirementsPage() {
     const status = String(requirementCreationJob.status || "").toLowerCase();
 
     if (status === "completed") {
-      const generatedDrafts = requirementCreationJob.requirements?.length
-        ? requirementCreationJob.requirements
+      const recoveredDrafts = asArray(requirementCreationJob.requirements);
+      const generatedDrafts = recoveredDrafts.length
+        ? recoveredDrafts
         : requirementCreationJob.suggestion
           ? [{
               ...requirementCreationJob.suggestion,
               client_id: requirementCreationJob.suggestion.client_id || "ai-req-1",
               quality_score: requirementCreationJob.suggestion.quality_score || 0.72,
-              rationale: requirementCreationJob.suggestion.rationale || "AI-generated requirement draft."
+              rationale: requirementCreationJob.suggestion.rationale || "AI-generated Story draft."
             }]
           : [];
 
-      setOptimizationSuggestion(requirementCreationJob.suggestion || null);
-      setRequirementCreationDrafts(generatedDrafts);
-      const selectedDraftIds = generatedDrafts
-        .map((draftItem, index) => ({ id: getRequirementCreationDraftId(draftItem, index), score: Number(draftItem.quality_score || 0) }))
-        .filter((item) => item.score >= 0.8)
-        .map((item) => item.id);
-      const defaultSelectedIds = selectedDraftIds.length ? selectedDraftIds : generatedDrafts.slice(0, 1).map((draftItem, index) => getRequirementCreationDraftId(draftItem, index));
-      setSelectedRequirementCreationDraftIds(defaultSelectedIds);
-      setExpandedRequirementCreationDraftIds(generatedDrafts.slice(0, 1).map((draftItem, index) => getRequirementCreationDraftId(draftItem, index)));
-      setIsRequirementAiSidebarCollapsed(true);
-      setPreviewTone(requirementCreationJob.fallback_used ? "error" : "success");
-      setPreviewMessage(
-        requirementCreationJob.fallback_used
-          ? `AI fallback used: ${requirementCreationJob.fallback_reason || "LLM unavailable"}`
-          : `${generatedDrafts.length || requirementCreationJob.generated || 0} requirement draft${(generatedDrafts.length || requirementCreationJob.generated || 0) === 1 ? "" : "s"} generated. Review and select the strongest drafts before creating Jira requirements.`
-      );
+      const hydratedDraftIds = requirementCreationDrafts.map((draftItem, index) => getRequirementCreationDraftId(draftItem, index));
+      const generatedDraftIds = generatedDrafts.map((draftItem, index) => getRequirementCreationDraftId(draftItem, index));
+      const isCurrentJobHydrated = hydratedDraftIds.length === generatedDraftIds.length
+        && hydratedDraftIds.every((draftId, index) => draftId === generatedDraftIds[index]);
+      if (!isCurrentJobHydrated) {
+        setOptimizationSuggestion(requirementCreationJob.suggestion || null);
+        setRequirementCreationDrafts(generatedDrafts);
+        const selectedDraftIds = generatedDrafts
+          .map((draftItem, index) => ({ id: getRequirementCreationDraftId(draftItem, index), score: Number(draftItem.quality_score || 0) }))
+          .filter((item) => item.score >= 0.8)
+          .map((item) => item.id);
+        const defaultSelectedIds = selectedDraftIds.length ? selectedDraftIds : generatedDrafts.slice(0, 1).map((draftItem, index) => getRequirementCreationDraftId(draftItem, index));
+        setSelectedRequirementCreationDraftIds(defaultSelectedIds);
+        setExpandedRequirementCreationDraftIds(generatedDrafts.slice(0, 1).map((draftItem, index) => getRequirementCreationDraftId(draftItem, index)));
+        setIsRequirementAiSidebarCollapsed(true);
+        setPreviewTone(requirementCreationJob.fallback_used ? "error" : "success");
+        setPreviewMessage(
+          requirementCreationJob.fallback_used
+            ? `AI fallback used: ${requirementCreationJob.fallback_reason || "LLM unavailable"}`
+            : `${generatedDrafts.length || requirementCreationJob.generated || 0} Story draft${(generatedDrafts.length || requirementCreationJob.generated || 0) === 1 ? "" : "s"} generated. Review and select the strongest drafts before creating Jira Stories.`
+        );
+      }
+      const generationKey = `${requirementCreationJob.id || requirementCreationJobId}:${includeGherkin}`;
+      if (includeGherkin && generatedDrafts.length && gherkinGenerationKeyRef.current !== generationKey) {
+        gherkinGenerationKeyRef.current = generationKey;
+        setIsGeneratingGherkin(true);
+        setPreviewMessage("Story drafts are ready. Generating focused Gherkin scenarios from those exact drafts…");
+        void api.requirements.previewGherkin({
+          project_id: projectId,
+          integration_id: integrationId || undefined,
+          requirements: generatedDrafts.map((item) => ({
+            client_id: item.client_id,
+            title: item.title,
+            description: item.description,
+            acceptance_criteria: asArray(item.acceptance_criteria)
+          }))
+        }).then((response) => {
+          const byId = new Map(response.requirements.map((item) => [item.client_id, item.gherkin_scenarios]));
+          setRequirementCreationDrafts((current) => current.map((item) => ({ ...item, gherkin_scenarios: byId.get(item.client_id) || [] })));
+          setPreviewTone("success");
+          setPreviewMessage(response.validation?.repaired_story_count
+            ? "Story drafts and Gherkin scenarios are ready. Invalid model formatting was safely replaced with complete validated scenarios."
+            : response.fallback_used
+              ? `Story drafts are ready. Gherkin used the validated fallback because ${response.fallback_reason || "the LLM was unavailable"}`
+              : "Story drafts and Gherkin scenarios are ready for review.");
+        }).catch((error) => {
+          gherkinGenerationKeyRef.current = "";
+          setPreviewTone("success");
+          setPreviewMessage(`Story drafts are ready and remain usable. The optional Gherkin pass could not complete${error instanceof Error ? `: ${error.message}` : "."}`);
+        }).finally(() => setIsGeneratingGherkin(false));
+      }
       return;
     }
 
     if (status === "failed") {
       setPreviewTone("error");
-      setPreviewMessage(requirementCreationJob.last_error || "AI requirement generation failed. Reduce the prompt or attachments and try again.");
+      setPreviewMessage(requirementCreationJob.last_error || "AI Story generation failed. Reduce the prompt or attachments and try again.");
       return;
     }
 
     if (["queued", "running"].includes(status)) {
       setPreviewTone("success");
-      setPreviewMessage(status === "queued" ? "AI requirement generation queued…" : "AI requirement generation is running…");
+      setPreviewMessage(status === "queued" ? "AI Story generation queued…" : "AI Story generation is running…");
     }
-  }, [requirementAiMode, requirementCreationJob]);
+  }, [includeGherkin, integrationId, projectId, requirementAiMode, requirementCreationDrafts, requirementCreationJob, requirementCreationJobId]);
 
   useEffect(() => {
     if (appTypesQuery.isPending) {
@@ -894,10 +1172,6 @@ export function RequirementsPage() {
     }
   }, [requirements, requirementsQuery.isFetching, requirementsQuery.isLoading, searchParams, selectedRequirementId, setSearchParams]);
 
-  useEffect(() => {
-    setDeleteSelectedRequirementIds((current) => current.filter((id) => requirements.some((item) => item.id === id)));
-  }, [requirements]);
-
   const selectedRequirementSummary = useMemo(
     () => requirements.find((item) => item.id === selectedRequirementId) || null,
     [requirements, selectedRequirementId]
@@ -932,7 +1206,7 @@ export function RequirementsPage() {
   const optimizeTargets = useMemo(
     () =>
       optimizeRequirementIds
-        .map((id) => requirements.find((item) => item.id === id) || null)
+        .map((id) => requirements.find((item) => item.id === id) || selectedRequirementSnapshotsRef.current.get(id) || null)
         .filter(Boolean) as Requirement[],
     [optimizeRequirementIds, requirements]
   );
@@ -969,7 +1243,10 @@ export function RequirementsPage() {
     const requirementIds = new Set(requirements.map((requirement) => requirement.id));
 
     requirements.forEach((requirement) => {
-      map[requirement.id] = [];
+      // Jira issue links on the requirement summary are authoritative. The
+      // bounded test-case suggestion query below must never turn links beyond
+      // its first page into false zero-coverage signals.
+      map[requirement.id] = [...new Set((requirement.test_case_ids || []).map(String))];
     });
 
     testCases.forEach((testCase) => {
@@ -984,31 +1261,38 @@ export function RequirementsPage() {
       });
     });
 
-    requirements.forEach((requirement) => {
-      const scopedLinkedIds = (requirement.test_case_ids || []).filter((testCaseId) => testCases.some((testCase) => testCase.id === testCaseId));
-      map[requirement.id] = [...new Set([...(map[requirement.id] || []), ...scopedLinkedIds])];
-    });
-
     return map;
   }, [requirements, testCases]);
 
   const requirementIterationById = useMemo(() => {
     const map = new Map<string, RequirementIteration>();
     requirements.forEach((requirement) => {
-      const iteration = requirementIterations.find((item) =>
-        (item.requirement_ids || []).includes(requirement.id)
-        || Boolean(requirement.iteration_id && item.id === requirement.iteration_id)
-        || Boolean(requirement.sprint_id && item.jira_sprint_id && String(requirement.sprint_id) === String(item.jira_sprint_id))
-        || Boolean(!requirement.sprint_id && requirement.sprint && [item.jira_sprint_name, item.name].some((name) => name === requirement.sprint))
-      );
+      const iteration = resolveRequirementSprintIteration(requirement, requirementIterations);
 
       if (iteration) {
         map.set(requirement.id, iteration);
       }
     });
 
+    // The scoped child endpoint is authoritative for an expanded Sprint. This
+    // also covers Jira-native Sprint headers whose local requirement_ids can be
+    // empty even though Jira returns children for the Sprint.
+    sprintPageRequests.forEach(({ iteration }, queryIndex) => {
+      asArray(sprintRequirementQueries[queryIndex]?.data?.items).forEach((requirement) => {
+        map.set(requirement.id, iteration);
+      });
+    });
+
+    // Jira's Sprint mutation can become visible before its JQL search index is
+    // refreshed. A successful move response wins over an older source-Sprint
+    // child page until a native Sprint id confirms the new membership.
+    Object.entries(confirmedSprintMovesByRequirementId).forEach(([requirementId, move]) => {
+      const target = requirementIterations.find((iteration) => iteration.id === move.targetIterationId);
+      if (target) map.set(requirementId, target);
+    });
+
     return map;
-  }, [requirementIterations, requirements]);
+  }, [confirmedSprintMovesByRequirementId, requirementIterations, requirements, sprintPageRequests, sprintRequirementQueries]);
 
   const passCoverageByRequirementId = useMemo(() => {
     const coverage: Record<string, RequirementCoverageMetric> = {};
@@ -1034,13 +1318,21 @@ export function RequirementsPage() {
 
     requirements.forEach((requirement) => {
       const linkedCaseIds = linkedCaseIdsByRequirementId[requirement.id] || [];
-      const covered = linkedCaseIds.filter((testCaseId) => testCaseById.get(testCaseId)?.automated === "yes").length;
+      const knownCases = linkedCaseIds.map((testCaseId) => testCaseById.get(testCaseId)).filter(Boolean) as TestCase[];
+      const covered = knownCases.filter((testCase) => testCase.automated === "yes").length;
       const total = linkedCaseIds.length;
+      const known = knownCases.length;
+      const complete = known === total;
 
       coverage[requirement.id] = {
         total,
         covered,
-        percent: total ? Math.round((covered / total) * 100) : 0
+        // A partial suggestion page cannot support a project-wide automation
+        // percentage. Retain the loaded ratio for diagnostics, and let callers
+        // render it only when `complete` is true.
+        percent: known ? Math.round((covered / known) * 100) : 0,
+        known,
+        complete
       };
     });
 
@@ -1294,6 +1586,14 @@ export function RequirementsPage() {
       return true;
     });
   }, [defaultRequirementStatus, deferredRequirementSearchTerm, linkedCaseIdsByRequirementId, requirementCoverageFilter, requirementFixVersionFilter, requirementIterationById, requirementLabelFilter, requirementPriorityFilter, requirementReleaseFilter, requirementSprintFilter, requirementStatusFilter, requirements]);
+  const hasActiveRequirementCatalogFilter = Boolean(deferredRequirementSearchTerm.trim())
+    || requirementStatusFilter !== "all"
+    || requirementPriorityFilter !== "all"
+    || requirementLabelFilter !== "all"
+    || requirementSprintFilter !== "all"
+    || requirementFixVersionFilter !== "all"
+    || requirementReleaseFilter !== "all"
+    || requirementCoverageFilter !== "all";
 
   const iterationRequirementOptions = useMemo(() => {
     const normalizedSearch = iterationRequirementSearch.trim().toLowerCase();
@@ -1327,7 +1627,8 @@ export function RequirementsPage() {
       const locallyAssignedIds = new Set((iteration.requirement_ids || []).map(String));
       const groupRequirements = filteredRequirements.filter((requirement) => {
         if (assignedRequirementIds.has(requirement.id)) return false;
-        const matches = locallyAssignedIds.has(requirement.id)
+        const matches = requirementIterationById.get(requirement.id)?.id === iteration.id
+          || locallyAssignedIds.has(requirement.id)
           || Boolean(requirement.iteration_id && requirement.iteration_id === iteration.id)
           || Boolean(requirement.sprint_id && iteration.jira_sprint_id && String(requirement.sprint_id) === String(iteration.jira_sprint_id))
           || Boolean(!requirement.sprint_id && requirement.sprint && [iteration.jira_sprint_name, iteration.name].some((name) => name === requirement.sprint));
@@ -1335,13 +1636,26 @@ export function RequirementsPage() {
         return matches;
       });
       return { iteration, requirements: groupRequirements };
-    }).filter(({ iteration, requirements: groupRequirements }) =>
-      String(iteration.state || iteration.status || "").toLowerCase() !== "closed" || groupRequirements.length > 0
-    );
+    }).filter(({ iteration, requirements: groupRequirements }) => {
+      if (groupRequirements.length || !hasActiveRequirementCatalogFilter) return true;
+
+      const isExpanded = expandedIterationIds.includes(iteration.id);
+      const pageState = sprintPageStateById[iteration.id];
+      const knownCount = getKnownSprintRequirementCount(iteration);
+      const childScopeIncomplete = !isExpanded
+        ? knownCount === undefined || knownCount > 0
+        : !pageState
+          || pageState.isInitialLoading
+          || pageState.isLoadingMore
+          || pageState.failedPageIndex !== null
+          || Boolean(pageState.nextCursor);
+
+      return childScopeIncomplete;
+    });
     const unassignedRequirements = filteredRequirements.filter((requirement) => !assignedRequirementIds.has(requirement.id));
 
     return { groups, unassignedRequirements };
-  }, [filteredRequirements, requirementIterations]);
+  }, [expandedIterationIds, filteredRequirements, hasActiveRequirementCatalogFilter, requirementIterationById, requirementIterations, sprintPageStateById]);
 
   const iterationHealth = useMemo(() => {
     const defectFromId = (defectId: string): RequirementDefectLink => {
@@ -1371,7 +1685,9 @@ export function RequirementsPage() {
       status: item.status_category || item.status || defaultRequirementStatus,
       linkedCaseCount: (linkedCaseIdsByRequirementId[item.id] || []).length,
       passPercent: passCoverageByRequirementId[item.id]?.percent || 0,
-      automationPercent: automationCoverageByRequirementId[item.id]?.percent || 0,
+      automationPercent: automationCoverageByRequirementId[item.id]?.complete === false
+        ? undefined
+        : automationCoverageByRequirementId[item.id]?.percent,
       linkedCases: (linkedCaseIdsByRequirementId[item.id] || []).map((testCaseId) => ({
         id: testCaseId,
         status: latestResultByCaseId[testCaseId]?.status || null
@@ -1394,19 +1710,19 @@ export function RequirementsPage() {
   const renderIterationMetrics = (health: ReturnType<typeof deriveIterationHealth>) => (
     <HierarchyMetricStrip
       count={health.count}
-      noun="story"
+      noun="Story"
       metrics={[
         {
           label: "Done",
           value: `${health.completionPercent}%`,
           tone: health.completionPercent >= 80 ? "success" : health.completionPercent >= 50 ? "warning" : "neutral",
-          title: `${health.completedRequirementCount}/${health.count} stories are in a completed Jira workflow status.`
+          title: `${health.completedRequirementCount}/${health.count} Stories are in a completed Jira workflow status.`
         },
         {
           label: "Coverage",
           value: `${health.coveragePercent}%`,
           tone: health.coveragePercent >= 80 ? "success" : health.coveragePercent >= 50 ? "warning" : "danger",
-          title: `${health.count - health.zeroCoverageCount}/${health.count} stories have at least one linked test case. Zero coverage: ${health.zeroCoverageCount}.`
+          title: `${health.count - health.zeroCoverageCount}/${health.count} Stories have at least one linked test case. Zero coverage: ${health.zeroCoverageCount}.`
         },
         {
           label: "Run pass",
@@ -1418,17 +1734,28 @@ export function RequirementsPage() {
           label: "At risk",
           value: health.requirementsAtRisk,
           tone: health.requirementsAtRisk ? "danger" : "success",
-          title: `At-risk stories are uncovered, have failed or blocked linked cases, open P1/P2 bugs, or weak high-priority readiness. P1/P2 bugs: ${health.openHighDefectCount}; total bugs: ${health.totalDefectCount}.`
+          title: `At-risk Stories are uncovered, have failed or blocked linked cases, open P1/P2 bugs, or weak high-priority readiness. P1/P2 bugs: ${health.openHighDefectCount}; total bugs: ${health.totalDefectCount}.`
         }
       ]}
     />
   );
-  const renderDeferredSprintMetrics = (count: number) => (
+  const renderDeferredSprintMetrics = (count?: number) => Number.isFinite(count) ? (
     <HierarchyMetricStrip
-      count={count}
-      noun="story"
+      count={Number(count)}
+      noun="Story"
       metrics={[{ label: "Metrics", value: "On expand", tone: "neutral", title: "Open this Sprint to load its bounded Story page and calculate live Sprint metrics." }]}
     />
+  ) : (
+    <div className="hierarchy-metric-strip" aria-label="Count on expand; Sprint metrics are calculated from loaded Stories">
+      <span className="hierarchy-record-count" title="Open this Sprint to load its Story count.">
+        <strong>On expand</strong>
+        <small>Story count</small>
+      </span>
+      <span className="hierarchy-metric tone-neutral" title="Open this Sprint to calculate live Sprint metrics.">
+        <small>Metrics</small>
+        <strong>On expand</strong>
+      </span>
+    </div>
   );
 
   const renderSprintIdentity = (iteration: RequirementIteration) => {
@@ -1460,12 +1787,8 @@ export function RequirementsPage() {
     > = [];
 
     requirementIterationGroups.groups.forEach(({ iteration, requirements: groupRequirements }) => {
-      if (!groupRequirements.length && requirementSearchTerm.trim()) {
-        return;
-      }
-
       entries.push({ kind: "iteration", iteration, count: groupRequirements.length });
-      if (!collapsedIterationIds.includes(iteration.id)) {
+      if (expandedIterationIds.includes(iteration.id)) {
         groupRequirements.forEach((requirement) => entries.push({ kind: "requirement", requirement }));
       }
     });
@@ -1476,7 +1799,27 @@ export function RequirementsPage() {
     }
 
     return entries;
-  }, [collapsedIterationIds, requirementIterationGroups, requirementSearchTerm, requirementsQuery.hasNextPage]);
+  }, [expandedIterationIds, requirementIterationGroups, requirementsQuery.hasNextPage]);
+
+  const hasIncompleteRequirementReferenceSearch = Boolean(deferredRequirementSearchTerm.trim())
+    && requirements.some((requirement) => requirement.detail_complete === false);
+  const hasIncompleteRequirementFilterScope = hasActiveRequirementCatalogFilter && (
+    hasIncompleteRequirementReferenceSearch
+    || Boolean(requirementsQuery.hasNextPage)
+    || requirementIterations.some((iteration) => {
+      const isExpanded = expandedIterationIds.includes(iteration.id);
+      const pageState = sprintPageStateById[iteration.id];
+      if (!isExpanded) {
+        const knownCount = getKnownSprintRequirementCount(iteration);
+        return knownCount === undefined || knownCount > 0;
+      }
+      return !pageState
+        || pageState.isInitialLoading
+        || pageState.isLoadingMore
+        || pageState.failedPageIndex !== null
+        || Boolean(pageState.nextCursor);
+    })
+  );
 
   const activeRequirementFilterCount =
     Number(requirementStatusFilter !== "all") +
@@ -1490,17 +1833,9 @@ export function RequirementsPage() {
   const areAllFilteredRequirementsSelected =
     (filteredRequirements.length > 0 || requirementIterationGroups.groups.length > 0)
     && filteredRequirements.every((item) => deleteSelectedRequirementIds.includes(item.id))
-    && requirementIterationGroups.groups
-      .filter(({ iteration }) => iteration.source !== "jira")
-      .every(({ iteration }) => selectedIterationIds.includes(iteration.id));
+    && requirementIterationGroups.groups.every(({ iteration }) => selectedIterationIds.includes(iteration.id));
 
-  const selectedExportRequirements = useMemo(
-    () => requirements.filter((item) => deleteSelectedRequirementIds.includes(item.id)),
-    [deleteSelectedRequirementIds, requirements]
-  );
-
-  const getVisibleIterationRequirementIds = (iterationId: string) =>
-    requirementIterationGroups.groups.find(({ iteration }) => iteration.id === iterationId)?.requirements.map((requirement) => requirement.id) || [];
+  const selectedExportRequirements = selectedRequirementRecords;
 
   const setRequirementIdsSelected = (requirementIds: string[], checked: boolean) => {
     const uniqueIds = [...new Set(requirementIds)];
@@ -1511,9 +1846,7 @@ export function RequirementsPage() {
 
   const setAllFilteredRequirementItemsSelected = (checked: boolean) => {
     const requirementIds = filteredRequirements.map((item) => item.id);
-    const iterationIds = requirementIterationGroups.groups
-      .filter(({ iteration }) => iteration.source !== "jira")
-      .map(({ iteration }) => iteration.id);
+    const iterationIds = requirementIterationGroups.groups.map(({ iteration }) => iteration.id);
 
     setRequirementIdsSelected(requirementIds, checked);
     setSelectedIterationIds((current) => checked
@@ -1521,14 +1854,10 @@ export function RequirementsPage() {
       : current.filter((id) => !iterationIds.includes(id)));
   };
 
-  const setIterationAndChildrenSelected = (iteration: RequirementIteration, checked: boolean) => {
-    const requirementIds = getVisibleIterationRequirementIds(iteration.id);
-    setSelectedIterationIds((current) => iteration.source === "jira"
-      ? current.filter((id) => id !== iteration.id)
-      : checked
-        ? [...new Set([...current, iteration.id])]
-        : current.filter((id) => id !== iteration.id));
-    setRequirementIdsSelected(requirementIds, checked);
+  const setIterationSelected = (iterationId: string, checked: boolean) => {
+    setSelectedIterationIds((current) => checked
+      ? [...new Set([...current, iterationId])]
+      : current.filter((id) => id !== iterationId));
   };
 
   const setUnassignedRequirementsSelected = (checked: boolean) => {
@@ -1536,9 +1865,13 @@ export function RequirementsPage() {
     setRequirementIdsSelected(requirementIds, checked);
   };
 
-  const startDraggingRequirements = (requirementId: string) => {
-    const ids = deleteSelectedRequirementIds.includes(requirementId) ? deleteSelectedRequirementIds : [requirementId];
+  const startDraggingRequirements = (requirementId: string, dataTransfer?: DataTransfer) => {
+    if (isDeletingSelectedRequirements) return [];
+    const ids = resolveHierarchyDragIds(requirementId, deleteSelectedRequirementIds);
     setDraggingRequirementIds(ids);
+    if (dataTransfer) {
+      writeHierarchyDragPayload(dataTransfer, "requirement", ids);
+    }
     return ids;
   };
 
@@ -1556,7 +1889,7 @@ export function RequirementsPage() {
       headerRender: () => (
         <label className="data-table-header-checkbox" onClick={(event) => event.stopPropagation()}>
           <input
-            aria-label="Select all requirements"
+            aria-label="Select all Stories"
             checked={areAllFilteredRequirementsSelected}
             onChange={(event) =>
               setAllFilteredRequirementItemsSelected(event.target.checked)
@@ -1587,10 +1920,12 @@ export function RequirementsPage() {
     },
     {
       key: "title",
-      label: "Requirement",
+      label: "Story",
       canToggle: false,
+      width: 360,
+      minWidth: 320,
       sortValue: (item) => item.title,
-      render: (item) => <strong>{item.title}</strong>
+      render: (item) => <strong className="data-table-primary-title" title={item.title}>{item.title}</strong>
     },
     {
       key: "description",
@@ -1603,8 +1938,10 @@ export function RequirementsPage() {
       key: "externalReferences",
       label: "References",
       defaultVisible: false,
-      sortValue: (item) => formatReferenceList(item.external_references),
-      render: (item) => formatReferenceList(item.external_references) || "—"
+      sortValue: (item) => item.detail_complete === false ? undefined : formatReferenceList(item.external_references),
+      render: (item) => item.detail_complete === false
+        ? "Open for references"
+        : formatReferenceList(item.external_references) || "—"
     },
     {
       key: "labels",
@@ -1675,9 +2012,13 @@ export function RequirementsPage() {
       key: "automationCoverage",
       label: "Automation coverage",
       defaultVisible: false,
-      sortValue: (item: Requirement) => automationCoverageByRequirementId[item.id]?.percent || 0,
+      sortValue: (item: Requirement) => {
+        const metric = automationCoverageByRequirementId[item.id];
+        return metric?.complete === false ? undefined : metric?.percent || 0;
+      },
       render: (item: Requirement) => {
         const metric = automationCoverageByRequirementId[item.id] || { total: 0, covered: 0, percent: 0 };
+        if (metric.complete === false) return "—";
         const safeValue = Math.max(0, Math.min(100, Math.round(metric.percent)));
         return `${safeValue}%`;
       }
@@ -1729,15 +2070,15 @@ export function RequirementsPage() {
           <CatalogActionMenu
             actions={[
 	              {
-	                label: "Open requirement",
-	                description: "Open this requirement in the detail workspace.",
+	                label: "Open Story",
+	                description: "Open this Story in the detail workspace.",
 	                icon: <OpenIcon />,
 	                requiredPermissions: ["requirement.view"],
 	                onClick: () => openRequirementWorkspace(item.id)
 	              },
 	              {
 	                label: "AI test case generation",
-	                description: "Generate or review AI-designed test cases for this requirement.",
+	                description: "Generate or review AI-designed test cases for this Story.",
 	                icon: <SparkIcon />,
 	                featureKeys: ["qaira.ai.requirement_design"],
 	                permissionMode: "all" as const,
@@ -1745,8 +2086,8 @@ export function RequirementsPage() {
 	                onClick: () => openRequirementAiStudio(item.id)
 	              },
 	              {
-	                label: "AI Complete requirement",
-	                description: "Use AI to improve missing or weak requirement details.",
+	                label: "AI Complete Story",
+	                description: "Use AI to improve missing or weak Story details.",
 	                icon: <SparkIcon />,
 	                featureKeys: ["qaira.ai.requirement_design"],
 	                permissionMode: "all" as const,
@@ -1754,8 +2095,8 @@ export function RequirementsPage() {
 	                onClick: () => openRequirementOptimization([item.id])
 	              },
 	              {
-	                label: "Delete requirement",
-	                description: "Delete this requirement while keeping linked test cases in the library.",
+	                label: "Delete Story",
+	                description: "Delete this Story while keeping linked test cases in the library.",
 	                icon: <TrashIcon />,
 	                onClick: () => void handleDeleteRequirementItem(item),
 	                disabled: deleteRequirement.isPending,
@@ -1812,14 +2153,22 @@ export function RequirementsPage() {
     ? passCoverageByRequirementId[selectedRequirement.id] || { total: 0, covered: 0, percent: 0 }
     : { total: 0, covered: 0, percent: 0 };
   const selectedRequirementAutomationCoverage = selectedRequirement
-    ? automationCoverageByRequirementId[selectedRequirement.id] || { total: 0, covered: 0, percent: 0 }
-    : { total: 0, covered: 0, percent: 0 };
+    ? automationCoverageByRequirementId[selectedRequirement.id] || { total: 0, covered: 0, percent: 0, known: 0, complete: true }
+    : { total: 0, covered: 0, percent: 0, known: 0, complete: true };
   const selectedRequirementBugResolution = selectedRequirement
     ? bugResolutionByRequirementId[selectedRequirement.id] || { total: 0, covered: 0, percent: 0 }
     : { total: 0, covered: 0, percent: 0 };
   const selectedRequirementRunHistory = selectedRequirement
     ? runHistoryByRequirementId[selectedRequirement.id] || []
     : [];
+  const selectedTestCaseFallbackLabels = useMemo(() => {
+    const labels: Record<string, string> = {};
+    (selectedRequirement?.related_items || []).forEach((item) => {
+      if (item.qaira_kind !== "test-case") return;
+      labels[item.id] = [item.display_id, item.title].filter(Boolean).join(" · ") || `Linked test case ${item.id}`;
+    });
+    return labels;
+  }, [selectedRequirement]);
   const selectedRunHistoryByTestCaseId = useMemo(() => {
     const map: Record<string, RequirementRunHistoryRow[]> = {};
 
@@ -1880,7 +2229,7 @@ export function RequirementsPage() {
 
 	    if (!appTypeId) {
 	      setMessageTone("error");
-	      setMessage("Select an app type before creating a test case for this requirement.");
+	      setMessage("Select an app type before creating a test case for this Story.");
       return;
     }
 
@@ -1898,15 +2247,29 @@ export function RequirementsPage() {
   };
   useEffect(() => {
     if (!selectedRequirement) {
+      seededRequirementDraftKeyRef.current = "";
       setDraft(emptyRequirementDraft);
       setSelectedTestCaseIds([]);
       setSelectedDefectIds([]);
       return;
     }
 
+    // Derived Sprint/query collections can change identity during ordinary
+    // renders. Seed only when the selected canonical Story changes so a local
+    // keystroke is never overwritten by the server snapshot.
+    const draftSeedKey = [
+      selectedRequirement.id,
+      selectedRequirement.revision ?? "no-revision",
+      selectedRequirement.updated_at || "",
+      requirementDetailQuery.data?.id === selectedRequirement.id ? "detail" : "summary"
+    ].join(":");
+    if (seededRequirementDraftKeyRef.current === draftSeedKey) return;
+    seededRequirementDraftKeyRef.current = draftSeedKey;
+
     setDraft({
       title: selectedRequirement.title,
       description: selectedRequirement.description || "",
+      gherkinScenariosText: formatGherkinScenarios(selectedRequirement.gherkin_scenarios),
       externalReferencesText: formatReferenceList(selectedRequirement.external_references),
       labelsText: formatReferenceList(selectedRequirement.labels),
       sprint: selectedRequirement.sprint_id
@@ -1993,9 +2356,22 @@ export function RequirementsPage() {
   }, [acceptDesignedCases.isPending, isAiStudioOpen, previewDesignedCases.isPending]);
 
   const refresh = async () => {
+    const sprintChildrenPrefix = ["sprint-requirement-children", projectId] as const;
+    setSprintPageCursorsById({});
     await Promise.all([
       queryClient.invalidateQueries({ queryKey: ["requirements", projectId] }),
+      queryClient.invalidateQueries({ queryKey: ["requirement-detail", projectId] }),
+      queryClient.invalidateQueries({ queryKey: ["requirement-route-detail", projectId] }),
       queryClient.invalidateQueries({ queryKey: ["requirement-iterations", projectId] }),
+      queryClient.invalidateQueries({
+        refetchType: "none",
+        predicate: (candidate) => {
+          const key = candidate.queryKey;
+          return key[0] === sprintChildrenPrefix[0]
+            && key[1] === sprintChildrenPrefix[1]
+            && Number(key[3]) === 0;
+        }
+      }),
       queryClient.invalidateQueries({ queryKey: ["requirements-test-cases", projectId, appTypeId] }),
       queryClient.invalidateQueries({ queryKey: ["requirements-execution-results", projectId, appTypeId] }),
       queryClient.invalidateQueries({ queryKey: ["requirements-executions", projectId, appTypeId] }),
@@ -2005,11 +2381,40 @@ export function RequirementsPage() {
       queryClient.invalidateQueries({ queryKey: ["workspace-transactions"] }),
       queryClient.invalidateQueries({ queryKey: ["workspace-transaction-events"] })
     ]);
+    await queryClient.refetchQueries({
+      type: "active",
+      predicate: (candidate) => {
+        const key = candidate.queryKey;
+        return key[0] === sprintChildrenPrefix[0]
+          && key[1] === sprintChildrenPrefix[1]
+          && Number(key[3]) === 0;
+      }
+    });
+  };
+
+  const scheduleRequirementSprintRevalidation = (iterationId: string, moveScope: string) => {
+    if (requirementMoveRevalidationTimerRef.current !== null) {
+      window.clearTimeout(requirementMoveRevalidationTimerRef.current);
+    }
+    requirementMoveRevalidationTimerRef.current = window.setTimeout(() => {
+      requirementMoveRevalidationTimerRef.current = null;
+      if (requirementMoveScopeRef.current !== moveScope) return;
+      void queryClient.refetchQueries({
+        type: "active",
+        predicate: (candidate) => {
+          const key = candidate.queryKey;
+          return key[0] === "sprint-requirement-children"
+            && key[1] === projectId
+            && key[2] === iterationId
+            && Number(key[3]) === 0;
+        }
+      });
+    }, 2_000);
   };
 
   const openCreateRequirementModal = () => {
     if (!canCreateRequirements) {
-      showError(null, "Permission required: requirement.create");
+      showError(null, "Permission required to create Stories.");
       return;
     }
 
@@ -2053,7 +2458,7 @@ export function RequirementsPage() {
 
   const openRequirementImportModal = () => {
     if (!canImportRequirements) {
-      showError(null, "Permission required: requirement.import");
+      showError(null, "Permission required to import Stories.");
       return;
     }
 
@@ -2074,12 +2479,12 @@ export function RequirementsPage() {
     event.preventDefault();
 
     if (!canCreateRequirements) {
-      showError(null, "Permission required: requirement.create");
+      showError(null, "Permission required to create Stories.");
       return;
     }
 
     if (!projectId) {
-      showError(null, "Select a project before creating a requirement.");
+      showError(null, "Select a project before creating a Story.");
       return;
     }
 
@@ -2103,6 +2508,7 @@ export function RequirementsPage() {
         project_id: projectId,
         title: createDraft.title,
         description: createDraft.description || undefined,
+        gherkin_scenarios: parseGherkinScenarios(createDraft.gherkinScenariosText),
         external_references: parseReferenceList(createDraft.externalReferencesText),
         labels: parseReferenceList(createDraft.labelsText),
         sprint: createDraft.sprint || undefined,
@@ -2119,11 +2525,11 @@ export function RequirementsPage() {
       setIsCreateModalOpen(false);
       setCreateDraft(emptyRequirementDraft);
       showSuccess(response.status_warning
-        ? `Requirement created. Jira kept its workflow status because ${response.status_warning.requested_status || createDraft.status} is not available from the current workflow state.`
-        : "Requirement created.");
+        ? `Story created. Jira kept its workflow status because ${response.status_warning.requested_status || createDraft.status} is not available from the current workflow state.`
+        : "Story created.");
       await refresh();
     } catch (error) {
-      showError(error, "Unable to create requirement");
+      showError(error, "Unable to create Story");
     }
   };
 
@@ -2144,7 +2550,7 @@ export function RequirementsPage() {
     event.preventDefault();
 
     if (editingIteration ? !canUpdateRequirementIterations : !canCreateRequirementIterations) {
-      showError(null, `Permission required: requirement_iteration.${editingIteration ? "update" : "create"}`);
+      showError(null, `Permission required to ${editingIteration ? "update" : "create"} Sprints.`);
       return;
     }
 
@@ -2196,7 +2602,7 @@ export function RequirementsPage() {
       setSprintDraftRequirementIds([]);
       setEditingIteration(null);
       setIsCreateIterationModalOpen(false);
-      setCollapsedIterationIds((current) => current.filter((id) => id !== response.id));
+      setExpandedIterationIds((current) => [...new Set([...current, response.id])]);
       setDeleteSelectedRequirementIds([]);
       showSuccess("Sprint created in Jira.");
       await refresh();
@@ -2205,65 +2611,196 @@ export function RequirementsPage() {
     }
   };
 
-  const handleDropRequirementOnIteration = async (iterationId: string) => {
-    if (!draggingRequirementIds.length) {
+  const moveRequirementsToIteration = async (iterationId: string, candidateIds: string[]) => {
+    const moveScope = `${projectId}:${appTypeId}`;
+    const targetIteration = requirementIterations.find((iteration) => iteration.id === iterationId);
+    const isClosedSprint = String(targetIteration?.state || targetIteration?.status || "").toLowerCase() === "closed";
+    const dragIds = [...new Set(candidateIds.filter(Boolean))];
+    const movableIds = dragIds.filter((id) => requirementIterationById.get(id)?.id !== iterationId);
+    const movableRequirementById = new Map(movableIds.map((id) => [
+      id,
+      requirements.find((requirement) => requirement.id === id)
+        || selectedRequirementSnapshotsRef.current.get(id)
+        || null
+    ]));
+
+    if (!canUpdateRequirementIterations) {
+      setDraggingRequirementIds([]);
+      showError(null, "Permission required to move Stories between Sprints.");
       return;
     }
 
-    try {
-      await assignRequirementsToIteration.mutateAsync({ id: iterationId, requirementIds: draggingRequirementIds, append: true });
-      const movedCount = draggingRequirementIds.length;
+    if (isDeletingSelectedRequirements) {
       setDraggingRequirementIds([]);
-      setCollapsedIterationIds((current) => current.filter((id) => id !== iterationId));
-      showSuccess(`${movedCount} ${movedCount === 1 ? "story" : "stories"} moved into sprint.`);
-      await refresh();
-    } catch (error) {
-      showError(error, "Unable to move story into sprint");
+      return;
     }
+
+    if (isClosedSprint) {
+      setDraggingRequirementIds([]);
+      showError(null, "Stories cannot be moved into a completed Jira Sprint.");
+      return;
+    }
+
+    if (!targetIteration || !movableIds.length || assignRequirementsToIteration.isPending || requirementMovePendingRef.current) {
+      setDraggingRequirementIds([]);
+      return;
+    }
+
+    requirementMovePendingRef.current = true;
+    const movedIds: string[] = [];
+    let moveError: unknown = null;
+    try {
+      for (const batchIds of chunkHierarchyMoveIds(movableIds, JIRA_SPRINT_MOVE_BATCH_SIZE)) {
+        if (requirementMoveScopeRef.current !== moveScope) {
+          return;
+        }
+        await assignRequirementsToIteration.mutateAsync({ id: iterationId, requirementIds: batchIds, append: true });
+        if (requirementMoveScopeRef.current !== moveScope) {
+          return;
+        }
+        movedIds.push(...batchIds);
+        setConfirmedSprintMovesByRequirementId((current) => {
+          const next = { ...current };
+          batchIds.forEach((requirementId) => {
+            const requirement = movableRequirementById.get(requirementId);
+            if (requirement) next[requirementId] = createConfirmedRequirementSprintMove(requirement, targetIteration);
+          });
+          return next;
+        });
+        setDeleteSelectedRequirementIds((current) => current.filter((id) => !batchIds.includes(id)));
+      }
+    } catch (error) {
+      moveError = error;
+    } finally {
+      requirementMovePendingRef.current = false;
+      setDraggingRequirementIds([]);
+    }
+
+    if (requirementMoveScopeRef.current !== moveScope) return;
+
+    if (movedIds.length) {
+      setExpandedIterationIds((current) => [...new Set([...current, iterationId])]);
+    }
+
+    if (moveError) {
+      if (!movedIds.length) {
+        showError(moveError, "Unable to move Story into Sprint");
+        return;
+      }
+
+      setMessageTone("error");
+      setMessage(`${movedIds.length} ${movedIds.length === 1 ? "Story was" : "Stories were"} moved before the remaining move stopped.${moveError instanceof Error ? ` ${moveError.message}` : ""}`);
+      try {
+        await refresh();
+      } catch {
+        // Confirmed move projections remain visible until Jira JQL catches up.
+      }
+      scheduleRequirementSprintRevalidation(iterationId, moveScope);
+      return;
+    }
+
+    const movedCount = movedIds.length;
+    setDeleteSelectedRequirementIds((current) => current.filter((id) => !dragIds.includes(id)));
+    let refreshFailed = false;
+    try {
+      await refresh();
+    } catch {
+      refreshFailed = true;
+    }
+    scheduleRequirementSprintRevalidation(iterationId, moveScope);
+    showSuccess(refreshFailed
+      ? `${movedCount} ${movedCount === 1 ? "Story" : "Stories"} moved in Jira. Sprint evidence will revalidate automatically.`
+      : `${movedCount} ${movedCount === 1 ? "Story" : "Stories"} moved into Sprint.`);
   };
 
-  const handleDeleteSelectedIterations = async () => {
-    if (!selectedIterationIds.length || !canDeleteRequirementIterations) {
+  const handleDropRequirementOnIteration = (
+    iterationId: string,
+    event: ReactDragEvent<HTMLDivElement>
+  ) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const ids = readHierarchyDragPayload(event.dataTransfer, "requirement", draggingRequirementIds);
+    void moveRequirementsToIteration(iterationId, ids);
+  };
+
+  const getRequirementDropState = (iteration: RequirementIteration) => {
+    if (!draggingRequirementIds.length) {
+      return { canAcceptDrop: false, dropLabel: "" };
+    }
+
+    const isClosedSprint = String(iteration.state || iteration.status || "").toLowerCase() === "closed";
+    const movableCount = draggingRequirementIds.filter((id) => requirementIterationById.get(id)?.id !== iteration.id).length;
+    const canAcceptDrop = canUpdateRequirementIterations
+      && !assignRequirementsToIteration.isPending
+      && !isDeletingSelectedRequirements
+      && !isClosedSprint
+      && movableCount > 0;
+    const dropLabel = isClosedSprint
+      ? "Completed Sprints cannot accept Stories"
+      : !canUpdateRequirementIterations
+        ? "Permission required to move Stories"
+        : isDeletingSelectedRequirements
+          ? "Deleting selected Stories…"
+          : assignRequirementsToIteration.isPending
+          ? "Moving Stories…"
+          : movableCount
+            ? `Move ${movableCount} ${movableCount === 1 ? "Story" : "Stories"} to ${iteration.name}`
+            : `Already in ${iteration.name}`;
+
+    return { canAcceptDrop, dropLabel };
+  };
+
+  const handleDeleteIteration = async (iteration: RequirementIteration) => {
+    if (
+      !canDeleteRequirementIterations
+      || !selectedIterationIds.includes(iteration.id)
+      || deletingIterationId
+      || isDeletingSelectedRequirements
+    ) {
       return;
     }
 
     const confirmed = await confirmDelete({
-      message: `Delete ${selectedIterationIds.length} legacy sprint group${selectedIterationIds.length === 1 ? "" : "s"}? Stories will stay available in the backlog.`
+      message: `Delete Sprint “${iteration.name}”? Its Stories will stay available in the backlog.`
     });
 
     if (!confirmed) {
       return;
     }
 
+    setDeletingIterationId(iteration.id);
+
     try {
-      await Promise.all(selectedIterationIds.map((iterationId) => deleteRequirementIteration.mutateAsync(iterationId)));
-      setSelectedIterationIds([]);
-      showSuccess("Selected legacy sprint group deleted.");
+      await deleteRequirementIteration.mutateAsync(iteration.id);
+      setSelectedIterationIds((current) => current.filter((id) => id !== iteration.id));
+      showSuccess(`Sprint “${iteration.name}” deleted. Its Stories are available in the backlog.`);
       await refresh();
     } catch (error) {
-      showError(error, "Unable to delete selected sprint groups");
+      showError(error, "Unable to delete sprint");
+    } finally {
+      setDeletingIterationId("");
     }
   };
 
   const handleDeleteSelectedRequirementItems = async () => {
-    const selectedRequirements = requirements.filter((item) => deleteSelectedRequirementIds.includes(item.id));
+    const selectedRequirementIds = [...new Set(deleteSelectedRequirementIds)];
     const selectedIterations = selectedIterationIds;
 
-    if (!selectedRequirements.length && !selectedIterations.length) {
+    if (!selectedRequirementIds.length && !selectedIterations.length) {
       return;
     }
 
-    if ((selectedRequirements.length && !canDeleteRequirements) || (selectedIterations.length && !canDeleteRequirementIterations)) {
-      showError(null, "Permission required to delete the selected requirement items.");
+    if ((selectedRequirementIds.length && !canDeleteRequirements) || (selectedIterations.length && !canDeleteRequirementIterations)) {
+      showError(null, "Permission required to delete the selected Stories or Sprints.");
       return;
     }
 
     const parts = [
-      selectedRequirements.length ? `${selectedRequirements.length} requirement${selectedRequirements.length === 1 ? "" : "s"}` : "",
-      selectedIterations.length ? `${selectedIterations.length} legacy sprint group${selectedIterations.length === 1 ? "" : "s"}` : ""
+      selectedRequirementIds.length ? `${selectedRequirementIds.length} ${selectedRequirementIds.length === 1 ? "Story" : "Stories"}` : "",
+      selectedIterations.length ? `${selectedIterations.length} sprint${selectedIterations.length === 1 ? "" : "s"}` : ""
     ].filter(Boolean);
     const confirmed = await confirmDelete({
-      message: `Delete ${parts.join(" and ")}? Linked test cases stay available; stories not selected for deletion return to the backlog when a legacy sprint group is removed.`
+      message: `Delete ${parts.join(" and ")}? Linked test cases stay available; Stories not selected for deletion return to the backlog when a Sprint is removed.`
     });
 
     if (!confirmed) {
@@ -2274,12 +2811,10 @@ export function RequirementsPage() {
 
     try {
       const [requirementResults, iterationResults] = await Promise.all([
-        Promise.allSettled(selectedRequirements.map((requirement) => api.requirements.delete(requirement.id))),
+        Promise.allSettled(selectedRequirementIds.map((requirementId) => api.requirements.delete(requirementId))),
         Promise.allSettled(selectedIterations.map((iterationId) => deleteRequirementIteration.mutateAsync(iterationId)))
       ]);
-      const deletedRequirementIds = selectedRequirements
-        .filter((_, index) => requirementResults[index]?.status === "fulfilled")
-        .map((requirement) => requirement.id);
+      const deletedRequirementIds = selectedRequirementIds.filter((_, index) => requirementResults[index]?.status === "fulfilled");
       const deletedIterationIds = selectedIterations.filter((_, index) => iterationResults[index]?.status === "fulfilled");
       const failedCount = requirementResults.filter((result) => result.status === "rejected").length + iterationResults.filter((result) => result.status === "rejected").length;
 
@@ -2299,15 +2834,21 @@ export function RequirementsPage() {
         await refresh();
       }
 
+      const deletedParts = [
+        deletedRequirementIds.length ? `${deletedRequirementIds.length} ${deletedRequirementIds.length === 1 ? "Story" : "Stories"}` : "",
+        deletedIterationIds.length ? `${deletedIterationIds.length} sprint${deletedIterationIds.length === 1 ? "" : "s"}` : ""
+      ].filter(Boolean);
+      const deletedSummary = deletedParts.length ? deletedParts.join(" and ") : "No selected items";
+
       if (failedCount) {
         setMessageTone("error");
-        setMessage(`${deletedRequirementIds.length} requirement${deletedRequirementIds.length === 1 ? "" : "s"} and ${deletedIterationIds.length} sprint group${deletedIterationIds.length === 1 ? "" : "s"} deleted, ${failedCount} failed.`);
+        setMessage(`${deletedSummary} deleted; ${failedCount} failed.`);
         return;
       }
 
-      showSuccess(`${deletedRequirementIds.length} requirement${deletedRequirementIds.length === 1 ? "" : "s"} and ${deletedIterationIds.length} sprint group${deletedIterationIds.length === 1 ? "" : "s"} deleted.`);
+      showSuccess(`${deletedSummary} deleted.`);
     } catch (error) {
-      showError(error, "Unable to delete selected requirement items");
+      showError(error, "Unable to delete the selected Stories or Sprints");
     } finally {
       setIsDeletingSelectedRequirements(false);
     }
@@ -2317,7 +2858,7 @@ export function RequirementsPage() {
 	    event.preventDefault();
 
 	    if (!canUpdateRequirements) {
-	      showError(null, "Permission required: requirement.update");
+	      showError(null, "Permission required to update Stories.");
 	      return;
 	    }
 
@@ -2346,6 +2887,7 @@ export function RequirementsPage() {
         input: {
           title: draft.title,
           description: draft.description,
+          gherkin_scenarios: parseGherkinScenarios(draft.gherkinScenariosText),
           external_references: parseReferenceList(draft.externalReferencesText),
           labels: parseReferenceList(draft.labelsText),
           sprint: draft.sprint,
@@ -2360,10 +2902,10 @@ export function RequirementsPage() {
 
       await replaceMappings.mutateAsync({ requirementId: selectedRequirement.id, testCaseIds: selectedTestCaseIds });
       await replaceDefectMappings.mutateAsync({ requirementId: selectedRequirement.id, issueIds: selectedDefectIds });
-      showSuccess("Requirement updated.");
+      showSuccess("Story updated.");
       await refresh();
     } catch (error) {
-      showError(error, "Unable to update requirement");
+      showError(error, "Unable to update Story");
     }
   };
 
@@ -2384,8 +2926,8 @@ export function RequirementsPage() {
       setMessageTone(parsed.rows.length ? "success" : "error");
       setMessage(
         parsed.rows.length
-          ? `Prepared ${parsed.rows.length} requirements from ${file.name}.`
-          : parsed.warnings[0] || "No requirements could be parsed from the CSV file."
+          ? `Prepared ${parsed.rows.length} ${parsed.rows.length === 1 ? "Story" : "Stories"} from ${file.name}.`
+          : parsed.warnings[0] || "No Stories could be parsed from the CSV file."
       );
     } catch (error) {
       showError(error, "Unable to read the CSV file");
@@ -2396,7 +2938,7 @@ export function RequirementsPage() {
 
   const handleBulkImportRequirements = async () => {
     if (!canImportRequirements) {
-      showError(null, "Permission required: requirement.import");
+      showError(null, "Permission required to import Stories.");
       return;
     }
 
@@ -2411,20 +2953,20 @@ export function RequirementsPage() {
       });
 
       setMessageTone("success");
-      setMessage(`Requirement import queued. Track progress in TestOps batch process ${response.transaction_id.slice(0, 8)}.`);
+      setMessage(`Story import queued. Track progress in TestOps batch process ${response.transaction_id.slice(0, 8)}.`);
       setImportWarnings([]);
       setImportRows([]);
       setImportFileName("");
       setIsImportModalOpen(false);
       await refresh();
     } catch (error) {
-      showError(error, "Unable to import requirements");
+      showError(error, "Unable to import Stories");
     }
   };
 
   const handleExportRequirements = async () => {
     if (!canExportRequirements || !projectId || !selectedExportRequirements.length) {
-      showError(null, canExportRequirements ? "Select at least one requirement to export." : "Permission required: requirement.export");
+      showError(null, canExportRequirements ? "Select at least one Story to export." : "Permission required to export Stories.");
       return;
     }
 
@@ -2434,7 +2976,13 @@ export function RequirementsPage() {
         requirement_ids: selectedExportRequirements.map((requirement) => requirement.id),
         format: "csv"
       });
-      downloadCsvRecords("qaira-requirements.csv", selectedExportRequirements.map((requirement) => ({
+      const selectedOrder = new Map(selectedExportRequirements.map((requirement, index) => [requirement.id, index]));
+      const authoritativeRequirements = asArray(response.requirement_records)
+        .sort((left, right) => (selectedOrder.get(left.id) ?? Number.MAX_SAFE_INTEGER) - (selectedOrder.get(right.id) ?? Number.MAX_SAFE_INTEGER));
+      if (!authoritativeRequirements.length) {
+        throw new Error("Jira did not return authoritative Story details for this export. Refresh and try again.");
+      }
+      downloadCsvRecords("qaira-stories.csv", authoritativeRequirements.map((requirement) => ({
         Title: requirement.title,
         Description: requirement.description || "",
         Status: requirement.status || "",
@@ -2449,15 +2997,15 @@ export function RequirementsPage() {
         "Linked Bugs": (requirement.defect_ids || []).join("|")
       })));
       const skippedCount = Array.isArray((response as { skipped?: unknown[] }).skipped) ? (response as { skipped?: unknown[] }).skipped!.length : 0;
-      showSuccess(`Exported ${selectedExportRequirements.length} selected requirement${selectedExportRequirements.length === 1 ? "" : "s"}.${skippedCount ? ` Jira skipped ${skippedCount} stale selection${skippedCount === 1 ? "" : "s"}.` : ""} Audit ${response.transaction_id.slice(0, 8)} is available in TestOps.`);
+      showSuccess(`Exported ${authoritativeRequirements.length} selected ${authoritativeRequirements.length === 1 ? "Story" : "Stories"}.${skippedCount ? ` Jira skipped ${skippedCount} stale selection${skippedCount === 1 ? "" : "s"}.` : ""} Audit ${response.transaction_id.slice(0, 8)} is available in TestOps.`);
     } catch (error) {
-      showError(error, "Unable to export requirements");
+      showError(error, "Unable to export Stories");
     }
   };
 
   const rephraseRequirementDescriptionWithAi = async (html: string, plainText: string, scope: "create" | "detail") => {
     if (!projectId || !canUseRequirementAi) {
-      showError(null, canUseRequirementAi ? "Select a project before using AI rephrase." : "Permission required: requirement.ai");
+      showError(null, canUseRequirementAi ? "Select a project before using AI rephrase." : "Permission required to use Story AI.");
       return undefined;
     }
 
@@ -2485,18 +3033,18 @@ export function RequirementsPage() {
       });
       return response.description;
     } catch (error) {
-      showError(error, "Unable to rephrase requirement description with AI");
+      showError(error, "Unable to rephrase Story description with AI");
       return undefined;
     }
   };
 
 	  const handleDeleteRequirement = async () => {
 	    if (!canDeleteRequirements) {
-	      showError(null, "Permission required: requirement.delete");
+	      showError(null, "Permission required to delete Stories.");
 	      return;
 	    }
 
-	    if (!selectedRequirement || !(await confirmDelete({ message: `Delete requirement "${selectedRequirement.title}"? Linked test cases will remain in the library.` }))) {
+	    if (!selectedRequirement || !(await confirmDelete({ message: `Delete Story "${selectedRequirement.title}"? Linked test cases will remain in the library.` }))) {
 	      return;
 	    }
 
@@ -2508,16 +3056,16 @@ export function RequirementsPage() {
       setSelectedTestCaseIds([]);
       setSelectedDefectIds([]);
       setPreviewCases([]);
-      showSuccess("Requirement deleted.");
+      showSuccess("Story deleted.");
       await refresh();
     } catch (error) {
-      showError(error, "Unable to delete requirement");
+      showError(error, "Unable to delete Story");
     }
   };
 
 	  function openRequirementAiStudio(requirementId: string) {
 	    if (!canUseRequirementAi) {
-	      showError(null, "Permission required: requirement.ai");
+	      showError(null, "Permission required to use Story AI.");
 	      return;
 	    }
 
@@ -2528,11 +3076,11 @@ export function RequirementsPage() {
 
 	  async function handleDeleteRequirementItem(requirement: Requirement) {
 	    if (!canDeleteRequirements) {
-	      showError(null, "Permission required: requirement.delete");
+	      showError(null, "Permission required to delete Stories.");
 	      return;
 	    }
 
-	    if (!(await confirmDelete({ message: `Delete requirement "${requirement.title}"? Linked test cases will remain in the library.` }))) {
+	    if (!(await confirmDelete({ message: `Delete Story "${requirement.title}"? Linked test cases will remain in the library.` }))) {
 	      return;
 	    }
 
@@ -2553,22 +3101,22 @@ export function RequirementsPage() {
         setAiRequirementId("");
       }
 
-      showSuccess("Requirement deleted.");
+      showSuccess("Story deleted.");
       await refresh();
     } catch (error) {
-      showError(error, "Unable to delete requirement");
+      showError(error, "Unable to delete Story");
     }
   }
 
 	  const handleDeleteSelectedRequirements = async () => {
-	    const selectedRequirements = requirements.filter((item) => deleteSelectedRequirementIds.includes(item.id));
+	    const selectedRequirementIds = [...new Set(deleteSelectedRequirementIds)];
 
-	    if (!selectedRequirements.length || !canDeleteRequirements) {
+	    if (!selectedRequirementIds.length || !canDeleteRequirements) {
 	      return;
 	    }
 
     const confirmed = await confirmDelete({
-      message: `Delete ${selectedRequirements.length} requirement${selectedRequirements.length === 1 ? "" : "s"}? Linked test cases will remain in the library.`
+      message: `Delete ${selectedRequirementIds.length} ${selectedRequirementIds.length === 1 ? "Story" : "Stories"}? Linked test cases will remain in the library.`
     });
 
     if (!confirmed) {
@@ -2578,10 +3126,8 @@ export function RequirementsPage() {
     setIsDeletingSelectedRequirements(true);
 
     try {
-      const results = await Promise.allSettled(selectedRequirements.map((requirement) => api.requirements.delete(requirement.id)));
-      const deletedIds = selectedRequirements
-        .filter((_, index) => results[index]?.status === "fulfilled")
-        .map((requirement) => requirement.id);
+      const results = await Promise.allSettled(selectedRequirementIds.map((requirementId) => api.requirements.delete(requirementId)));
+      const deletedIds = selectedRequirementIds.filter((_, index) => results[index]?.status === "fulfilled");
       const failedResults = results.filter((result): result is PromiseRejectedResult => result.status === "rejected");
 
       setDeleteSelectedRequirementIds((current) => current.filter((id) => !deletedIds.includes(id)));
@@ -2600,14 +3146,14 @@ export function RequirementsPage() {
       }
 
       if (!failedResults.length) {
-        showSuccess(`${deletedIds.length} requirement${deletedIds.length === 1 ? "" : "s"} deleted.`);
+        showSuccess(`${deletedIds.length} ${deletedIds.length === 1 ? "Story" : "Stories"} deleted.`);
         return;
       }
 
       const firstError = failedResults[0]?.reason;
       setMessageTone("error");
       setMessage(
-        `${deletedIds.length} requirement${deletedIds.length === 1 ? "" : "s"} deleted, ${failedResults.length} failed.${firstError instanceof Error ? ` ${firstError.message}` : ""}`
+        `${deletedIds.length} ${deletedIds.length === 1 ? "Story" : "Stories"} deleted, ${failedResults.length} failed.${firstError instanceof Error ? ` ${firstError.message}` : ""}`
       );
     } finally {
       setIsDeletingSelectedRequirements(false);
@@ -2655,7 +3201,7 @@ export function RequirementsPage() {
 	  const handlePreviewDesignedCases = async () => {
 	    if (!canUseRequirementAi) {
 	      setPreviewTone("error");
-	      setPreviewMessage("Permission required: requirement.ai");
+	      setPreviewMessage("Permission required to use Story AI.");
 	      return;
 	    }
 
@@ -2678,7 +3224,7 @@ export function RequirementsPage() {
 
       setPreviewCases(response.cases);
       setPreviewTone("success");
-      setPreviewMessage(`${response.generated} draft cases prepared from the selected requirement context. Review their traceability and steps before accepting.`);
+      setPreviewMessage(`${response.generated} draft cases prepared from the selected Story context. Review their traceability and steps before accepting.`);
     } catch (error) {
       setPreviewTone("error");
       setPreviewMessage(error instanceof Error ? error.message : "Unable to preview AI-generated test cases");
@@ -2727,7 +3273,7 @@ export function RequirementsPage() {
       setIsAiStudioOpen(false);
       setPreviewCases([]);
       setPreviewMessage("");
-      showSuccess(`${acceptedPreviewCases.length} AI-designed case${acceptedPreviewCases.length === 1 ? "" : "s"} accepted as standard steps and linked to the requirement.`);
+      showSuccess(`${acceptedPreviewCases.length} AI-designed case${acceptedPreviewCases.length === 1 ? "" : "s"} accepted as standard steps and linked to the Story.`);
       await refresh();
       navigate("/test-cases");
     } catch (error) {
@@ -2738,7 +3284,7 @@ export function RequirementsPage() {
 
 	  function openRequirementOptimization(requirementIds?: string[]) {
 	    if (!canUseRequirementAi || !canUpdateRequirements) {
-	      showError(null, `Permission required: ${!canUseRequirementAi ? "requirement.ai" : "requirement.update"}`);
+	      showError(null, !canUseRequirementAi ? "Permission required to use Story AI." : "Permission required to update Stories.");
 	      return;
 	    }
 
@@ -2751,7 +3297,7 @@ export function RequirementsPage() {
     const targetIds = preferredId ? [preferredId] : [];
 
     if (!targetIds.length) {
-      showError(new Error("Select a requirement first."), "Unable to AI Complete requirement");
+      showError(new Error("Select a Story first."), "Unable to AI Complete Story");
       return;
     }
 
@@ -2762,6 +3308,8 @@ export function RequirementsPage() {
     setSelectedRequirementCreationDraftIds([]);
     setExpandedRequirementCreationDraftIds([]);
     setRequirementCreationJobId("");
+    gherkinGenerationKeyRef.current = "";
+    setIncludeGherkin(true);
     setOptimizationFields({
       title: true,
       description: true,
@@ -2777,7 +3325,7 @@ export function RequirementsPage() {
 
   const openAiRequirementCreation = () => {
     if (!canUseRequirementAi || !canCreateRequirements || !projectId) {
-      showError(null, `Permission required: ${!canUseRequirementAi ? "requirement.ai" : "requirement.create"}`);
+      showError(null, !canUseRequirementAi ? "Permission required to use Story AI." : "Permission required to create Stories.");
       return;
     }
 
@@ -2791,6 +3339,8 @@ export function RequirementsPage() {
     setSelectedRequirementCreationDraftIds([]);
     setExpandedRequirementCreationDraftIds([]);
     setRequirementCreationJobId("");
+    gherkinGenerationKeyRef.current = "";
+    setIncludeGherkin(true);
     setOptimizationFields({ title: true, description: true, external_references: true, priority: true, status: true });
     setPreviewMessage("");
     setPreviewTone("success");
@@ -2799,7 +3349,7 @@ export function RequirementsPage() {
   };
 
   const closeRequirementAiModal = () => {
-    if (previewRequirementOptimization.isPending || previewRequirementCreation.isPending || createRequirementGenerationJob.isPending || createRequirement.isPending || updateRequirement.isPending) {
+    if (previewRequirementOptimization.isPending || previewRequirementCreation.isPending || createRequirementGenerationJob.isPending || isGeneratingGherkin || createRequirement.isPending || updateRequirement.isPending) {
       return;
     }
 
@@ -2810,6 +3360,8 @@ export function RequirementsPage() {
     setSelectedRequirementCreationDraftIds([]);
     setExpandedRequirementCreationDraftIds([]);
     setRequirementCreationJobId("");
+    gherkinGenerationKeyRef.current = "";
+    setIsGeneratingGherkin(false);
     setPreviewMessage("");
     setIsRequirementAiSidebarCollapsed(false);
   };
@@ -2817,7 +3369,7 @@ export function RequirementsPage() {
 	  const handlePreviewRequirementOptimization = async () => {
 	    if (!canUseRequirementAi) {
 	      setPreviewTone("error");
-	      setPreviewMessage("Permission required: requirement.ai");
+	      setPreviewMessage("Permission required to use Story AI.");
 	      return;
 	    }
 
@@ -2856,8 +3408,9 @@ export function RequirementsPage() {
         setSelectedRequirementCreationDraftIds([]);
         setExpandedRequirementCreationDraftIds([]);
         setRequirementCreationJobId("");
+        gherkinGenerationKeyRef.current = "";
         setPreviewTone("success");
-        setPreviewMessage("Queuing AI requirement generation…");
+        setPreviewMessage("Queuing AI Story generation…");
         const job = await createRequirementGenerationJob.mutateAsync({
             project_id: projectId,
             ...promptInput,
@@ -2867,7 +3420,7 @@ export function RequirementsPage() {
           });
         setRequirementCreationJobId(job.id || job.job_id || "");
         setPreviewTone("success");
-        setPreviewMessage("AI requirement generation queued. Qaira will poll until the drafts are ready.");
+        setPreviewMessage("AI Story generation queued. Qaira will poll until the drafts are ready.");
         return;
       }
 
@@ -2875,30 +3428,64 @@ export function RequirementsPage() {
         requirementId: selectedRequirementForAi!.id,
         input: promptInput
       });
-      setOptimizationSuggestion(response.suggestion);
+      let suggestion = response.suggestion;
+      setOptimizationSuggestion(suggestion);
       setPreviewTone(response.fallback_used ? "error" : "success");
       setPreviewMessage(
         response.fallback_used
-          ? `AI fallback used: ${response.fallback_reason || "LLM unavailable"}`
-          : `Requirement optimized using ${response.integration?.name || "AI"}.`
+          ? `Story completion fallback used: ${response.fallback_reason || "LLM unavailable"}`
+          : `Story completion is ready from ${response.integration?.name || "AI"}.`
       );
+      if (includeGherkin) {
+        setIsGeneratingGherkin(true);
+        setPreviewMessage("Story completion is ready. Generating Gherkin scenarios from the completed draft…");
+        try {
+          const gherkinResponse = await api.requirements.previewGherkin({
+            project_id: projectId,
+            integration_id: integrationId || undefined,
+            model: selectedIntegration?.model || undefined,
+            requirements: [{
+              client_id: selectedRequirementForAi!.id,
+              title: suggestion.title,
+              description: suggestion.description,
+              acceptance_criteria: asArray(suggestion.acceptance_criteria)
+            }]
+          });
+          suggestion = { ...suggestion, gherkin_scenarios: gherkinResponse.requirements[0]?.gherkin_scenarios || [] };
+          setOptimizationSuggestion(suggestion);
+          setPreviewTone(response.fallback_used ? "error" : "success");
+          setPreviewMessage(gherkinResponse.validation?.repaired_story_count
+            ? "Story completion and Gherkin are ready. Invalid model formatting was safely replaced with complete validated scenarios."
+            : gherkinResponse.fallback_used
+              ? `Story completion is ready. Gherkin used the validated fallback because ${gherkinResponse.fallback_reason || "the LLM was unavailable"}`
+              : "Story completion and Gherkin scenarios are ready for review.");
+        } catch (gherkinError) {
+          // Gherkin is an optional, second-stage enhancement. Never discard a
+          // valid first-stage Story completion when this focused pass fails.
+          setOptimizationSuggestion(suggestion);
+          setPreviewTone(response.fallback_used ? "error" : "success");
+          setPreviewMessage(`Story completion is ready and remains usable. The optional Gherkin pass could not complete${gherkinError instanceof Error ? `: ${gherkinError.message}` : "."}`);
+        }
+      }
     } catch (error) {
       setPreviewTone("error");
-      setPreviewMessage(error instanceof Error ? error.message : requirementAiMode === "create" ? "Unable to generate requirement drafts" : "Unable to optimize requirement");
+      setPreviewMessage(error instanceof Error ? error.message : requirementAiMode === "create" ? "Unable to generate Story drafts" : "Unable to optimize Story");
+    } finally {
+      setIsGeneratingGherkin(false);
     }
   };
 
 	  const handleApplyRequirementOptimization = async () => {
 	    if (requirementAiMode === "create" ? !canCreateRequirements : !canUpdateRequirements) {
 	      setPreviewTone("error");
-	      setPreviewMessage(`Permission required: ${requirementAiMode === "create" ? "requirement.create" : "requirement.update"}`);
+	      setPreviewMessage(requirementAiMode === "create" ? "Permission required to create Stories." : "Permission required to update Stories.");
 	      return;
 	    }
 
     if (requirementAiMode === "create") {
       if (!requirementCreationDrafts.length) {
         setPreviewTone("error");
-        setPreviewMessage("Generate requirement drafts first, then select the best ones to create.");
+        setPreviewMessage("Generate Story drafts first, then select the best ones to create.");
         return;
       }
 
@@ -2908,7 +3495,7 @@ export function RequirementsPage() {
 
       if (!selectedDrafts.length) {
         setPreviewTone("error");
-        setPreviewMessage("Select at least one generated requirement draft.");
+        setPreviewMessage("Select at least one generated Story draft.");
         return;
       }
 
@@ -2932,6 +3519,7 @@ export function RequirementsPage() {
             project_id: projectId,
             title: candidate.title,
             description: composeAiRequirementDescription(candidate),
+            gherkin_scenarios: includeGherkin ? asArray(candidate.gherkin_scenarios) : [],
             external_references: candidate.external_references,
             labels: ["ai-drafted"],
             sprint: createDraft.sprint || undefined,
@@ -2958,10 +3546,10 @@ export function RequirementsPage() {
         setRequirementCreationDrafts([]);
         setSelectedRequirementCreationDraftIds([]);
         setExpandedRequirementCreationDraftIds([]);
-        showSuccess(`${createdIds.length} AI-assisted requirement${createdIds.length === 1 ? "" : "s"} created.${statusWarningCount ? ` Jira kept workflow status on ${statusWarningCount} item${statusWarningCount === 1 ? "" : "s"} because the requested AI draft status was not transitionable.` : ""} Review the saved Jira requirement${createdIds.length === 1 ? "" : "s"} before using downstream.`);
+        showSuccess(`${createdIds.length} AI-assisted ${createdIds.length === 1 ? "Story" : "Stories"} created.${statusWarningCount ? ` Jira kept workflow status on ${statusWarningCount} item${statusWarningCount === 1 ? "" : "s"} because the requested AI draft status was not transitionable.` : ""} Review the saved Jira ${createdIds.length === 1 ? "Story" : "Stories"} before using ${createdIds.length === 1 ? "it" : "them"} in downstream workflows.`);
         await refresh();
       } catch (error) {
-        showError(error, "Unable to create AI requirements");
+        showError(error, "Unable to create AI Stories");
       }
       return;
     }
@@ -2970,20 +3558,12 @@ export function RequirementsPage() {
 	      return;
 	    }
 
-    const acceptanceAppend = [
-      optimizationSuggestion.acceptance_criteria.length ? "Acceptance criteria:" : "",
-      ...optimizationSuggestion.acceptance_criteria.map((item) => `- ${item}`),
-      optimizationSuggestion.risks.length ? "\nRisks:" : "",
-      ...optimizationSuggestion.risks.map((item) => `- ${item}`),
-      optimizationSuggestion.open_questions.length ? "\nOpen questions:" : "",
-      ...optimizationSuggestion.open_questions.map((item) => `- ${item}`)
-    ].filter(Boolean).join("\n");
-
     const baseDraft = activeOptimizeRequirement!.id === selectedRequirement?.id
       ? draft
       : {
           title: activeOptimizeRequirement!.title,
           description: activeOptimizeRequirement!.description || "",
+          gherkinScenariosText: formatGherkinScenarios(activeOptimizeRequirement!.gherkin_scenarios),
           externalReferencesText: formatReferenceList(activeOptimizeRequirement!.external_references),
           labelsText: formatReferenceList(activeOptimizeRequirement!.labels),
 	          sprint: activeOptimizeRequirement!.sprint || "",
@@ -2996,12 +3576,15 @@ export function RequirementsPage() {
         };
 
     const nextDescription = optimizationFields.description
-      ? optimizationSuggestion.description
-      : [baseDraft.description, acceptanceAppend].filter(Boolean).join("\n\n");
+      ? composeAiRequirementDescription(optimizationSuggestion)
+      : baseDraft.description;
 
     const nextDraft = {
       title: optimizationFields.title ? optimizationSuggestion.title : baseDraft.title,
       description: nextDescription,
+      gherkinScenariosText: includeGherkin && asArray(optimizationSuggestion.gherkin_scenarios).length
+        ? formatGherkinScenarios(optimizationSuggestion.gherkin_scenarios)
+        : baseDraft.gherkinScenariosText,
       externalReferencesText: optimizationFields.external_references ? formatReferenceList(optimizationSuggestion.external_references) : baseDraft.externalReferencesText,
       labelsText: baseDraft.labelsText,
 	      sprint: baseDraft.sprint,
@@ -3023,6 +3606,7 @@ export function RequirementsPage() {
         input: {
           title: nextDraft.title,
           description: nextDraft.description,
+          gherkin_scenarios: parseGherkinScenarios(nextDraft.gherkinScenariosText),
           external_references: parseReferenceList(nextDraft.externalReferencesText),
           labels: parseReferenceList(nextDraft.labelsText),
 	          sprint: nextDraft.sprint,
@@ -3030,7 +3614,10 @@ export function RequirementsPage() {
 	          release: nextDraft.release,
 	          iteration_id: nextDraft.iterationId,
 	          priority: nextDraft.priority,
-          status: nextDraft.status
+          status: nextDraft.status,
+          expected_revision: requirementDetailQuery.data?.id === activeOptimizeRequirement!.id
+            ? requirementDetailQuery.data.revision
+            : undefined
         }
       });
       setOptimizationSuggestion(null);
@@ -3038,10 +3625,10 @@ export function RequirementsPage() {
       setIsOptimizeModalOpen(false);
       setOptimizeRequirementIds([]);
         setDeleteSelectedRequirementIds((current) => current.filter((id) => id !== activeOptimizeRequirement!.id));
-      showSuccess(`AI requirement changes applied to "${activeOptimizeRequirement!.title}".`);
+      showSuccess(`AI Story changes applied to "${activeOptimizeRequirement!.title}".`);
       await refresh();
     } catch (error) {
-      showError(error, "Unable to apply AI requirement changes");
+      showError(error, "Unable to apply AI Story changes");
     }
   };
 
@@ -3090,15 +3677,15 @@ export function RequirementsPage() {
   );
   const requirementImpactFindings = useMemo<AiPreviewFinding[]>(() => {
     const preview = previewRequirementImpact.data;
-    if (!preview) return [];
+    if (!preview?.impact) return [];
 
     const severity = preview.impact.risk_level;
     const groups = [
-      { id: "test-cases", title: "Linked test cases", items: preview.impact.test_cases, action: "Review test intent, steps, and expected results against the proposed requirement change." },
-      { id: "test-suites", title: "Affected suites", items: preview.impact.test_suites, action: "Confirm suite scope and ordering still represent the intended regression path." },
-      { id: "test-runs", title: "Affected runs", items: preview.impact.test_runs, action: "Review queued or active run scope and decide whether a refresh or rerun is needed." },
+      { id: "test-cases", title: "Linked test cases", items: asArray(preview.impact.test_cases), action: "Review test intent, steps, and expected results against the proposed Story change." },
+      { id: "test-suites", title: "Affected suites", items: asArray(preview.impact.test_suites), action: "Confirm suite scope and ordering still represent the intended regression path." },
+      { id: "test-runs", title: "Affected runs", items: asArray(preview.impact.test_runs), action: "Review queued or active run scope and decide whether a refresh or rerun is needed." },
       ...(canUseAutomationWorkspace
-        ? [{ id: "automation-assets", title: "Automation assets", items: preview.impact.automation_assets, action: "Review automation mappings before the next automated run." }]
+        ? [{ id: "automation-assets", title: "Automation assets", items: asArray(preview.impact.automation_assets), action: "Review automation mappings before the next automated run." }]
         : [])
     ];
     const findings = groups
@@ -3112,13 +3699,13 @@ export function RequirementsPage() {
         evidence: group.items.map((item) => item.display_id || item.id).filter(Boolean)
       }));
 
-    if (!preview.impact.test_cases.length) {
+    if (!asArray(preview.impact.test_cases).length) {
       findings.unshift({
         id: "coverage-gap",
         title: "Coverage gap",
         severity: "high",
         description: "No linked test case was found in the current Jira traceability graph.",
-        action: "Create or link reviewed test coverage before treating the requirement change as release-ready.",
+        action: "Create or link reviewed test coverage before treating the Story change as release-ready.",
         evidence: [preview.requirement.display_id]
       });
     }
@@ -3158,21 +3745,21 @@ export function RequirementsPage() {
         <>
           <PageHeader
             eyebrow="Test authoring"
-            title="Requirements"
-            description="Organize reusable requirement scope, keep coverage visible, and hand selected requirements into AI-assisted case design."
+            title="Stories"
+            description="Organize reusable Story scope, keep coverage visible, and hand selected Stories into AI-assisted case design."
             meta={[
-              { label: "Requirements", value: metrics.total },
+              { label: "Stories", value: metrics.total },
               { label: "Mapped", value: metrics.mapped },
               { label: "High priority", value: metrics.highPriority }
             ]}
           />
-          <section className="requirements-health-strip" aria-label="Requirement health metrics">
+          <section className="requirements-health-strip metric-strip page-metric-strip" aria-label="Story health metrics" role="group">
             <article className="requirements-health-card tone-progress">
               <div>
                 <span>Completion Status</span>
                 <strong>{metrics.completionPercent}%</strong>
               </div>
-              <p>{metrics.completed} of {metrics.total} requirement{metrics.total === 1 ? "" : "s"} marked Done.</p>
+              <p>{metrics.completed} of {metrics.total} {metrics.total === 1 ? "Story" : "Stories"} marked Done.</p>
               <div className="requirements-health-meter" aria-hidden="true">
                 <span style={{ width: `${metrics.completionPercent}%` }} />
               </div>
@@ -3182,7 +3769,7 @@ export function RequirementsPage() {
                 <span>Test Coverage</span>
                 <strong>{metrics.coveragePercent}%</strong>
               </div>
-              <p>{metrics.mapped} requirement{metrics.mapped === 1 ? "" : "s"} linked to at least one test case.</p>
+              <p>{metrics.mapped} {metrics.mapped === 1 ? "Story" : "Stories"} linked to at least one test case.</p>
               <div className="requirements-health-meter" aria-hidden="true">
                 <span style={{ width: `${metrics.coveragePercent}%` }} />
               </div>
@@ -3192,7 +3779,7 @@ export function RequirementsPage() {
                 <span>Bug Density</span>
                 <strong>{metrics.defectDensity.toFixed(1)}</strong>
               </div>
-              <p>{metrics.totalDefects} linked bug{metrics.totalDefects === 1 ? "" : "s"} across {metrics.total || 0} requirement{metrics.total === 1 ? "" : "s"}.</p>
+              <p>{metrics.totalDefects} linked bug{metrics.totalDefects === 1 ? "" : "s"} across {metrics.total || 0} {metrics.total === 1 ? "Story" : "Stories"}.</p>
               <div className="requirements-health-meter is-density" aria-hidden="true">
                 <span style={{ width: `${Math.min(100, Math.round(metrics.defectDensity * 25))}%` }} />
               </div>
@@ -3205,16 +3792,16 @@ export function RequirementsPage() {
 
       <WorkspaceMasterDetail
         browseView={(
-          <Panel title="Requirements" titleVariant="eyebrow" subtitle="Start in the visual catalog, scan coverage quickly, then open one requirement into a focused editor view.">
+          <Panel title="Stories" titleVariant="eyebrow" subtitle="Start in the visual catalog, scan coverage quickly, then open one Story in a focused editor view.">
             <div className="design-list-toolbar requirement-catalog-toolbar">
               <CatalogViewToggle onChange={setCatalogViewMode} value={catalogViewMode} />
               <CatalogSearchFilter
                 activeFilterCount={activeRequirementFilterCount}
-                ariaLabel="Search requirements"
+                ariaLabel="Search Stories"
                 onChange={setRequirementSearchTerm}
                 placeholder="Search title, description, status, or priority"
-                subtitle="Filter the requirement tiles by the same facts shown on each card."
-                title="Filter requirements"
+                subtitle="Filter the Story tiles by the same facts shown on each card."
+                title="Filter Stories"
                 value={requirementSearchTerm}
               >
                 <div className="catalog-filter-grid">
@@ -3296,7 +3883,7 @@ export function RequirementsPage() {
                       value={requirementCoverageFilter}
                       onChange={(event) => setRequirementCoverageFilter(event.target.value as RequirementCoverageFilter)}
                     >
-                      <option value="all">All requirements</option>
+                      <option value="all">All Stories</option>
                       <option value="linked">With linked cases</option>
                       <option value="unlinked">Without linked cases</option>
                     </select>
@@ -3345,6 +3932,36 @@ export function RequirementsPage() {
                   <span>Clear</span>
                 </button>
               ) : null}
+              {deleteSelectedRequirementIds.length && requirementIterations.some((iteration) =>
+                String(iteration.state || iteration.status || "").toLowerCase() !== "closed"
+              ) ? (
+                <label className="catalog-hierarchy-move-control">
+                  <span className="sr-only">Move selected Stories to Sprint</span>
+                  <select
+                    aria-label={`Move ${deleteSelectedRequirementIds.length} selected ${deleteSelectedRequirementIds.length === 1 ? "Story" : "Stories"} to Sprint`}
+                    className="compact-select catalog-hierarchy-move-select"
+                    disabled={!canUpdateRequirementIterations || assignRequirementsToIteration.isPending || isDeletingSelectedRequirements}
+                    onChange={(event) => {
+                      if (event.target.value) {
+                        void moveRequirementsToIteration(event.target.value, deleteSelectedRequirementIds);
+                      }
+                    }}
+                    value=""
+                  >
+                    <option value="">Move selected to sprint…</option>
+                    {requirementIterations
+                      .filter((iteration) => String(iteration.state || iteration.status || "").toLowerCase() !== "closed")
+                      .map((iteration) => {
+                        const movableCount = deleteSelectedRequirementIds.filter((id) => requirementIterationById.get(id)?.id !== iteration.id).length;
+                        return (
+                          <option disabled={!movableCount} key={iteration.id} value={iteration.id}>
+                            {iteration.name}{movableCount ? "" : " · already assigned"}
+                          </option>
+                        );
+                      })}
+                  </select>
+                </label>
+              ) : null}
               <button
                 className="ghost-button catalog-selection-button"
                 disabled={!canCreateRequirementIterations || !projectId}
@@ -3363,27 +3980,27 @@ export function RequirementsPage() {
                 }}
                 type="button"
               >
-                <IterationIcon />
+                <IterationIcon size={20} />
                 <span>Create sprint</span>
               </button>
               <RequirementSplitActionButton
                 disabled={!canCreateRequirements || !projectId}
-                icon={<FileAddIcon />}
-                iconOnly={true}
-                label="Create Requirement"
-                menuLabel="Open create requirement options"
+                icon={<FileAddIcon size={20} />}
+                iconOnly={false}
+                label="Create Story"
+                menuLabel="Open create Story options"
                 onClick={openCreateRequirementModal}
                 actions={[
                   {
-                    label: "Bulk Import Requirements",
-                    description: "Upload CSV requirements into the selected project.",
+                    label: "Bulk Import Stories",
+                    description: "Upload Stories from a CSV file into the selected project.",
                     icon: <ImportIcon />,
                     disabled: !canImportRequirements || !projectId,
                     onClick: openRequirementImportModal
                   },
                   {
-                    label: "Create Requirements using AI",
-                    description: "Create a reviewable requirement draft from prompt templates, smart context, files, links, and reference photos.",
+                    label: "Create Stories using AI",
+                    description: "Create a reviewable Story draft from prompt templates, smart context, files, links, and reference photos.",
                     icon: <SparkIcon />,
                     disabled: !canUseRequirementAi || !canCreateRequirements || !projectId,
                     onClick: openAiRequirementCreation
@@ -3393,20 +4010,20 @@ export function RequirementsPage() {
               {deleteSelectedRequirementIds.length ? <RequirementSplitActionButton
                 disabled={!canUseRequirementAi || !canUpdateRequirements || !deleteSelectedRequirementIds.length}
                 icon={<SparkIcon />}
-                label="AI Complete requirement"
-                menuLabel="Open selected requirement AI options"
+                label="AI Complete Story"
+                menuLabel="Open selected Story AI options"
                 onClick={() => openRequirementOptimization(deleteSelectedRequirementIds)}
                 actions={[
                   {
-                    label: "AI Complete requirement",
-                    description: "Complete one selected requirement with focused AI context.",
+                    label: "AI Complete Story",
+                    description: "Complete one selected Story with focused AI context.",
                     icon: <SparkIcon />,
                     disabled: !canUseRequirementAi || !canUpdateRequirements || !deleteSelectedRequirementIds.length,
                     onClick: () => openRequirementOptimization(deleteSelectedRequirementIds)
                   },
                   {
                     label: "AI test case generation",
-                    description: "Generate test cases from the first selected requirement.",
+                    description: "Generate test cases from the first selected Story.",
                     icon: <SparkIcon />,
                     disabled: !canUseRequirementAi || !canCreateTestCases || !deleteSelectedRequirementIds.length || !appTypeId,
                     onClick: () => {
@@ -3424,6 +4041,7 @@ export function RequirementsPage() {
                   className="ghost-button danger catalog-selection-button"
                   disabled={
                     isDeletingSelectedRequirements
+                      || Boolean(deletingIterationId)
                       || (deleteSelectedRequirementIds.length > 0 && !canDeleteRequirements)
                       || (selectedIterationIds.length > 0 && !canDeleteRequirementIterations)
                   }
@@ -3446,83 +4064,124 @@ export function RequirementsPage() {
                   type="button"
                 >
                   <ExportIcon />
-                  <span>Export requirement</span>
+                  <span>Export Story</span>
                 </button>
               ) : null}
             </div>
 
+            {hasIncompleteRequirementFilterScope ? (
+              <div className="hierarchy-filter-scope-note" role="status">
+                Search and filters cover loaded summary fields. External references load only when a Story is opened; expand Sprint headers or use a verified Load more control to check remaining Stories.
+              </div>
+            ) : null}
+
+            <div aria-live="polite" className="sr-only">
+              {draggingRequirementIds.length
+                ? `Moving ${draggingRequirementIds.length} selected ${draggingRequirementIds.length === 1 ? "Story" : "Stories"}. Choose an available Sprint.`
+                : ""}
+            </div>
             <TileBrowserPane className="requirement-card-list">
               {isRequirementCatalogLoading ? <TileCardSkeletonGrid /> : null}
 
-              {!isRequirementCatalogLoading && (filteredRequirements.length || requirementIterationGroups.groups.length) && catalogViewMode === "tile" ? (
+              {!isRequirementCatalogLoading && (filteredRequirements.length || requirementIterationGroups.groups.length || requirementsQuery.hasNextPage) && catalogViewMode === "tile" ? (
                 <div className="tile-browser-grid">
 	                  {iterationTileEntries.map((entry) => {
                     if (entry.kind === "iteration") {
-                      const isCollapsed = collapsedIterationIds.includes(entry.iteration.id);
-                      const iterationChildIds = getVisibleIterationRequirementIds(entry.iteration.id);
+                      const isCollapsed = !expandedIterationIds.includes(entry.iteration.id);
                       const sprintPageState = sprintPageStateById[entry.iteration.id];
-                      const isSelected = iterationChildIds.length > 0
-                        && iterationChildIds.every((id) => deleteSelectedRequirementIds.includes(id))
-                        && (entry.iteration.source === "jira" || selectedIterationIds.includes(entry.iteration.id));
-                      const canAcceptDrop = String(entry.iteration.state || entry.iteration.status || "").toLowerCase() !== "closed";
+                      const isSelected = selectedIterationIds.includes(entry.iteration.id);
+                      const { canAcceptDrop, dropLabel } = getRequirementDropState(entry.iteration);
 
                       return (
+                        <Fragment key={`iteration-${entry.iteration.id}`}>
                         <div
-                          className={draggingRequirementIds.length && canAcceptDrop ? "test-case-module-header requirement-iteration-header is-drop-ready" : "test-case-module-header requirement-iteration-header"}
-                          key={`iteration-${entry.iteration.id}`}
+                          className={[
+                            "test-case-module-header requirement-iteration-header",
+                            draggingRequirementIds.length ? (canAcceptDrop ? "is-drop-ready" : "is-drop-blocked") : ""
+                          ].filter(Boolean).join(" ")}
+                          data-drop-label={dropLabel || undefined}
                           onDragOver={(event) => {
-                            if (draggingRequirementIds.length && canAcceptDrop) {
+                            if (canAcceptDrop) {
                               event.preventDefault();
+                              event.dataTransfer.dropEffect = "move";
+                            } else {
+                              event.dataTransfer.dropEffect = "none";
                             }
                           }}
-                          onDrop={() => canAcceptDrop && void handleDropRequirementOnIteration(entry.iteration.id)}
+                          onDrop={canAcceptDrop ? (event) => handleDropRequirementOnIteration(entry.iteration.id, event) : undefined}
+                          title={dropLabel || undefined}
                         >
                           <label className="checkbox-field" onClick={(event) => event.stopPropagation()}>
                             <input
+                              aria-label={`Select sprint ${entry.iteration.name}`}
                               checked={isSelected}
-                              onChange={(event) => setIterationAndChildrenSelected(entry.iteration, event.target.checked)}
+                              onChange={(event) => setIterationSelected(entry.iteration.id, event.target.checked)}
                               type="checkbox"
                             />
                           </label>
                           <button
+                            aria-expanded={!isCollapsed}
                             aria-label={isCollapsed ? "Expand sprint" : "Collapse sprint"}
                             className={isCollapsed ? "ghost-button compact module-toggle-button" : "ghost-button compact module-toggle-button is-expanded"}
-                            onClick={() =>
-                              setCollapsedIterationIds((current) =>
-                                current.includes(entry.iteration.id)
-                                  ? current.filter((id) => id !== entry.iteration.id)
-                                  : [...current, entry.iteration.id]
-                              )
-                            }
+                            onClick={() => toggleSprintExpansion(entry.iteration.id)}
                             type="button"
                           >
                             <HierarchyToggleIcon isExpanded={!isCollapsed} />
                           </button>
                           {renderSprintIdentity(entry.iteration)}
-                          <button
-                            aria-label={`Edit ${entry.iteration.name}`}
-                            className="ghost-button compact sprint-edit-button"
-                            disabled={!canUpdateRequirementIterations || String(entry.iteration.state || entry.iteration.status || "").toLowerCase() === "closed"}
-                            onClick={() => openEditIteration(entry.iteration)}
-                            title="Edit sprint in Jira"
-                            type="button"
-                          >
-                            <PencilIcon />
-                          </button>
-                          {isCollapsed
-                            ? renderDeferredSprintMetrics(entry.iteration.requirement_count ?? entry.count)
+                          <div className="action-row hierarchy-parent-actions">
+                            <button
+                              aria-label={`Edit ${entry.iteration.name}`}
+                              className="ghost-button compact sprint-edit-button"
+                              disabled={!canUpdateRequirementIterations || String(entry.iteration.state || entry.iteration.status || "").toLowerCase() === "closed"}
+                              onClick={() => openEditIteration(entry.iteration)}
+                              title="Edit sprint in Jira"
+                              type="button"
+                            >
+                              <PencilIcon />
+                            </button>
+                            <button
+                              aria-label={`${deletingIterationId === entry.iteration.id ? "Deleting" : "Delete"} sprint ${entry.iteration.name}`}
+                              className="ghost-button compact danger sprint-delete-button"
+                              disabled={!isSelected || !canDeleteRequirementIterations || Boolean(deletingIterationId) || isDeletingSelectedRequirements}
+                              onClick={() => void handleDeleteIteration(entry.iteration)}
+                              title={isSelected ? "Delete sprint" : "Select the sprint to enable delete"}
+                              type="button"
+                            >
+                              <TrashIcon />
+                            </button>
+                          </div>
+                          {isCollapsed || !sprintPageState || sprintPageState.isInitialLoading || sprintPageState.failedPageIndex === 0
+                            ? renderDeferredSprintMetrics(getKnownSprintRequirementCount(entry.iteration))
                             : renderIterationMetrics(iterationHealth.byId.get(entry.iteration.id)!)}
-                          {!isCollapsed && (sprintPageState?.isFetching || sprintPageState?.nextCursor) ? (
+                          {!isCollapsed
+                          && !sprintPageState?.isInitialLoading
+                          && (sprintPageState?.nextCursor || sprintPageState?.isLoadingMore || Number(sprintPageState?.failedPageIndex) > 0) ? (
                             <HierarchyLoadMoreButton
-                              batchSize={25}
-                              isLoading={Boolean(sprintPageState?.isFetching)}
+                              actionLabel={Number(sprintPageState?.failedPageIndex) > 0 ? "Retry loading" : undefined}
+                              isLoading={Boolean(sprintPageState?.isLoadingMore)}
                               loaded={sprintPageState?.loaded}
                               onLoad={() => loadNextSprintPage(entry.iteration.id)}
-                              scopeLabel={`stories in ${entry.iteration.name}`}
+                              scopeLabel={`Stories in ${entry.iteration.name}`}
                               total={sprintPageState?.total}
                             />
                           ) : null}
                         </div>
+                        {!isCollapsed && sprintPageState?.isInitialLoading ? (
+                          <div className="hierarchy-children-state hierarchy-children-state--tile">
+                            <LoadingState
+                              description="Preparing this sprint while keeping the workspace responsive."
+                              label={`Loading Stories in ${entry.iteration.name}`}
+                            />
+                          </div>
+                        ) : null}
+                        {!isCollapsed && sprintPageState?.failedPageIndex === 0 ? (
+                          <div className="hierarchy-children-state hierarchy-children-state--tile hierarchy-children-state--error" role="alert">
+                            <span>Stories in this Sprint could not be loaded.</span>
+                            <button className="ghost-button compact" onClick={() => retrySprintPage(entry.iteration.id, 0)} type="button">Retry</button>
+                          </div>
+                        ) : null}
+                        </Fragment>
                       );
                     }
 
@@ -3533,6 +4192,7 @@ export function RequirementsPage() {
                         <div className="test-case-module-header is-unassigned requirement-iteration-header" key="iteration-unassigned">
                           <label className="checkbox-field" onClick={(event) => event.stopPropagation()}>
                             <input
+                              aria-label="Select all backlog Stories"
                               checked={allUnassignedSelected}
                               onChange={(event) => setUnassignedRequirementsSelected(event.target.checked)}
                               type="checkbox"
@@ -3546,14 +4206,6 @@ export function RequirementsPage() {
                             </div>
                           </div>
                           {renderIterationMetrics(iterationHealth.unassigned)}
-                          {requirementsQuery.hasNextPage ? (
-                            <HierarchyLoadMoreButton
-                              batchSize={15}
-                              isLoading={requirementsQuery.isFetchingNextPage}
-                              onLoad={() => requirementsQuery.fetchNextPage()}
-                              scopeLabel="backlog stories"
-                            />
-                          ) : null}
                         </div>
                       );
                     }
@@ -3564,27 +4216,30 @@ export function RequirementsPage() {
                     const linkedCaseCount = (linkedCaseIdsByRequirementId[item.id] || []).length;
                     const passCoverage = passCoverageByRequirementId[item.id] || { total: 0, covered: 0, percent: 0 };
                     const automationCoverage = automationCoverageByRequirementId[item.id] || { total: 0, covered: 0, percent: 0 };
-                    const readinessScore = canUseAutomationWorkspace
+                    const hasCompleteAutomationCoverage = automationCoverage.complete !== false;
+                    const readinessScore = canUseAutomationWorkspace && hasCompleteAutomationCoverage
                       ? Math.round((passCoverage.percent * 0.55) + (automationCoverage.percent * 0.45))
                       : Math.round(passCoverage.percent);
                     const isCoverageRisk = !linkedCaseCount || (item.priority ?? 3) <= 2 && readinessScore < 70;
                     const passCoverageTitle = passCoverage.total
                       ? `${passCoverage.covered}/${passCoverage.total} linked test cases passed`
                       : "No linked test cases to measure pass coverage";
-                    const automationCoverageTitle = automationCoverage.total
-                      ? `${automationCoverage.covered}/${automationCoverage.total} linked test cases automated`
+                    const automationCoverageTitle = !hasCompleteAutomationCoverage
+                      ? `${automationCoverage.known || 0}/${automationCoverage.total} linked test case summaries loaded; open the Story for complete automation details`
+                      : automationCoverage.total
+                        ? `${automationCoverage.covered}/${automationCoverage.total} linked test cases automated`
                       : "No linked test cases to measure automation coverage";
                     const tileActions = [
 	                      {
-	                        label: "Open requirement",
-	                        description: "Open this requirement in the detail workspace.",
+	                        label: "Open Story",
+	                        description: "Open this Story in the detail workspace.",
 	                        icon: <OpenIcon />,
 	                        requiredPermissions: ["requirement.view"],
 	                        onClick: () => openRequirementWorkspace(item.id)
 	                      },
 		                      {
 		                        label: "AI test case generation",
-		                        description: "Generate or review AI-designed test cases for this requirement.",
+	                        description: "Generate or review AI-designed test cases for this Story.",
 		                        icon: <SparkIcon />,
 		                        featureKeys: ["qaira.ai.requirement_design"],
 		                        permissionMode: "all" as const,
@@ -3592,8 +4247,8 @@ export function RequirementsPage() {
 		                        onClick: () => openRequirementAiStudio(item.id)
 		                      },
 		                      {
-		                        label: "AI Complete requirement",
-		                        description: "Use AI to improve missing or weak requirement details.",
+	                        label: "AI Complete Story",
+	                        description: "Use AI to improve missing or weak Story details.",
 		                        icon: <SparkIcon />,
 		                        featureKeys: ["qaira.ai.requirement_design"],
 	                        permissionMode: "all" as const,
@@ -3601,8 +4256,8 @@ export function RequirementsPage() {
 	                        onClick: () => openRequirementOptimization([item.id])
 	                      },
 	                      {
-	                        label: "Delete requirement",
-	                        description: "Delete this requirement while keeping linked test cases in the library.",
+	                        label: "Delete Story",
+	                        description: "Delete this Story while keeping linked test cases in the library.",
 	                        icon: <TrashIcon />,
 	                        onClick: () => void handleDeleteRequirementItem(item),
 	                        disabled: deleteRequirement.isPending,
@@ -3613,7 +4268,7 @@ export function RequirementsPage() {
 
                     return (
                       <article
-                        draggable
+                        draggable={canUpdateRequirementIterations && !isDeletingSelectedRequirements}
                         key={item.id}
                         className={[
                           "record-card tile-card requirement-catalog-card",
@@ -3623,9 +4278,7 @@ export function RequirementsPage() {
                         ].filter(Boolean).join(" ")}
                         onDragEnd={() => setDraggingRequirementIds([])}
                         onDragStart={(event) => {
-                          const ids = startDraggingRequirements(item.id);
-                          event.dataTransfer.effectAllowed = "move";
-                          event.dataTransfer.setData("text/plain", ids.join(","));
+                          startDraggingRequirements(item.id, event.dataTransfer);
                         }}
                         onClick={() => openRequirementWorkspace(item.id)}
                         onKeyDown={(event) => {
@@ -3665,7 +4318,7 @@ export function RequirementsPage() {
 		                              <strong>{item.title}</strong>
 		                            </div>
 	                          </div>
-                          <RichTextContent className="tile-card-description" value={item.description} fallback="No requirement description captured yet." />
+                          <RichTextContent className="tile-card-description" value={item.description} fallback="No Story description captured yet." />
                           <div className="requirement-progress-stack">
                             <RequirementProgressBar detail={passCoverageTitle} label="Pass rate" metric={passCoverage} />
                             {canUseAutomationWorkspace ? <RequirementProgressBar detail={automationCoverageTitle} label="Automation coverage" metric={automationCoverage} /> : null}
@@ -3687,9 +4340,11 @@ export function RequirementsPage() {
                             </TileCardFact>
                             <TileCardFact
                               label={`${readinessScore}%`}
-                              title={canUseAutomationWorkspace
+                              title={canUseAutomationWorkspace && hasCompleteAutomationCoverage
                                 ? "Release readiness contribution from linked case pass rate and automation coverage"
-                                : "Release readiness contribution from linked case pass rate"}
+                                : canUseAutomationWorkspace
+                                  ? "Release readiness currently uses pass rate; complete automation details load when the Story is opened"
+                                  : "Release readiness contribution from linked case pass rate"}
                               tone={readinessScore >= 80 ? "success" : readinessScore >= 50 ? "info" : "danger"}
                             >
                               <SparkIcon />
@@ -3701,87 +4356,128 @@ export function RequirementsPage() {
                   })}
                 </div>
               ) : null}
-              {!isRequirementCatalogLoading && (filteredRequirements.length || requirementIterationGroups.groups.length) && catalogViewMode === "list" ? (
+              {!isRequirementCatalogLoading && catalogViewMode === "tile" && requirementsQuery.hasNextPage ? (
+                <div className="hierarchy-load-more-footer">
+                  <HierarchyLoadMoreButton
+                    isLoading={requirementsQuery.isFetchingNextPage}
+                    onLoad={() => requirementsQuery.fetchNextPage()}
+                    placement="footer"
+                    scopeLabel="backlog Stories"
+                  />
+                </div>
+              ) : null}
+              {!isRequirementCatalogLoading && (filteredRequirements.length || requirementIterationGroups.groups.length || requirementsQuery.hasNextPage) && catalogViewMode === "list" ? (
                 <>
                   {requirementIterationGroups.groups.map(({ iteration, requirements: groupRequirements }) => {
-                    const isCollapsed = collapsedIterationIds.includes(iteration.id);
+                    const isCollapsed = !expandedIterationIds.includes(iteration.id);
                     const iterationChildIds = groupRequirements.map((requirement) => requirement.id);
                     const sprintPageState = sprintPageStateById[iteration.id];
-                    const isSelected = iterationChildIds.length > 0
-                      && iterationChildIds.every((id) => deleteSelectedRequirementIds.includes(id))
-                      && (iteration.source === "jira" || selectedIterationIds.includes(iteration.id));
-                    const canAcceptDrop = String(iteration.state || iteration.status || "").toLowerCase() !== "closed";
+                    const isSelected = selectedIterationIds.includes(iteration.id);
+                    const { canAcceptDrop, dropLabel } = getRequirementDropState(iteration);
                     return (
                       <Fragment key={iteration.id}>
                         <div
-                          className={draggingRequirementIds.length && canAcceptDrop ? "test-case-module-header requirement-iteration-header requirement-iteration-list-header is-drop-ready" : "test-case-module-header requirement-iteration-header requirement-iteration-list-header"}
+                          className={[
+                            "test-case-module-header requirement-iteration-header requirement-iteration-list-header",
+                            draggingRequirementIds.length ? (canAcceptDrop ? "is-drop-ready" : "is-drop-blocked") : ""
+                          ].filter(Boolean).join(" ")}
+                          data-drop-label={dropLabel || undefined}
                           onDragOver={(event) => {
-                            if (draggingRequirementIds.length && canAcceptDrop) {
+                            if (canAcceptDrop) {
                               event.preventDefault();
+                              event.dataTransfer.dropEffect = "move";
+                            } else {
+                              event.dataTransfer.dropEffect = "none";
                             }
                           }}
-                          onDrop={() => canAcceptDrop && void handleDropRequirementOnIteration(iteration.id)}
+                          onDrop={canAcceptDrop ? (event) => handleDropRequirementOnIteration(iteration.id, event) : undefined}
+                          title={dropLabel || undefined}
                         >
                           <label className="checkbox-field" onClick={(event) => event.stopPropagation()}>
                             <input
+                              aria-label={`Select sprint ${iteration.name}`}
                               checked={isSelected}
-                              onChange={(event) => setIterationAndChildrenSelected(iteration, event.target.checked)}
+                              onChange={(event) => setIterationSelected(iteration.id, event.target.checked)}
                               type="checkbox"
                             />
                           </label>
                           <button
+                            aria-expanded={!isCollapsed}
                             aria-label={isCollapsed ? "Expand sprint" : "Collapse sprint"}
                             className={isCollapsed ? "ghost-button compact module-toggle-button" : "ghost-button compact module-toggle-button is-expanded"}
-                            onClick={() =>
-                              setCollapsedIterationIds((current) =>
-                                current.includes(iteration.id)
-                                  ? current.filter((id) => id !== iteration.id)
-                                  : [...current, iteration.id]
-                              )
-                            }
+                            onClick={() => toggleSprintExpansion(iteration.id)}
                             type="button"
                           >
                             <HierarchyToggleIcon isExpanded={!isCollapsed} />
                           </button>
                           {renderSprintIdentity(iteration)}
-                          <button
-                            aria-label={`Edit ${iteration.name}`}
-                            className="ghost-button compact sprint-edit-button"
-                            disabled={!canUpdateRequirementIterations || String(iteration.state || iteration.status || "").toLowerCase() === "closed"}
-                            onClick={() => openEditIteration(iteration)}
-                            title="Edit sprint in Jira"
-                            type="button"
-                          >
-                            <PencilIcon />
-                          </button>
-                          {isCollapsed
-                            ? renderDeferredSprintMetrics(iteration.requirement_count ?? groupRequirements.length)
+                          <div className="action-row hierarchy-parent-actions">
+                            <button
+                              aria-label={`Edit ${iteration.name}`}
+                              className="ghost-button compact sprint-edit-button"
+                              disabled={!canUpdateRequirementIterations || String(iteration.state || iteration.status || "").toLowerCase() === "closed"}
+                              onClick={() => openEditIteration(iteration)}
+                              title="Edit sprint in Jira"
+                              type="button"
+                            >
+                              <PencilIcon />
+                            </button>
+                            <button
+                              aria-label={`${deletingIterationId === iteration.id ? "Deleting" : "Delete"} sprint ${iteration.name}`}
+                              className="ghost-button compact danger sprint-delete-button"
+                              disabled={!isSelected || !canDeleteRequirementIterations || Boolean(deletingIterationId) || isDeletingSelectedRequirements}
+                              onClick={() => void handleDeleteIteration(iteration)}
+                              title={isSelected ? "Delete sprint" : "Select the sprint to enable delete"}
+                              type="button"
+                            >
+                              <TrashIcon />
+                            </button>
+                          </div>
+                          {isCollapsed || !sprintPageState || sprintPageState.isInitialLoading || sprintPageState.failedPageIndex === 0
+                            ? renderDeferredSprintMetrics(getKnownSprintRequirementCount(iteration))
                             : renderIterationMetrics(iterationHealth.byId.get(iteration.id)!)}
-                          {!isCollapsed && (sprintPageState?.isFetching || sprintPageState?.nextCursor) ? (
+                          {!isCollapsed
+                          && !sprintPageState?.isInitialLoading
+                          && (sprintPageState?.nextCursor || sprintPageState?.isLoadingMore || Number(sprintPageState?.failedPageIndex) > 0) ? (
                             <HierarchyLoadMoreButton
-                              batchSize={25}
-                              isLoading={Boolean(sprintPageState?.isFetching)}
+                              actionLabel={Number(sprintPageState?.failedPageIndex) > 0 ? "Retry loading" : undefined}
+                              isLoading={Boolean(sprintPageState?.isLoadingMore)}
                               loaded={sprintPageState?.loaded}
                               onLoad={() => loadNextSprintPage(iteration.id)}
-                              scopeLabel={`stories in ${iteration.name}`}
+                              scopeLabel={`Stories in ${iteration.name}`}
                               total={sprintPageState?.total}
                             />
                           ) : null}
                         </div>
                         {!isCollapsed ? (
-                          <DataTable
-                            columns={getScopedRequirementListColumns(iterationChildIds, `Select all stories in ${iteration.name}`)}
-                            enableColumnResize
-                            emptyMessage="No stories match this sprint."
-                            getRowDraggable={() => true}
-                            getRowClassName={(item) => (selectedRequirement?.id === item.id ? "is-active-row" : "")}
-                            getRowKey={(item) => item.id}
-                            onRowDragEnd={() => setDraggingRequirementIds([])}
-                            onRowDragStart={(item) => startDraggingRequirements(item.id)}
-                            onRowClick={(item) => openRequirementWorkspace(item.id)}
-                            rows={groupRequirements}
-                            storageKey={`qaira:requirements:list-columns:${iteration.id}`}
-                          />
+                          sprintPageState?.isInitialLoading ? (
+                            <div className="hierarchy-children-state hierarchy-children-state--list">
+                              <LoadingState
+                                description="Preparing this sprint while keeping the list in place."
+                                label={`Loading Stories in ${iteration.name}`}
+                              />
+                            </div>
+                          ) : sprintPageState?.failedPageIndex === 0 ? (
+                            <div className="hierarchy-children-state hierarchy-children-state--list hierarchy-children-state--error" role="alert">
+                              <span>Stories in this Sprint could not be loaded.</span>
+                              <button className="ghost-button compact" onClick={() => retrySprintPage(iteration.id, 0)} type="button">Retry</button>
+                            </div>
+                          ) : (
+                            <DataTable
+                              columns={getScopedRequirementListColumns(iterationChildIds, `Select all Stories in ${iteration.name}`)}
+                              enableColumnResize
+                              enableHeaderColumnReorder
+                              emptyMessage="No Stories match this Sprint."
+                              getRowDraggable={() => canUpdateRequirementIterations && !isDeletingSelectedRequirements}
+                              getRowClassName={(item) => (selectedRequirement?.id === item.id ? "is-active-row" : "")}
+                              getRowKey={(item) => item.id}
+                              onRowDragEnd={() => setDraggingRequirementIds([])}
+                              onRowDragStart={(item, event) => startDraggingRequirements(item.id, event.dataTransfer)}
+                              onRowClick={(item) => openRequirementWorkspace(item.id)}
+                              rows={groupRequirements}
+                              storageKey={`qaira:requirements:list-columns:${iteration.id}`}
+                            />
+                          )
                         ) : null}
                       </Fragment>
                     );
@@ -3791,7 +4487,9 @@ export function RequirementsPage() {
                       <div className="test-case-module-header is-unassigned requirement-iteration-header requirement-iteration-list-header">
                         <label className="checkbox-field" onClick={(event) => event.stopPropagation()}>
                           <input
-                            checked={requirementIterationGroups.unassignedRequirements.every((requirement) => deleteSelectedRequirementIds.includes(requirement.id))}
+                            aria-label="Select all backlog Stories"
+                            checked={requirementIterationGroups.unassignedRequirements.length > 0
+                              && requirementIterationGroups.unassignedRequirements.every((requirement) => deleteSelectedRequirementIds.includes(requirement.id))}
                             onChange={(event) => setUnassignedRequirementsSelected(event.target.checked)}
                             type="checkbox"
                           />
@@ -3804,39 +4502,42 @@ export function RequirementsPage() {
                           </div>
                         </div>
                         {renderIterationMetrics(iterationHealth.unassigned)}
-                        {requirementsQuery.hasNextPage ? (
-                          <HierarchyLoadMoreButton
-                            batchSize={15}
-                            isLoading={requirementsQuery.isFetchingNextPage}
-                            onLoad={() => requirementsQuery.fetchNextPage()}
-                            scopeLabel="backlog stories"
-                          />
-                        ) : null}
                       </div>
                       <DataTable
-                        columns={getScopedRequirementListColumns(requirementIterationGroups.unassignedRequirements.map((requirement) => requirement.id), "Select all backlog stories")}
+                        columns={getScopedRequirementListColumns(requirementIterationGroups.unassignedRequirements.map((requirement) => requirement.id), "Select all backlog Stories")}
                         enableColumnResize
-                        emptyMessage="No backlog stories match the current search."
-                        getRowDraggable={() => true}
+                        enableHeaderColumnReorder
+                        emptyMessage="No backlog Stories match the current search."
+                        getRowDraggable={() => canUpdateRequirementIterations && !isDeletingSelectedRequirements}
                         getRowClassName={(item) => (selectedRequirement?.id === item.id ? "is-active-row" : "")}
                         getRowKey={(item) => item.id}
                         onRowDragEnd={() => setDraggingRequirementIds([])}
-                        onRowDragStart={(item) => startDraggingRequirements(item.id)}
+                        onRowDragStart={(item, event) => startDraggingRequirements(item.id, event.dataTransfer)}
                         onRowClick={(item) => openRequirementWorkspace(item.id)}
                         rows={requirementIterationGroups.unassignedRequirements}
                         storageKey="qaira:requirements:list-columns:unassigned"
                       />
+                      {requirementsQuery.hasNextPage ? (
+                        <div className="hierarchy-load-more-footer">
+                          <HierarchyLoadMoreButton
+                            isLoading={requirementsQuery.isFetchingNextPage}
+                            onLoad={() => requirementsQuery.fetchNextPage()}
+                            placement="footer"
+                            scopeLabel="backlog Stories"
+                          />
+                        </div>
+                      ) : null}
                     </>
                   ) : null}
                 </>
               ) : null}
-              {!isRequirementCatalogLoading && !requirements.length && !requirementIterationGroups.groups.length ? (
+              {!isRequirementCatalogLoading && !requirements.length && !requirementIterationGroups.groups.length && !requirementsQuery.hasNextPage ? (
                 <div className="empty-state compact">
-                  <div>No requirements yet for this project.</div>
-	                  <button className="primary-button" disabled={!canCreateRequirements || !projectId} onClick={openCreateRequirementModal} type="button">Create first requirement</button>
+                  <div>No Stories yet for this project.</div>
+	                  <button className="primary-button" disabled={!canCreateRequirements || !projectId} onClick={openCreateRequirementModal} type="button">Create first Story</button>
                 </div>
               ) : null}
-              {!isRequirementCatalogLoading && requirements.length && !filteredRequirements.length ? <div className="empty-state compact">No requirements match the current search.</div> : null}
+              {!isRequirementCatalogLoading && requirements.length && !filteredRequirements.length && !requirementIterationGroups.groups.length ? <div className="empty-state compact">No Stories match the current search.</div> : null}
             </TileBrowserPane>
           </Panel>
         )}
@@ -3844,7 +4545,7 @@ export function RequirementsPage() {
           <Panel
             actions={(
               <div className="panel-head-actions-row">
-                <WorkspaceBackButton label="Back to requirement tiles" onClick={closeRequirementDetail} />
+                <WorkspaceBackButton label="Back to Story tiles" onClick={closeRequirementDetail} />
                 {selectedRequirement ? (
                   <>
 		                  <button className="primary-button" disabled={!canCreateTestCases || !appTypeId} onClick={() => openNewTestCase(selectedRequirement)} type="button">
@@ -3858,24 +4559,24 @@ export function RequirementsPage() {
                       type="button"
                     >
                       <SparkIcon />
-                      <span>AI Complete requirement</span>
+                      <span>AI Complete Story</span>
                     </button>
                     <button className="ghost-button danger" disabled={!canDeleteRequirements || deleteRequirement.isPending} onClick={() => void handleDeleteRequirement()} type="button">
                       <TrashIcon />
-                      <span>Delete Requirement</span>
+                      <span>Delete Story</span>
                     </button>
                   </>
                 ) : null}
               </div>
             )}
-            title={selectedRequirement ? selectedRequirement.title : "Requirement details"}
-            subtitle={selectedRequirement ? "Edit the requirement, manage reusable coverage links, and keep the selected item in focus." : "Select a requirement to review its details."}
+            title={selectedRequirement ? selectedRequirement.title : "Story details"}
+            subtitle={selectedRequirement ? "Edit the Story, manage reusable coverage links, and keep the selected item in focus." : "Select a Story to review its details."}
 	          >
             {selectedRequirement ? (
               <div className="detail-stack">
                 <DetailSectionTabs
                   activeTab={activeTraceabilityTab}
-                  ariaLabel="Requirement detail sections"
+                  ariaLabel="Story detail sections"
                   items={[
                     { value: "details", label: "Details", icon: <PencilIcon /> },
                     { value: "related", label: "Related items", icon: <OpenIcon />, count: selectedRequirement.related_items?.length || 0 },
@@ -3900,9 +4601,11 @@ export function RequirementsPage() {
                     </span>
                   </div>
                   <div className="mini-card">
-                    <strong>{`${selectedRequirementAutomationCoverage.percent}%`}</strong>
+                    <strong>{selectedRequirementAutomationCoverage.complete === false ? "—" : `${selectedRequirementAutomationCoverage.percent}%`}</strong>
                     <span>
-                      {selectedRequirementAutomationCoverage.total
+                      {selectedRequirementAutomationCoverage.complete === false
+                        ? `Automation details ${selectedRequirementAutomationCoverage.known || 0}/${selectedRequirementAutomationCoverage.total} loaded`
+                        : selectedRequirementAutomationCoverage.total
                         ? `Auto ${selectedRequirementAutomationCoverage.covered}/${selectedRequirementAutomationCoverage.total}`
                         : "Automation"}
                     </span>
@@ -3921,10 +4624,10 @@ export function RequirementsPage() {
                     countLabel={`${selectedTestCaseIds.length} linked`}
                     isExpanded={expandedSections.details}
                     onToggle={() => setExpandedSections((current) => ({ ...current, details: !current.details }))}
-                    title="Requirement details"
+                    title="Story details"
                   >
                     <div className="requirement-detail-id-row">
-                      <span>Requirement ID</span>
+                      <span>Story ID</span>
                       <DisplayIdBadge value={selectedRequirement.display_id || selectedRequirement.id} href={getJiraBrowseUrl(selectedRequirement.display_id || selectedRequirement.id, selectedRequirement.jira_url)} />
                     </div>
                     <form className="form-grid requirement-details-form" onSubmit={(event) => void handleSaveRequirement(event)}>
@@ -3974,7 +4677,7 @@ export function RequirementsPage() {
                       </div>
                       <FormField label="Description" required={jiraRequirementEditCoreRequired.description}>
                         <RichTextEditor
-                          aiRephraseTitle="Rephrase requirement description with AI"
+                          aiRephraseTitle="Rephrase Story description with AI"
                           onAiRephrase={(html, plainText) => rephraseRequirementDescriptionWithAi(html, plainText, "detail")}
                           required={jiraRequirementEditCoreRequired.description}
                           rows={4}
@@ -3982,6 +4685,21 @@ export function RequirementsPage() {
                           onChange={(description) => setDraft((current) => ({ ...current, description }))}
                         />
                       </FormField>
+                      {draft.gherkinScenariosText ? (
+                        <FormField
+                          className="requirement-gherkin-field"
+                          hint="AI-generated scenarios are stored separately from the Jira Story description. Keep Feature, Scenario, Given, When, and Then keywords when editing."
+                          label="Gherkin scenarios"
+                        >
+                          <textarea
+                            className="requirement-gherkin-editor"
+                            onChange={(event) => setDraft((current) => ({ ...current, gherkinScenariosText: event.target.value }))}
+                            rows={9}
+                            spellCheck={false}
+                            value={draft.gherkinScenariosText}
+                          />
+                        </FormField>
+                      ) : null}
                       <ExternalReferencesField
                         value={draft.externalReferencesText}
                         onChange={(externalReferencesText) => setDraft((current) => ({ ...current, externalReferencesText }))}
@@ -4012,7 +4730,7 @@ export function RequirementsPage() {
 
                       <div className="action-row">
                         <button className="primary-button" disabled={!canUpdateRequirements || requirementEditMetadataQuery.isLoading || requirementEditMetadataQuery.isError || updateRequirement.isPending || replaceMappings.isPending || replaceDefectMappings.isPending} type="submit">
-                          {updateRequirement.isPending || replaceMappings.isPending || replaceDefectMappings.isPending ? "Saving…" : "Save requirement"}
+                          {updateRequirement.isPending || replaceMappings.isPending || replaceDefectMappings.isPending ? "Saving…" : "Save Story"}
                         </button>
                       </div>
                     </form>
@@ -4041,8 +4759,8 @@ export function RequirementsPage() {
                   <div className="detail-section-panel requirement-detail-wide-panel" role="tabpanel">
                     <div className="requirement-grounding-header">
                       <div>
-                        <strong>AI Assurance Requirement grounding</strong>
-                        <span>Quality signals, evidence gaps, and change-impact review for this Jira requirement.</span>
+                        <strong>AI Assurance Story grounding</strong>
+                        <span>Quality signals, evidence gaps, and change-impact review for this Jira Story.</span>
                       </div>
                       <button
                         className="ghost-button compact"
@@ -4062,7 +4780,7 @@ export function RequirementsPage() {
                       scoreLabel={selectedRequirementAiReadiness.scoreLabel}
                       signals={selectedRequirementAiReadiness.signals}
                       summary={selectedRequirementAiReadiness.summary}
-                      title="Requirement grounding"
+                      title="Story grounding"
                     />
                   </div>
                 ) : null}
@@ -4080,6 +4798,7 @@ export function RequirementsPage() {
                       searchTerm={detailTestCaseSearchTerm}
                       onSearchTermChange={setDetailTestCaseSearchTerm}
                       selectedIds={selectedTestCaseIds}
+                      selectedFallbackLabels={selectedTestCaseFallbackLabels}
                       sortLinkedFirst
                       testCases={testCases}
                       onToggle={(testCaseId, checked) => toggleSelectedTestCase(setSelectedTestCaseIds, testCaseId, checked)}
@@ -4119,7 +4838,7 @@ export function RequirementsPage() {
                 ) : null}
               </div>
             ) : (
-              <div className="empty-state compact">Select a requirement from the catalog to view and edit its details.</div>
+              <div className="empty-state compact">Select a Story from the catalog to view and edit its details.</div>
             )}
           </Panel>
         )}
@@ -4138,14 +4857,14 @@ export function RequirementsPage() {
             <div className="requirement-create-header">
               <div className="requirement-create-title">
                 <div className="modal-title-info-row">
-                  <h2 className="dialog-title" id="create-requirement-title">Create requirement</h2>
+                  <h2 className="dialog-title" id="create-requirement-title">Create Story</h2>
                   <InfoTooltip
-                    content="Create the requirement in a focused modal, then link any reusable test cases that already exist for the selected app type."
-                    label="Create requirement information"
+                    content="Create the Story in a focused modal, then link any reusable test cases that already exist for the selected app type."
+                    label="Create Story information"
                   />
                 </div>
               </div>
-              <DialogCloseButton disabled={createRequirement.isPending} label="Close create requirement" onClick={closeCreateRequirementModal} />
+              <DialogCloseButton disabled={createRequirement.isPending} label="Close create Story" onClick={closeCreateRequirementModal} />
             </div>
 
             <form className="requirement-create-modal-form" onSubmit={(event) => void handleCreateRequirement(event)}>
@@ -4197,7 +4916,7 @@ export function RequirementsPage() {
                   <FormField label="Description" inputId="create-requirement-description-input" required={jiraRequirementCoreRequired.description}>
                     <RichTextEditor
                       id="create-requirement-description-input"
-                      aiRephraseTitle="Rephrase requirement description with AI"
+                      aiRephraseTitle="Rephrase Story description with AI"
                       onAiRephrase={(html, plainText) => rephraseRequirementDescriptionWithAi(html, plainText, "create")}
                       required={jiraRequirementCoreRequired.description}
                       rows={4}
@@ -4260,7 +4979,7 @@ export function RequirementsPage() {
                   Cancel
                 </button>
 	                <button className="primary-button" disabled={!canCreateRequirements || createRequirement.isPending || requirementCreateMetadataQuery.isLoading || requirementCreateMetadataQuery.isError} type="submit">
-	                  {createRequirement.isPending ? "Creating…" : requirementCreateMetadataQuery.isLoading ? "Checking Jira fields…" : "Create requirement"}
+	                  {createRequirement.isPending ? "Creating…" : requirementCreateMetadataQuery.isLoading ? "Checking Jira fields…" : "Create Story"}
 	                </button>
               </div>
             </form>
@@ -4281,7 +5000,7 @@ export function RequirementsPage() {
 	            <div className="requirement-create-header">
 	              <div className="requirement-create-title">
 	                <h2 className="dialog-title" id="create-sprint-title">{editingIteration ? "Edit sprint" : "Create sprint"}</h2>
-	                <p>{editingIteration ? "Update the Jira Sprint’s plan, delivery window, goal, and status." : "Create the Sprint in Jira, define its delivery window, and place the selected stories into its scope."}</p>
+	                <p>{editingIteration ? "Update the Jira Sprint’s plan, delivery window, goal, and status." : "Create the Sprint in Jira, define its delivery window, and place the selected Stories into its scope."}</p>
 	              </div>
 	              <DialogCloseButton disabled={createRequirementIteration.isPending || updateRequirementIteration.isPending} label={`Close ${editingIteration ? "edit" : "create"} sprint`} onClick={() => { setEditingIteration(null); setIsCreateIterationModalOpen(false); }} />
 	            </div>
@@ -4335,16 +5054,16 @@ export function RequirementsPage() {
 	                <div className="sprint-create-section-heading sprint-story-picker-heading">
                     <div>
                       <strong>Stories in this sprint</strong>
-                      <span>Choose scope now; stories can also be dragged into the Sprint later.</span>
+                      <span>Choose scope now; Stories can also be dragged into the Sprint later.</span>
                     </div>
                     <span className="sprint-story-count">{sprintDraftRequirementIds.length} selected</span>
                   </div>
 	                <div className="iteration-requirement-picker-toolbar">
-	                  <FormField label="Search stories">
+	                  <FormField className="sprint-story-search-field" label="Search Stories">
                     <div className="search-input-with-icon">
                       <SearchIcon />
                       <input
-                        placeholder="Search stories"
+                        placeholder="Search Stories"
                         value={iterationRequirementSearch}
                         onChange={(event) => setIterationRequirementSearch(event.target.value)}
                       />
@@ -4376,7 +5095,7 @@ export function RequirementsPage() {
                     ) : null}
                   </div>
                 </div>
-                <div className="iteration-requirement-picker-list sprint-story-picker-list" role="listbox" aria-label="Stories for this sprint">
+                <div className="iteration-requirement-picker-list sprint-story-picker-list" role="listbox" aria-label="Stories for this Sprint">
                   {iterationRequirementOptions.map((requirement) => {
                     const isChecked = sprintDraftRequirementIds.includes(requirement.id);
                     const iterationName = requirementIterationById.get(requirement.id)?.name || requirement.sprint;
@@ -4406,7 +5125,7 @@ export function RequirementsPage() {
                     );
                   })}
 	                  {!iterationRequirementOptions.length ? (
-	                    <div className="empty-state compact">No stories match this search.</div>
+	                    <div className="empty-state compact">No Stories match this search.</div>
 	                  ) : null}
 	                </div>
 	              </div> : null}
@@ -4442,12 +5161,12 @@ export function RequirementsPage() {
             <div className="import-modal-header">
               <div className="import-modal-title">
                 <div className="modal-title-info-row">
-                  <h2 className="dialog-title" id="bulk-requirement-import-title">Bulk requirement import</h2>
+                  <h2 className="dialog-title" id="bulk-requirement-import-title">Bulk import Stories</h2>
                 </div>
               </div>
               <DialogCloseButton
                 disabled={bulkImportRequirements.isPending}
-                label="Close bulk requirement import"
+                label="Close Story import"
                 onClick={() => setIsImportModalOpen(false)}
               />
             </div>
@@ -4511,7 +5230,11 @@ export function RequirementsPage() {
                 onClick={() => void handleBulkImportRequirements()}
                 type="button"
               >
-                {bulkImportRequirements.isPending ? "Queuing..." : `Queue ${importRows.length || ""} Requirements`}
+                {bulkImportRequirements.isPending
+                  ? "Queuing..."
+                  : importRows.length
+                    ? `Queue ${importRows.length} ${importRows.length === 1 ? "Story" : "Stories"}`
+                    : "Queue Stories"}
               </button>
               <button
                 className="ghost-button"
@@ -4545,10 +5268,10 @@ export function RequirementsPage() {
           >
             <div className="ai-studio-header">
               <div className="ai-studio-header-copy ai-requirement-ai-header-copy">
-                <p className="dialog-context-label">Requirements</p>
+                <p className="dialog-context-label">Stories</p>
                 <div className="ai-requirement-title-row">
                   <h2 className="dialog-title" id="ai-improve-requirement-title">
-                    {requirementAiMode === "create" ? "Create requirements using AI" : "AI Complete requirement"}
+                    {requirementAiMode === "create" ? "Create Stories using AI" : "AI Complete Story"}
                   </h2>
                   <button className="primary-button ai-studio-primary-action ai-requirement-title-action" disabled={!canUseRequirementAi || previewRequirementOptimization.isPending || previewRequirementCreation.isPending || createRequirementGenerationJob.isPending || isRequirementCreationJobRunning} onClick={() => void handlePreviewRequirementOptimization()} type="button">
                     <SparkIcon />
@@ -4558,20 +5281,32 @@ export function RequirementsPage() {
                         ? "Generating…"
                         : previewRequirementOptimization.isPending || previewRequirementCreation.isPending
                       ? "Thinking…"
-                      : requirementAiMode === "create" ? "Generate requirement drafts" : "Complete requirement"}
+                      : requirementAiMode === "create" ? "Generate Story drafts" : "Complete Story"}
                   </button>
                 </div>
                 <p>
                   {requirementAiMode === "create"
-                    ? "Generate multiple testable requirement candidates from prompt context, external references, and compressed attachments, then select only the strongest drafts for Jira."
+                    ? "Generate multiple testable Story candidates from prompt context, external references, and compressed attachments, then select only the strongest drafts for Jira."
                     : activeOptimizeRequirement
-                      ? `Complete one requirement: ${activeOptimizeRequirement.title}`
-                      : "Select one requirement, add context if needed, then generate a focused completion draft."}
+                      ? `Complete one Story: ${activeOptimizeRequirement.title}`
+                      : "Select one Story, add context if needed, then generate a focused completion draft."}
                 </p>
+                <label className="ai-gherkin-option">
+                  <input
+                    checked={includeGherkin}
+                    disabled={previewRequirementOptimization.isPending || createRequirementGenerationJob.isPending || isRequirementCreationJobRunning || isGeneratingGherkin}
+                    onChange={(event) => setIncludeGherkin(event.target.checked)}
+                    type="checkbox"
+                  />
+                  <span>
+                    <strong>Include Gherkin scenarios</strong>
+                    <small>Runs a focused second AI pass after the Story draft and keeps Given/When/Then scenarios in a separate review section.</small>
+                  </span>
+                </label>
               </div>
               <DialogCloseButton
-                disabled={previewRequirementOptimization.isPending || previewRequirementCreation.isPending || createRequirementGenerationJob.isPending || createRequirement.isPending || updateRequirement.isPending}
-                label={requirementAiMode === "create" ? "Close AI requirement creation" : "Close AI requirement improvement"}
+                disabled={previewRequirementOptimization.isPending || previewRequirementCreation.isPending || createRequirementGenerationJob.isPending || isGeneratingGherkin || createRequirement.isPending || updateRequirement.isPending}
+                label={requirementAiMode === "create" ? "Close AI Story creation" : "Close AI Story improvement"}
                 onClick={closeRequirementAiModal}
               />
             </div>
@@ -4593,7 +5328,7 @@ export function RequirementsPage() {
                         </select>
                       </FormField>
                       {requirementAiMode === "improve" ? (
-                        <FormField label="Requirement">
+                        <FormField label="Story">
                           <select
                             value={activeOptimizeRequirement?.id || ""}
                             onChange={(event) => {
@@ -4604,7 +5339,7 @@ export function RequirementsPage() {
                             }}
                             disabled={previewRequirementOptimization.isPending || updateRequirement.isPending}
                           >
-                            <option value="" disabled>Select requirement</option>
+                            <option value="" disabled>Select Story</option>
                             {aiCompleteRequirementOptions.map((requirement) => (
                               <option key={requirement.id} value={requirement.id}>
                                 {requirement.display_id ? `${requirement.display_id} · ` : ""}{requirement.title}
@@ -4710,7 +5445,7 @@ export function RequirementsPage() {
                       <div className="ai-requirement-generation-toolbar">
                         <div>
                           <strong>{selectedRequirementCreationDraftCount} of {requirementCreationDrafts.length} selected</strong>
-                          <span>Review title, description, priority, acceptance criteria, risks, and questions before creating Jira requirements.</span>
+                          <span>Review title, description, priority, acceptance criteria, risks, and questions before creating Jira Stories.</span>
                         </div>
                         <div className="action-row">
                           <button
@@ -4765,14 +5500,14 @@ export function RequirementsPage() {
                                 </label>
                                 <button
                                   aria-expanded={isExpanded}
-                                  aria-label={isExpanded ? "Collapse requirement draft" : "Expand requirement draft"}
+                                  aria-label={isExpanded ? "Collapse Story draft" : "Expand Story draft"}
                                   className="ghost-button compact explorer-icon-button"
                                   onClick={() => setExpandedRequirementCreationDraftIds((current) =>
                                     current.includes(draftId)
                                       ? current.filter((id) => id !== draftId)
                                       : [...current, draftId]
                                   )}
-                                  title={isExpanded ? "Collapse requirement draft" : "Expand requirement draft"}
+                                  title={isExpanded ? "Collapse Story draft" : "Expand Story draft"}
                                   type="button"
                                 >
                                   <CollapseExpandIcon isExpanded={isExpanded} />
@@ -4787,21 +5522,29 @@ export function RequirementsPage() {
                                 <div className="ai-requirement-draft-details">
                                   <div className="detail-summary">
                                     <strong>Acceptance criteria</strong>
-                                    <span>{candidate.acceptance_criteria.join(" ") || "No acceptance criteria returned."}</span>
+                                    <span>{asArray(candidate.acceptance_criteria).join(" ") || "No acceptance criteria returned."}</span>
                                   </div>
+                                  {includeGherkin ? (
+                                    <div className="detail-summary ai-gherkin-section">
+                                      <strong>Gherkin scenarios</strong>
+                                      {asArray(candidate.gherkin_scenarios).length
+                                        ? <pre>{asArray(candidate.gherkin_scenarios).join("\n\n")}</pre>
+                                        : <span>{isGeneratingGherkin ? "Generating scenarios from this Story draft…" : "No Gherkin scenarios returned."}</span>}
+                                    </div>
+                                  ) : null}
                                   <div className="detail-summary">
                                     <strong>Risks</strong>
-                                    <span>{candidate.risks.join(" ") || "No risks returned."}</span>
+                                    <span>{asArray(candidate.risks).join(" ") || "No risks returned."}</span>
                                   </div>
                                   <div className="detail-summary">
                                     <strong>Open questions</strong>
-                                    <span>{candidate.open_questions.join(" ") || "No open questions returned."}</span>
+                                    <span>{asArray(candidate.open_questions).join(" ") || "No open questions returned."}</span>
                                   </div>
                                   <div className="detail-summary">
                                     <strong>Why this draft</strong>
-                                    <span>{candidate.rationale || candidate.change_summary.join(" ") || "Drafted from the provided AI context."}</span>
+                                    <span>{candidate.rationale || asArray(candidate.change_summary).join(" ") || "Drafted from the provided AI context."}</span>
                                   </div>
-                                  {candidate.external_references.length ? (
+                                  {asArray(candidate.external_references).length ? (
                                     <div className="detail-summary">
                                       <strong>References</strong>
                                       <span>{formatReferenceList(candidate.external_references)}</span>
@@ -4816,7 +5559,7 @@ export function RequirementsPage() {
                     </div>
                   ) : (
                     <div className="empty-state compact ai-requirement-empty-state">
-                      Add prompt context, screenshots, files, or references, then generate requirement drafts. The prompt panel can collapse after generation so the review area gets the room.
+                      Add prompt context, screenshots, files, or references, then generate Story drafts. The prompt panel can collapse after generation so the review area gets the room.
                     </div>
                   )
                 ) : optimizationSuggestion ? (
@@ -4843,16 +5586,24 @@ export function RequirementsPage() {
 
                   <div className="detail-summary">
                     <strong>Change summary</strong>
-                    <span>{optimizationSuggestion.change_summary.join(" ") || "No summary returned."}</span>
+                    <span>{asArray(optimizationSuggestion.change_summary).join(" ") || "No summary returned."}</span>
                   </div>
                   <div className="detail-summary">
                     <strong>Acceptance criteria</strong>
-                    <span>{optimizationSuggestion.acceptance_criteria.join(" ") || "No acceptance criteria returned."}</span>
+                    <span>{asArray(optimizationSuggestion.acceptance_criteria).join(" ") || "No acceptance criteria returned."}</span>
                   </div>
+                  {includeGherkin ? (
+                    <div className="detail-summary ai-gherkin-section">
+                      <strong>Gherkin scenarios</strong>
+                      {asArray(optimizationSuggestion.gherkin_scenarios).length
+                        ? <pre>{asArray(optimizationSuggestion.gherkin_scenarios).join("\n\n")}</pre>
+                        : <span>No Gherkin scenarios returned.</span>}
+                    </div>
+                  ) : null}
                   </div>
                 ) : (
                   <div className="empty-state compact">
-                    Add prompt context, then generate a draft to review before any Jira requirement is created or updated.
+                    Add prompt context, then generate a draft to review before any Jira Story is created or updated.
                   </div>
                 )}
               </div>
@@ -4888,15 +5639,17 @@ export function RequirementsPage() {
               )}
 		              <button
                   className="primary-button"
-                  disabled={requirementAiMode === "create"
+                  disabled={isGeneratingGherkin || (requirementAiMode === "create"
                     ? !canCreateRequirements || !selectedRequirementCreationDraftCount || previewRequirementCreation.isPending || createRequirementGenerationJob.isPending || isRequirementCreationJobRunning || createRequirement.isPending || requirementCreateMetadataQuery.isLoading || requirementCreateMetadataQuery.isError
-                    : !canUpdateRequirements || !optimizationSuggestion || !Object.values(optimizationFields).some(Boolean) || updateRequirement.isPending}
+                    : !canUpdateRequirements || !optimizationSuggestion || !Object.values(optimizationFields).some(Boolean) || updateRequirement.isPending)}
                   onClick={() => void handleApplyRequirementOptimization()}
                   type="button"
                 >
-	                {updateRequirement.isPending || createRequirement.isPending
+	                {isGeneratingGherkin
+                    ? "Finishing Gherkin…"
+                    : updateRequirement.isPending || createRequirement.isPending
                     ? requirementAiMode === "create" ? "Creating…" : "Applying…"
-                    : requirementAiMode === "create" && requirementCreateMetadataQuery.isLoading ? "Checking Jira fields…" : requirementAiMode === "create" ? `Create selected requirements${selectedRequirementCreationDraftCount ? ` (${selectedRequirementCreationDraftCount})` : ""}` : "Apply selected"}
+                    : requirementAiMode === "create" && requirementCreateMetadataQuery.isLoading ? "Checking Jira fields…" : requirementAiMode === "create" ? `Create selected Stories${selectedRequirementCreationDraftCount ? ` (${selectedRequirementCreationDraftCount})` : ""}` : "Apply selected"}
               </button>
             </div>
           </div>
@@ -4914,10 +5667,10 @@ export function RequirementsPage() {
 	          disablePreview={!canUseRequirementAi || !aiRequirement || !appTypeId || previewDesignedCases.isPending || !integrations.length}
           dialogClassName="ai-design-modal--requirements"
           existingCases={associatedCases}
-          existingCasesSubtitle="These are already associated with the selected requirement in the current app type."
+          existingCasesSubtitle="These are already associated with the selected Story in the current app type."
           existingCasesTitle="Linked test cases"
           externalLinksText={aiExternalLinksText}
-          eyebrow="Requirements"
+          eyebrow="Stories"
           integrationId={integrationId}
           integrations={integrations}
           isAccepting={acceptDesignedCases.isPending}
@@ -4946,20 +5699,20 @@ export function RequirementsPage() {
           onPreviewMessageDismiss={() => setPreviewMessage("")}
           previewTone={previewTone}
           referenceImages={aiReferenceImages}
-          requirementHelpText="Select the requirement, shape the prompt, then review the AI-generated reusable cases before approving them."
-          requirementLabel="Requirement"
+          requirementHelpText="Select the Story, shape the prompt, then review the AI-generated reusable cases before approving them."
+          requirementLabel="Story"
           requirements={requirements}
           selectedRequirementIds={aiRequirement?.id ? [aiRequirement.id] : []}
         />
       ) : null}
 
       <AiInsightPreviewDialog
-        assuranceTitle="Requirement impact grounding"
-        emptyMessage="No linked downstream artifact was found for this requirement. Treat that as a coverage review item."
+        assuranceTitle="Story impact grounding"
+        emptyMessage="No linked downstream artifact was found for this Story. Treat that as a coverage review item."
         error={previewRequirementImpact.error instanceof Error ? previewRequirementImpact.error.message : null}
-        eyebrow="Requirement details"
+        eyebrow="Story details"
         findings={requirementImpactFindings}
-        gaps={previewRequirementImpact.data?.impact.test_cases.length ? [] : ["The requirement has no linked test case in the visible Jira scope."]}
+        gaps={asArray(previewRequirementImpact.data?.impact?.test_cases).length ? [] : ["The Story has no linked test case in the visible Jira scope."]}
         loading={previewRequirementImpact.isPending}
         onClose={() => setIsRequirementImpactPreviewOpen(false)}
         open={isRequirementImpactPreviewOpen}
@@ -4970,9 +5723,9 @@ export function RequirementsPage() {
           { label: "Linked tests", value: String(previewRequirementImpact.data.impact.totals.test_cases), tone: previewRequirementImpact.data.impact.totals.test_cases ? "positive" : "warning" },
           { label: "Affected runs", value: String(previewRequirementImpact.data.impact.totals.test_runs), tone: previewRequirementImpact.data.impact.totals.test_runs ? "warning" : "neutral" }
         ] : []}
-        subtitle={previewRequirementImpact.data ? `${previewRequirementImpact.data.requirement.display_id} · ${previewRequirementImpact.data.requirement.title}` : selectedRequirement?.title || "Selected requirement"}
+        subtitle={previewRequirementImpact.data ? `${previewRequirementImpact.data.requirement.display_id} · ${previewRequirementImpact.data.requirement.title}` : selectedRequirement?.title || "Selected Story"}
         summary={previewRequirementImpact.data?.explanation}
-        title="Preview requirement change impact"
+        title="Preview Story change impact"
       />
 
       {linkedPreviewCase ? (
@@ -5012,7 +5765,7 @@ function RequirementRelatedItemsPanel({
   };
 
   return (
-    <section className="requirement-related-panel" aria-label="Requirement related items">
+    <section className="requirement-related-panel" aria-label="Story related items">
       <div className="requirement-related-head">
         <div>
           <strong>Jira related items</strong>
@@ -5054,7 +5807,7 @@ function RequirementRelatedItemsPanel({
             </article>
           );
         })}
-        {!items.length ? <div className="empty-state compact">No Jira related items are visible for this requirement.</div> : null}
+        {!items.length ? <div className="empty-state compact">No Jira related items are visible for this Story.</div> : null}
       </div>
     </section>
   );
@@ -5238,6 +5991,7 @@ function RequirementLabelsField({
 function RequirementTestCasePicker({
   testCases,
   selectedIds,
+  selectedFallbackLabels = {},
   onToggle,
   emptyText,
   pickerClassName,
@@ -5253,6 +6007,7 @@ function RequirementTestCasePicker({
 }: {
   testCases: TestCase[];
   selectedIds: string[];
+  selectedFallbackLabels?: Record<string, string>;
   onToggle: (testCaseId: string, checked: boolean) => void;
   emptyText: string;
   pickerClassName?: string;
@@ -5269,6 +6024,8 @@ function RequirementTestCasePicker({
   const [statusFilter, setStatusFilter] = useState("all");
   const [priorityFilter, setPriorityFilter] = useState("all");
   const selectedSet = new Set(selectedIds);
+  const loadedTestCaseIds = new Set(testCases.map((testCase) => testCase.id));
+  const unresolvedSelectedIds = selectedIds.filter((testCaseId) => !loadedTestCaseIds.has(testCaseId));
   const normalizedSearch = searchTerm.trim().toLowerCase();
   const statusOptions = Array.from(new Set(testCases.map((testCase) => testCase.status || "draft").filter(Boolean))).sort((left, right) => left.localeCompare(right));
   const priorityOptions = Array.from(new Set(testCases.map((testCase) => String(testCase.priority ?? 3)))).sort((left, right) => Number(left) - Number(right));
@@ -5320,7 +6077,7 @@ function RequirementTestCasePicker({
         <label className="requirement-link-search-input">
           <SearchIcon />
           <input
-            placeholder="Search title, description, requirement, status, or priority"
+            placeholder="Search ID, title, description, status, or priority"
             value={searchTerm}
             onChange={(event) => onSearchTermChange(event.target.value)}
             onKeyDown={(event) => {
@@ -5401,11 +6158,38 @@ function RequirementTestCasePicker({
         </button>
 	      </div>
 
-      {!isSearchActive && !linkedTestCases.length ? (
+      {!isSearchActive && !linkedTestCases.length && !unresolvedSelectedIds.length ? (
         <div className="empty-state compact">Search to load reusable test cases.</div>
       ) : null}
 
       {shouldShowEmpty && isSearchActive ? <div className="empty-state compact">{testCases.length ? "No test cases match this search." : emptyText}</div> : null}
+
+      {unresolvedSelectedIds.length ? (
+        <div className="modal-case-picker requirement-link-picker">
+          {unresolvedSelectedIds.map((testCaseId) => {
+            const label = selectedFallbackLabels[testCaseId] || `Linked test case ${testCaseId}`;
+            return (
+              <div className="modal-case-option requirement-link-option is-linked is-compact" key={testCaseId}>
+                <div className="requirement-link-option-copy">
+                  <strong>{label}</strong>
+                  <span className="requirement-link-option-meta">Linked outside the bounded suggestion page · open the test-case workspace for full details</span>
+                </div>
+                <div className="requirement-link-actions">
+                  <button
+                    aria-label={`Unlink ${label}`}
+                    className="ghost-button requirement-link-toggle is-linked requirement-link-toggle--icon-only"
+                    onClick={() => onToggle(testCaseId, false)}
+                    title="Unlink test case"
+                    type="button"
+                  >
+                    <RequirementUnlinkIcon />
+                  </button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      ) : null}
 
       {orderedTestCases.length ? (
         <div className="modal-case-picker requirement-link-picker">

@@ -86,7 +86,7 @@ export function KnowledgeRepoPage() {
   });
   const testCasesQuery = useQuery({
     queryKey: ["knowledge-context-test-cases", appTypeId],
-    queryFn: () => api.testCases.list({ app_type_id: appTypeId }),
+    queryFn: () => api.testCases.list({ app_type_id: appTypeId, projection: "summary" }),
     enabled: Boolean(appTypeId)
   });
   const objectRepositoryQuery = useQuery({
@@ -190,7 +190,7 @@ export function KnowledgeRepoPage() {
       lines.push(`### ${testCase.title}`);
       lines.push(`- ID: ${testCase.display_id || testCase.id}`);
       lines.push(`- Status: ${testCase.status || "unknown"}`);
-      lines.push(`- Automated: ${testCase.automated || "no"}`);
+      lines.push(`- Automated: ${testCase.automated === "yes" ? "yes" : "no"}`);
       if (testCase.description) {
         lines.push(`- Description: ${testCase.description}`);
       }
@@ -221,10 +221,10 @@ export function KnowledgeRepoPage() {
       const sections = [
         "# QAira Application Context Pack",
         "",
-        "Use this as retrieval context for local LLM/manual case generation, requirement maturation, automation generation, and locator repair.",
+        "Use this as retrieval context for local LLM/manual case generation, story maturation, automation generation, and locator repair.",
         "",
         "## RAG Agent Operating Model",
-        "- Requirements define product intent and acceptance criteria.",
+        "- Stories define product intent and acceptance criteria.",
         "- Manual cases describe business workflows and expected outcomes.",
         "- Automated cases provide executable keyword steps, variables, APIs, and locator usage.",
         "- Object repository records are execution-time locator truth; prefer target locator first, DOM/accessibility structure second, screenshot fallback last.",
@@ -233,7 +233,7 @@ export function KnowledgeRepoPage() {
       ];
 
       if (contextSources.requirements) {
-        sections.push("## Requirements");
+        sections.push("## Stories");
         requirements.slice(0, 120).forEach((requirement: any) => {
           sections.push(`### ${requirement.title}`);
           sections.push(`- ID: ${requirement.display_id || requirement.id}`);
@@ -281,7 +281,7 @@ export function KnowledgeRepoPage() {
 
       const response = await createKnowledge.mutateAsync({
         title: `Application context pack ${new Date().toLocaleDateString()}`,
-        description: "Auto-built RAG context from requirements, cases, automation, object repository, APIs, and documents.",
+        description: "Auto-built RAG context from stories, cases, automation, object repository, APIs, and documents.",
         content_type: "markdown",
         content: sections.join("\n"),
         metadata: {
@@ -341,11 +341,11 @@ export function KnowledgeRepoPage() {
             <div className="agent-context-cockpit">
               <div>
                 <h2>Build an application-aware RAG pack</h2>
-                <p>Package selected requirements, manual cases, automated keyword steps, object repository fields, API notes, and document guidance into one active knowledge item. Local LLM integrations can then use the same context to mature requirements, design manual cases, generate automation, and repair locators.</p>
-                <div className="agent-context-metrics">
+                <p>Package selected stories, manual cases, automated keyword steps, object repository fields, API notes, and document guidance into one active knowledge item. Local LLM integrations can then use the same context to mature stories, design manual cases, generate automation, and repair locators.</p>
+                <div className="agent-context-metrics metric-strip page-metric-strip" aria-label="Available application context" role="group">
                   <div className="mini-card">
                     <strong>{requirements.length}</strong>
-                    <span>Requirements</span>
+                    <span>Stories</span>
                   </div>
                   <div className="mini-card">
                     <strong>{manualCases.length}</strong>
@@ -367,7 +367,7 @@ export function KnowledgeRepoPage() {
               </div>
               <div className="agent-context-source-grid">
                 {([
-                  ["requirements", "Requirements"],
+                  ["requirements", "Stories"],
                   ["manualCases", "Manual cases and steps"],
                   ["automatedCases", "Automated keyword steps"],
                   ["objectRepository", "Object repository and locators"],
@@ -412,7 +412,7 @@ export function KnowledgeRepoPage() {
             </button>
           </div>
 
-          <Panel title="Knowledge items" subtitle="Active entries are retrieved by AI generation, requirement completion, automation build, and locator repair flows.">
+          <Panel title="Knowledge items" subtitle="Active entries are retrieved by AI generation, story completion, automation build, and locator repair flows.">
             <DataTable
               rows={items}
               columns={[

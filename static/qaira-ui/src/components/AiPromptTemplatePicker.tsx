@@ -211,7 +211,7 @@ export function AiPromptTemplatePicker({
                     <div className="panel-title-row">
                       <p className="eyebrow">Add new prompt</p>
                       <InfoTooltip
-                        content="Capture the repeatable prompt shape once, then reuse it from Requirements and Test Cases."
+                        content="Capture the repeatable prompt shape once, then reuse it from Stories and Test Cases."
                         label="Add prompt information"
                       />
                     </div>

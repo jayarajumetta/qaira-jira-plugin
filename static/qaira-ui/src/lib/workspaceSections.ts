@@ -29,7 +29,7 @@ export const DASHBOARD_SECTION_ITEMS: WorkspaceSectionItem[] = [
 ];
 
 export const TEST_AUTHORING_SECTION_ITEMS: WorkspaceSectionItem[] = [
-  { to: "/requirements", label: "Requirements", shortLabel: "Reqs", icon: "requirements", featureKeys: ["qaira.manual.requirements"] },
+  { to: "/requirements", label: "Stories", shortLabel: "Stories", icon: "requirements", featureKeys: ["qaira.manual.requirements"] },
   { to: "/test-cases", label: "Cases", shortLabel: "Cases", icon: "cases", featureKeys: ["qaira.manual.test_cases"] },
   { to: "/shared-steps", label: "Shared Steps", shortLabel: "Shared", icon: "shared", featureKeys: ["qaira.manual.suites"] },
   { to: "/design", label: "Suites", shortLabel: "Suites", icon: "suites", featureKeys: ["qaira.manual.suites"] }
@@ -67,7 +67,7 @@ export const TEST_RUNS_SECTION_ITEMS: WorkspaceSectionItem[] = [
 export const WORKSPACE_PAGE_LABELS: Record<string, string> = {
   "/": "Home",
   "/projects": "Projects",
-  "/requirements": "Requirements",
+  "/requirements": "Stories",
   "/test-cases": "Cases",
   "/shared-steps": "Shared Step Groups",
   "/design": "Suites",

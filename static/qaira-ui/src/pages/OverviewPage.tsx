@@ -14,6 +14,7 @@ import { useCurrentProject } from "../hooks/useCurrentProject";
 import { useFeatureFlags } from "../hooks/useFeatureFlags";
 import { useWorkspaceData } from "../hooks/useWorkspaceData";
 import { api } from "../lib/api";
+import { asArray } from "../lib/collectionGuards";
 import { areFeatureFlagsEnabled } from "../lib/featureFlags";
 import { canAccessPath, hasPermission } from "../lib/permissions";
 import type { ExecutionResult } from "../types";
@@ -56,6 +57,7 @@ const DEFAULT_ANALYTICS_LAYOUT: AnalyticsLayout = {
   order: ANALYTICS_SECTIONS.map((section) => section.id),
   hidden: []
 };
+const WORKSPACE_ANALYTICS_SAMPLE_LIMIT = 100;
 
 function normalizeAnalyticsLayout(value: unknown): AnalyticsLayout {
   const candidate = value && typeof value === "object" ? value as Partial<AnalyticsLayout> : {};
@@ -327,13 +329,13 @@ function QualityAnalyticsDashboard() {
     testCasesProjection: "summary"
   });
 
-  const projectsList = projects.data || [];
-  const appTypesListRaw = appTypes.data || [];
-  const requirementsListRaw = requirements.data || [];
-  const suitesListRaw = testSuites.data || [];
-  const testCasesListRaw = testCases.data || [];
-  const executionsListRaw = executions.data || [];
-  const executionResultsListRaw = executionResults.data || [];
+  const projectsList = asArray(projects.data);
+  const appTypesListRaw = asArray(appTypes.data);
+  const requirementsListRaw = asArray(requirements.data);
+  const suitesListRaw = asArray(testSuites.data);
+  const testCasesListRaw = asArray(testCases.data);
+  const executionsListRaw = asArray(executions.data);
+  const executionResultsListRaw = asArray(executionResults.data);
   const activeProjectId = projectId || projectsList[0]?.id || "";
   const qualityInsightPreview = useMutation({
     mutationFn: (activeProject: string) => api.ai.qualityInsights({ project_id: activeProject })
@@ -353,7 +355,7 @@ function QualityAnalyticsDashboard() {
     [activeAppTypeIds, suitesListRaw]
   );
   const testCasesList = useMemo(
-    () => testCasesListRaw.filter((testCase) => testCase.app_type_id && activeAppTypeIds.has(testCase.app_type_id)),
+    () => testCasesListRaw.filter((testCase) => !testCase.app_type_id || activeAppTypeIds.has(testCase.app_type_id)),
     [activeAppTypeIds, testCasesListRaw]
   );
   const executionsList = useMemo(
@@ -370,9 +372,32 @@ function QualityAnalyticsDashboard() {
     [executionResultsList]
   );
 
-  const caseStepCountById = useMemo(() => {
-    return Object.fromEntries(testCasesList.map((testCase) => [testCase.id, Number(testCase.step_count || 0)]));
+  const caseStepCountById = useMemo<Record<string, number | undefined>>(() => {
+    return Object.fromEntries(testCasesList.map((testCase) => [
+      testCase.id,
+      Number.isFinite(testCase.step_count) ? Number(testCase.step_count) : undefined
+    ]));
   }, [testCasesList]);
+  const knownStepCaseCount = useMemo(
+    () => testCasesList.filter((testCase) => Number.isFinite(caseStepCountById[testCase.id])).length,
+    [caseStepCountById, testCasesList]
+  );
+  const knownAutomationCaseCount = useMemo(
+    () => testCasesList.filter((testCase) => testCase.automated === "yes" || testCase.automated === "no").length,
+    [testCasesList]
+  );
+  const manualCasesCount = useMemo(
+    () => testCasesList.filter((testCase) => testCase.automated === "no").length,
+    [testCasesList]
+  );
+  const hasIncompleteAnalyticsScope = requirementsListRaw.length >= WORKSPACE_ANALYTICS_SAMPLE_LIMIT
+    || testCasesListRaw.length >= WORKSPACE_ANALYTICS_SAMPLE_LIMIT
+    || testCasesList.some((testCase) =>
+      !testCase.app_type_id
+      || !Number.isFinite(testCase.step_count)
+      || (testCase.automated !== "yes" && testCase.automated !== "no")
+      || (testCase.detail_complete === false && testCase.summary_complete !== true)
+    );
 
   const executionSummaryById = useMemo(() => {
     const summary: Record<string, typeof EMPTY_EXECUTION_SUMMARY> = {};
@@ -418,12 +443,12 @@ function QualityAnalyticsDashboard() {
   );
 
   const designCompleteness = useMemo(() => {
-    if (!testCasesList.length) {
+    if (!knownStepCaseCount) {
       return 0;
     }
 
-    return Math.round((casesWithStepsCount / testCasesList.length) * 100);
-  }, [casesWithStepsCount, testCasesList]);
+    return Math.round((casesWithStepsCount / knownStepCaseCount) * 100);
+  }, [casesWithStepsCount, knownStepCaseCount]);
 
   const automatedCasesCount = useMemo(
     () => testCasesList.filter((testCase) => testCase.automated === "yes").length,
@@ -431,12 +456,12 @@ function QualityAnalyticsDashboard() {
   );
 
   const automationCoverage = useMemo(() => {
-    if (!testCasesList.length) {
+    if (!knownAutomationCaseCount) {
       return 0;
     }
 
-    return Math.round((automatedCasesCount / testCasesList.length) * 100);
-  }, [automatedCasesCount, testCasesList.length]);
+    return Math.round((automatedCasesCount / knownAutomationCaseCount) * 100);
+  }, [automatedCasesCount, knownAutomationCaseCount]);
 
   const automatedExecutions = useMemo(
     () => executionsList.filter((execution) => execution.trigger === "ci" || execution.trigger === "local"),
@@ -543,11 +568,11 @@ function QualityAnalyticsDashboard() {
 
   const casesWithoutSteps = useMemo(() => {
     return testCasesList
-      .filter((testCase) => !(caseStepCountById[testCase.id] || 0))
+      .filter((testCase) => caseStepCountById[testCase.id] === 0)
       .sort((left, right) => (left.priority ?? 3) - (right.priority ?? 3) || left.title.localeCompare(right.title))
       .slice(0, 6);
   }, [caseStepCountById, testCasesList]);
-  const casesMissingStepsCount = Math.max(testCasesList.length - casesWithStepsCount, 0);
+  const casesMissingStepsCount = Math.max(knownStepCaseCount - casesWithStepsCount, 0);
 
   const recentExecutions = useMemo(() => {
     return [...executionsList]
@@ -566,8 +591,8 @@ function QualityAnalyticsDashboard() {
       {
         id: "coverage",
         title: "Close coverage gaps",
-        detail: "Map missing requirements to reusable cases or AI-assisted drafts before the next review.",
-        meta: `${coverageGapCount} uncovered requirement${coverageGapCount === 1 ? "" : "s"}`,
+        detail: "Map missing stories to reusable cases or AI-assisted drafts before the next review.",
+        meta: `${coverageGapCount} uncovered ${coverageGapCount === 1 ? "story" : "stories"}`,
         to: "/requirements",
         tone: coverageGapCount ? "error" as const : "success" as const
       },
@@ -591,7 +616,7 @@ function QualityAnalyticsDashboard() {
         id: "automation",
         title: "Expand automation reach",
         detail: "Prioritize stable, repeatable cases that can reduce manual execution effort without weakening review controls.",
-        meta: `${Math.max(testCasesList.length - automatedCasesCount, 0)} automation candidate${testCasesList.length - automatedCasesCount === 1 ? "" : "s"}`,
+        meta: `${manualCasesCount} automation candidate${manualCasesCount === 1 ? "" : "s"}`,
         to: "/automation",
         tone: automationCoverage >= 70 ? "success" as const : "info" as const
       }] : []),
@@ -604,7 +629,7 @@ function QualityAnalyticsDashboard() {
         tone: executionStatusCounts.failed ? "error" as const : executionStatusCounts.running ? "info" as const : "success" as const
       }
     ];
-  }, [automatedCasesCount, automationCoverage, canViewAutomationAnalytics, casesMissingStepsCount, coverageGapCount, executionStatusCounts.failed, executionStatusCounts.running, suitesList.length, testCasesList.length]);
+  }, [automationCoverage, canViewAutomationAnalytics, casesMissingStepsCount, coverageGapCount, executionStatusCounts.failed, executionStatusCounts.running, manualCasesCount, suitesList.length]);
   const visibleQuickActions = useMemo(
     () => quickActions.filter((action) => canAccessPath(session, action.to)),
     [quickActions, session]
@@ -616,8 +641,8 @@ function QualityAnalyticsDashboard() {
         id: "scope",
         eyebrow: "Scope map",
         value: compactNumberFormatter.format(requirementsList.length),
-        title: "Requirements and app surfaces stay anchored to active product scope.",
-        description: "Projects, app types, and mapped requirements define the QA surface the rest of the workspace builds on.",
+        title: "Stories and app surfaces stay anchored to active product scope.",
+        description: "Projects, app types, and mapped stories define the QA surface the rest of the workspace builds on.",
         tone: requirementCoverage >= 80 ? "success" as const : requirementsList.length ? "info" as const : "neutral" as const,
         chipLabel: `${requirementCoverage}% mapped`,
         stats: [
@@ -690,7 +715,7 @@ function QualityAnalyticsDashboard() {
     const requirementItems = coverageGaps.slice(0, 3).map((requirement) => ({
       id: `requirement-${requirement.id}`,
       title: requirement.title,
-      detail: `Priority P${requirement.priority ?? 3} requirement still has no reusable test coverage attached.`,
+      detail: `Priority P${requirement.priority ?? 3} story still has no reusable test coverage attached.`,
       label: "Design coverage",
       tone: (requirement.priority ?? 3) <= 2 ? "error" as const : "info" as const,
       to: "/requirements"
@@ -859,7 +884,7 @@ function QualityAnalyticsDashboard() {
     return [
       {
         id: "requirements",
-        label: "Requirements",
+        label: "Stories",
         value: requirementsList.length,
         detail: "Product scope tracked in QAira",
         chipLabel: "Scope",
@@ -911,7 +936,7 @@ function QualityAnalyticsDashboard() {
   const commandSignals = useMemo(() => {
     return [
       {
-        label: "Requirement coverage",
+        label: "Story coverage",
         value: requirementCoverage,
         detail: `${mappedRequirementsCount}/${requirementsList.length || 0} mapped to reusable cases`,
         tone: requirementCoverage >= 80 ? "success" as const : "info" as const
@@ -919,7 +944,7 @@ function QualityAnalyticsDashboard() {
       {
         label: "Design completeness",
         value: designCompleteness,
-        detail: `${casesWithStepsCount}/${testCasesList.length || 0} cases have executable steps`,
+        detail: `${casesWithStepsCount}/${knownStepCaseCount || 0} verified cases have executable steps`,
         tone: designCompleteness >= 70 ? "success" as const : "info" as const
       },
       {
@@ -929,11 +954,11 @@ function QualityAnalyticsDashboard() {
         tone: resultStatusCounts.failed ? "danger" as const : passRate >= 80 ? "success" as const : "info" as const
       }
     ];
-  }, [casesWithStepsCount, designCompleteness, mappedRequirementsCount, passRate, requirementCoverage, requirementsList.length, resultStatusCounts.blocked, resultStatusCounts.failed, resultStatusCounts.running, testCasesList.length]);
+  }, [casesWithStepsCount, designCompleteness, knownStepCaseCount, mappedRequirementsCount, passRate, requirementCoverage, requirementsList.length, resultStatusCounts.blocked, resultStatusCounts.failed, resultStatusCounts.running]);
 
   const topRecommendation = useMemo(() => {
     if (coverageGaps.length) {
-      return `${coverageGapCount} requirement${coverageGapCount === 1 ? "" : "s"} still need reusable coverage before this dashboard becomes release-grade.`;
+      return `${coverageGapCount} ${coverageGapCount === 1 ? "story" : "stories"} still need reusable coverage before this dashboard becomes release-grade.`;
     }
 
     if (casesMissingStepsCount) {
@@ -953,7 +978,9 @@ function QualityAnalyticsDashboard() {
 
   const openRiskCount = coverageGapCount + casesMissingStepsCount + resultStatusCounts.failed + resultStatusCounts.blocked + executionStatusCounts.failed;
   const releaseBlockerCount = resultStatusCounts.failed + resultStatusCounts.blocked + executionStatusCounts.failed;
-  const releaseStateLabel = releaseReadinessScore >= 85 ? "Release Ready" : releaseReadinessScore >= 65 ? "Needs Hardening" : "At Risk";
+  const releaseStateLabel = hasIncompleteAnalyticsScope
+    ? "Provisional score"
+    : releaseReadinessScore >= 85 ? "Release Ready" : releaseReadinessScore >= 65 ? "Needs Hardening" : "At Risk";
   const releaseHeadline = releaseReadinessScore >= 85
     ? "Ready for release review"
     : releaseReadinessScore >= 65
@@ -963,17 +990,22 @@ function QualityAnalyticsDashboard() {
   const releaseRingStyle = { "--score": releaseReadinessScore } as CSSProperties;
   const canViewQualityInsights = hasPermission(session, "quality_insight.view")
     && areFeatureFlagsEnabled(featureFlagsQuery.data, ["qaira.ai.quality_insights"]);
+  const qualityInsightItems = asArray(qualityInsightPreview.data?.insights);
+  const qualityInsightEvidence = asArray(qualityInsightPreview.data?.provenance?.evidence);
+  const qualityInsightLimitations = asArray(qualityInsightPreview.data?.limitations);
   const qualityInsightFindings = useMemo<AiPreviewFinding[]>(
-    () => (qualityInsightPreview.data?.insights || []).map((insight) => ({
+    () => qualityInsightItems.map((insight) => {
+      const evidence = asArray(insight.evidence);
+      return ({
       id: insight.id,
       title: insight.title,
       severity: insight.severity,
       description: insight.explanation,
       action: insight.recommended_action,
-      meta: `${insight.evidence.length} Jira record${insight.evidence.length === 1 ? "" : "s"} in this signal`,
-      evidence: insight.evidence.map((item) => item.display_id || item.id).filter(Boolean)
-    })),
-    [qualityInsightPreview.data]
+      meta: `${evidence.length} Jira record${evidence.length === 1 ? "" : "s"} in this signal`,
+      evidence: evidence.map((item) => item.display_id || item.id).filter(Boolean)
+    }); }),
+    [qualityInsightItems]
   );
 
   const openQualityInsightPreview = () => {
@@ -994,13 +1026,13 @@ function QualityAnalyticsDashboard() {
       explanation: "Readiness combines coverage, design completeness, and recent execution confidence. Failed or blocked evidence lowers the score; automation adoption does not raise it.",
       calculation: `35% traceability + 25% design completeness + 40% latest pass confidence − ${releaseRiskPenalty} point blocker penalty`,
       signals: [
-        { label: "Requirement traceability", value: `${requirementCoverage}%`, detail: `${mappedRequirementsCount} of ${requirementsList.length} requirements have linked cases.`, tone: requirementCoverage >= 80 ? "success" : "info" },
-        { label: "Design completeness", value: `${designCompleteness}%`, detail: `${casesWithStepsCount} of ${testCasesList.length} cases contain executable steps.`, tone: designCompleteness >= 70 ? "success" : "info" },
+        { label: "Story traceability", value: `${requirementCoverage}%`, detail: `${mappedRequirementsCount} of ${requirementsList.length} stories have linked cases.`, tone: requirementCoverage >= 80 ? "success" : "info" },
+        { label: "Design completeness", value: `${designCompleteness}%`, detail: `${casesWithStepsCount} of ${knownStepCaseCount} verified cases contain executable steps.`, tone: designCompleteness >= 70 ? "success" : "info" },
         { label: "Latest pass confidence", value: `${latestPassRate}%`, detail: latestExecutionSummary.total ? `${latestExecutionSummary.total} results in the latest run.` : "Using the latest result per run and case.", tone: latestPassRate >= 80 ? "success" : latestFailedSignals ? "error" : "neutral" },
         { label: "Blocker penalty", value: `−${releaseRiskPenalty}`, detail: `${latestFailedSignals} latest failed/blocked results and ${executionStatusCounts.failed} failed runs.`, tone: releaseRiskPenalty ? "error" : "success" }
       ],
       actions: [
-        coverageGapCount ? `Link test coverage to ${coverageGapCount} uncovered requirement${coverageGapCount === 1 ? "" : "s"}.` : "Keep requirement-to-test links current as scope changes.",
+        coverageGapCount ? `Link test coverage to ${coverageGapCount} uncovered ${coverageGapCount === 1 ? "story" : "stories"}.` : "Keep story-to-test links current as scope changes.",
         casesMissingStepsCount ? `Complete steps for ${casesMissingStepsCount} unfinished test design${casesMissingStepsCount === 1 ? "" : "s"}.` : "Preserve executable test design as cases evolve.",
         releaseBlockerCount ? `Triage ${releaseBlockerCount} failed or blocked release signal${releaseBlockerCount === 1 ? "" : "s"}.` : "Review the evidence with the release owner before the final decision."
       ]
@@ -1008,14 +1040,14 @@ function QualityAnalyticsDashboard() {
     requirements: {
       id: "requirements",
       category: "Traceability metric",
-      title: "Requirement coverage",
+      title: "Story coverage",
       value: `${requirementCoverage}%`,
       verdict: requirementCoverage >= 80 ? "Scope is broadly traceable" : "Scope has material evidence gaps",
       explanation: "This indicates how much tracked product scope has at least one linked reusable test case. It measures linkage, not test quality or execution success.",
-      calculation: `${mappedRequirementsCount} linked requirements ÷ ${requirementsList.length || 0} tracked requirements`,
+      calculation: `${mappedRequirementsCount} linked stories ÷ ${requirementsList.length || 0} tracked stories`,
       signals: [
-        { label: "Linked", value: String(mappedRequirementsCount), detail: "Requirements with one or more test case links.", tone: "success" },
-        { label: "Uncovered", value: String(coverageGapCount), detail: "Requirements with no linked reusable test case.", tone: coverageGapCount ? "error" : "success" }
+        { label: "Linked", value: String(mappedRequirementsCount), detail: "Stories with one or more test case links.", tone: "success" },
+        { label: "Uncovered", value: String(coverageGapCount), detail: "Stories with no linked reusable test case.", tone: coverageGapCount ? "error" : "success" }
       ],
       actions: [coverageGapCount ? "Start with uncovered P1/P2 scope, then attach reusable cases or create a reviewed draft." : "Audit links when stories, releases, or sprints change."]
     },
@@ -1026,7 +1058,7 @@ function QualityAnalyticsDashboard() {
       value: `${designCompleteness}%`,
       verdict: designCompleteness >= 70 ? "Most cases can produce run evidence" : "Too many cases are not execution-ready",
       explanation: "This measures whether reusable cases contain steps. It is intentionally separate from automation coverage: a manual case with strong steps can still provide valid evidence.",
-      calculation: `${casesWithStepsCount} cases with steps ÷ ${testCasesList.length || 0} total cases`,
+      calculation: `${casesWithStepsCount} cases with steps ÷ ${knownStepCaseCount || 0} cases with verified step summaries`,
       signals: [
         { label: "Run ready", value: String(casesWithStepsCount), detail: "Cases with one or more steps.", tone: "success" },
         { label: "Incomplete", value: String(casesMissingStepsCount), detail: "Cases that cannot yet produce step-level evidence.", tone: casesMissingStepsCount ? "info" : "success" }
@@ -1054,10 +1086,10 @@ function QualityAnalyticsDashboard() {
       title: "Open quality risks",
       value: String(openRiskCount),
       verdict: releaseBlockerCount ? "Release-blocking evidence needs attention" : openRiskCount ? "Design and traceability debt remains" : "No dominant quality risk is visible",
-      explanation: "This is an action count across uncovered requirements, incomplete test design, failed or blocked results, and failed runs. It is not a count of unique Jira issues.",
+      explanation: "This is an action count across uncovered stories, incomplete test design, failed or blocked results, and failed runs. It is not a count of unique Jira issues.",
       calculation: `${coverageGapCount} coverage gaps + ${casesMissingStepsCount} design gaps + ${resultStatusCounts.failed} failed results + ${resultStatusCounts.blocked} blocked results + ${executionStatusCounts.failed} failed runs`,
       signals: [
-        { label: "Coverage gaps", value: String(coverageGapCount), detail: "Tracked requirements without linked cases.", tone: coverageGapCount ? "info" : "success" },
+        { label: "Coverage gaps", value: String(coverageGapCount), detail: "Tracked stories without linked cases.", tone: coverageGapCount ? "info" : "success" },
         { label: "Design gaps", value: String(casesMissingStepsCount), detail: "Cases without executable steps.", tone: casesMissingStepsCount ? "info" : "success" },
         { label: "Release blockers", value: String(releaseBlockerCount), detail: "Failed/blocked results plus failed runs.", tone: releaseBlockerCount ? "error" : "success" }
       ],
@@ -1070,7 +1102,7 @@ function QualityAnalyticsDashboard() {
       value: `${automationCoverage}%`,
       verdict: automationCoverage >= 70 ? "Automation reaches most reusable cases" : "Automation reach is still selective",
       explanation: "Automation coverage measures operational leverage. It is permission- and feature-gated and does not contribute to the release-readiness score.",
-      calculation: `${automatedCasesCount} automated cases ÷ ${testCasesList.length || 0} total cases`,
+      calculation: `${automatedCasesCount} automated cases ÷ ${knownAutomationCaseCount || 0} cases with a verified execution type`,
       signals: [
         { label: "Automated cases", value: String(automatedCasesCount), detail: "Cases explicitly marked automated.", tone: automationCoverage >= 70 ? "success" : "info" },
         { label: "Automated runs", value: String(automatedExecutions.length), detail: "Runs triggered through CI or the local automation agent.", tone: automatedExecutions.length ? "success" : "neutral" },
@@ -1078,7 +1110,7 @@ function QualityAnalyticsDashboard() {
       ],
       actions: ["Automate stable, repeatable cases with clear assertions first; keep human review for release decisions."]
     }
-  }), [automatedCasesCount, automatedExecutions.length, automatedLatestResults.length, automatedPassRate, automationCoverage, casesMissingStepsCount, casesWithStepsCount, coverageGapCount, designCompleteness, executionStatusCounts.failed, latestExecutionSummary.blocked, latestExecutionSummary.failed, latestExecutionSummary.passed, latestExecutionSummary.total, latestFailedSignals, latestPassRate, mappedRequirementsCount, openRiskCount, releaseBlockerCount, releaseHeadline, releaseReadinessScore, releaseRiskPenalty, requirementCoverage, requirementsList.length, resultStatusCounts.blocked, resultStatusCounts.failed, resultStatusCounts.passed, resultStatusCounts.total, testCasesList.length]);
+  }), [automatedCasesCount, automatedExecutions.length, automatedLatestResults.length, automatedPassRate, automationCoverage, casesMissingStepsCount, casesWithStepsCount, coverageGapCount, designCompleteness, executionStatusCounts.failed, knownAutomationCaseCount, knownStepCaseCount, latestExecutionSummary.blocked, latestExecutionSummary.failed, latestExecutionSummary.passed, latestExecutionSummary.total, latestFailedSignals, latestPassRate, mappedRequirementsCount, openRiskCount, releaseBlockerCount, releaseHeadline, releaseReadinessScore, releaseRiskPenalty, requirementCoverage, requirementsList.length, resultStatusCounts.blocked, resultStatusCounts.failed, resultStatusCounts.passed, resultStatusCounts.total]);
 
   const layoutStorageKey = `qaira-ui.analytics-layout.v1:${activeProjectId || "unselected"}`;
   useEffect(() => {
@@ -1139,6 +1171,12 @@ function QualityAnalyticsDashboard() {
         </div>
       </header>
 
+      {hasIncompleteAnalyticsScope ? (
+        <div className="inline-message" role="status">
+          Portfolio metrics are provisional. QAira is using a bounded 100-record summary sample and excludes legacy cases with unknown step or execution-type metadata from percentage denominators. Open and save legacy cases to backfill their compact summary.
+        </div>
+      ) : null}
+
       <div className="quality-analytics-sections">
       {sectionVisible("decision") ? (
         <AnalyticsSection
@@ -1148,7 +1186,7 @@ function QualityAnalyticsDashboard() {
           order={sectionOrder("decision")}
           title={sectionDefinition("decision").title}
         >
-      <div className="health-grid" aria-label="Project health overview">
+      <div className="health-grid metric-strip page-metric-strip" aria-label="Project health overview" role="group">
         <button aria-haspopup="dialog" className="health-card release-card metric-evidence-trigger" onClick={() => setSelectedMetricEvidence(metricEvidence.readiness)} type="button">
           <div className="health-card-head">
             <span>Release Readiness</span>
@@ -1168,7 +1206,7 @@ function QualityAnalyticsDashboard() {
         </button>
 
         <button aria-haspopup="dialog" className="stat-card metric-evidence-trigger" onClick={() => setSelectedMetricEvidence(metricEvidence.requirements)} type="button">
-          <span>Requirement Coverage</span>
+          <span>Story Coverage</span>
           <strong>{requirementCoverage}%</strong>
           <small>{mappedRequirementsCount} / {requirementsList.length || 0} mapped</small>
           <i className="meter"><em style={healthMeterStyle(requirementCoverage)} /></i>
@@ -1178,7 +1216,7 @@ function QualityAnalyticsDashboard() {
         <button aria-haspopup="dialog" className="stat-card info metric-evidence-trigger" onClick={() => setSelectedMetricEvidence(metricEvidence.design)} type="button">
           <span>Design Completeness</span>
           <strong>{designCompleteness}%</strong>
-          <small>{casesWithStepsCount} / {testCasesList.length || 0} cases with steps</small>
+          <small>{casesWithStepsCount} / {knownStepCaseCount || 0} verified cases with steps</small>
           <i className="meter"><em style={healthMeterStyle(designCompleteness)} /></i>
           <span className="metric-evidence-hint">Why this matters?</span>
         </button>
@@ -1435,13 +1473,13 @@ function QualityAnalyticsDashboard() {
           title={sectionDefinition("automation").title}
         >
           <Panel className="automation-analytics-panel" title="Automation reach and reliability" subtitle="Restricted to automation-enabled roles and projects. These operational metrics are excluded from release-readiness scoring.">
-            <div className="automation-analytics-grid">
+            <div className="automation-analytics-grid metric-strip page-metric-strip" aria-label="Automation metrics" role="group">
               <button aria-haspopup="dialog" className="automation-analytics-card metric-evidence-trigger" onClick={() => setSelectedMetricEvidence(metricEvidence.automation)} type="button">
-                <span>Case coverage</span><strong>{automationCoverage}%</strong><small>{automatedCasesCount} of {testCasesList.length} cases marked automated</small><i className="meter"><em style={healthMeterStyle(automationCoverage)} /></i><span className="metric-evidence-hint">View evidence</span>
+                <span>Case coverage</span><strong>{automationCoverage}%</strong><small>{automatedCasesCount} of {knownAutomationCaseCount} verified cases marked automated</small><i className="meter"><em style={healthMeterStyle(automationCoverage)} /></i><span className="metric-evidence-hint">View evidence</span>
               </button>
               <button aria-haspopup="dialog" className="automation-analytics-card metric-evidence-trigger" onClick={() => setSelectedMetricEvidence(metricEvidence.automation)} type="button"><span>Automated runs</span><strong>{automatedExecutions.length}</strong><small>CI and local-agent executions in the active project</small><span className="metric-evidence-hint">View context</span></button>
               <button aria-haspopup="dialog" className="automation-analytics-card metric-evidence-trigger" onClick={() => setSelectedMetricEvidence(metricEvidence.automation)} type="button"><span>Automated pass rate</span><strong>{automatedPassRate}%</strong><small>{automatedLatestResults.length} latest automated result{automatedLatestResults.length === 1 ? "" : "s"}</small><span className="metric-evidence-hint">View evidence</span></button>
-              <button aria-haspopup="dialog" className="automation-analytics-card metric-evidence-trigger" onClick={() => setSelectedMetricEvidence(metricEvidence.automation)} type="button"><span>Candidate backlog</span><strong>{Math.max(testCasesList.length - automatedCasesCount, 0)}</strong><small>Non-automated cases; prioritize by stability and repeatability</small><span className="metric-evidence-hint">View guidance</span></button>
+              <button aria-haspopup="dialog" className="automation-analytics-card metric-evidence-trigger" onClick={() => setSelectedMetricEvidence(metricEvidence.automation)} type="button"><span>Candidate backlog</span><strong>{manualCasesCount}</strong><small>Verified manual cases; prioritize by stability and repeatability</small><span className="metric-evidence-hint">View guidance</span></button>
             </div>
           </Panel>
         </AnalyticsSection>
@@ -1520,16 +1558,16 @@ function QualityAnalyticsDashboard() {
         error={qualityInsightPreview.error instanceof Error ? qualityInsightPreview.error.message : null}
         eyebrow="Quality command center"
         findings={qualityInsightFindings}
-        gaps={qualityInsightPreview.data?.provenance.evidence.length ? [] : ["No Jira evidence reference was available for this preview."]}
-        limitations={qualityInsightPreview.data?.limitations || []}
+        gaps={qualityInsightEvidence.length ? [] : ["No Jira evidence reference was available for this preview."]}
+        limitations={qualityInsightLimitations}
         loading={qualityInsightPreview.isPending}
         onClose={() => setIsQualityInsightPreviewOpen(false)}
         open={isQualityInsightPreviewOpen}
         recommendedActions={qualityInsightFindings.map((finding) => finding.action).filter((action): action is string => Boolean(action))}
         response={qualityInsightPreview.data}
         signals={qualityInsightPreview.data ? [
-          { label: "Portfolio rules", value: `${qualityInsightPreview.data.insights.length} signal${qualityInsightPreview.data.insights.length === 1 ? "" : "s"}`, tone: qualityInsightPreview.data.insights.some((insight) => insight.severity === "high") ? "warning" : "neutral" },
-          { label: "Jira evidence", value: `${qualityInsightPreview.data.provenance.evidence.length} reference${qualityInsightPreview.data.provenance.evidence.length === 1 ? "" : "s"}`, tone: qualityInsightPreview.data.provenance.evidence.length ? "positive" : "warning" },
+          { label: "Portfolio rules", value: `${qualityInsightItems.length} signal${qualityInsightItems.length === 1 ? "" : "s"}`, tone: qualityInsightItems.some((insight) => insight.severity === "high") ? "warning" : "neutral" },
+          { label: "Jira evidence", value: `${qualityInsightEvidence.length} reference${qualityInsightEvidence.length === 1 ? "" : "s"}`, tone: qualityInsightEvidence.length ? "positive" : "warning" },
           { label: "Decision", value: "Human owned", tone: "warning" }
         ] : []}
         subtitle={`Read-only, deterministic signals for ${selectedProject?.name || "the selected Jira project"}.`}

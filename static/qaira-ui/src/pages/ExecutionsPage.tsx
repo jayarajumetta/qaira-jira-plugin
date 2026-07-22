@@ -50,6 +50,7 @@ import { useCurrentAppType, useCurrentProject } from "../hooks/useCurrentProject
 import { useFeatureFlags } from "../hooks/useFeatureFlags";
 import { api } from "../lib/api";
 import { assessRunEvidenceReadiness } from "../lib/aiAssurance";
+import { asArray } from "../lib/collectionGuards";
 import { formatReferenceList, parseReferenceList } from "../lib/externalReferences";
 import { areFeatureFlagsEnabled } from "../lib/featureFlags";
 import { summarizeExecutionStart } from "../lib/executionStartSummary";
@@ -316,22 +317,22 @@ function getExecutionRiskInsight(summary: ExecutionRunSummary, impactSummary: Ex
   const topRequirement = impactSummary.impactedRequirements.find((requirement) => requirement.failedCases > 0) || impactSummary.impactedRequirements[0] || null;
 
   if (summary.failed > 0 && topRequirement) {
-    return `Evidence-based risk signal: ${summary.failed} failed case${summary.failed === 1 ? "" : "s"} are touching ${affectedRequirements || 1} requirement${(affectedRequirements || 1) === 1 ? "" : "s"}; start with ${topRequirement.title}.`;
+    return `Evidence-based risk signal: ${summary.failed} failed case${summary.failed === 1 ? "" : "s"} are touching ${affectedRequirements || 1} ${(affectedRequirements || 1) === 1 ? "story" : "stories"}; start with ${topRequirement.title}.`;
   }
 
   if (summary.blocked > 0) {
-    return `Evidence-based risk signal: ${summary.blocked} blocked case${summary.blocked === 1 ? "" : "s"} can hide release confidence until the affected requirement coverage is cleared.`;
+    return `Evidence-based risk signal: ${summary.blocked} blocked case${summary.blocked === 1 ? "" : "s"} can hide release confidence until the affected story coverage is cleared.`;
   }
 
   if (!summary.total && scopedCaseCount) {
-    return `Evidence-based risk signal: ${scopedCaseCount} scoped case${scopedCaseCount === 1 ? "" : "s"} are queued; requirement impact will sharpen as evidence arrives.`;
+    return `Evidence-based risk signal: ${scopedCaseCount} scoped case${scopedCaseCount === 1 ? "" : "s"} are queued; story impact will sharpen as evidence arrives.`;
   }
 
   if (summary.passRate >= 90 && summary.total) {
-    return `Evidence-based risk signal: pass confidence is strong across touched coverage; keep an eye on high-priority linked requirements.`;
+    return `Evidence-based risk signal: pass confidence is strong across touched coverage; keep an eye on high-priority linked stories.`;
   }
 
-  return `Evidence-based risk signal: run evidence is still forming; linked requirements and references are ready for trace review.`;
+  return `Evidence-based risk signal: run evidence is still forming; linked stories and references are ready for trace review.`;
 }
 
 const DEFAULT_CATALOG_VIEW_MODE_BY_RUN_VIEW: Record<TestRunsView, CatalogViewMode> = {
@@ -384,7 +385,7 @@ const WORKSPACE_TRANSACTION_METADATA_LABELS: Record<string, string> = {
   reused_scripts: "Scripts reused",
   healed_cases: "Cases healed",
   generated_cases_count: "Cases generated",
-  requirement_count: "Requirements",
+  requirement_count: "Stories",
   selected_case_count: "Selected cases",
   matched_case_count: "Matched cases",
   worker_count: "Workers"
@@ -819,7 +820,7 @@ function describeWorkspaceTransaction(
         transaction.status === "completed"
           ? readyForReviewDetail
           : generatedCaseCount || requirementCount
-            ? `${formatCountLabel(requirementCount, "requirement")} queued or processed · ${formatCountLabel(generatedCaseCount, "case")} generated`
+            ? `${formatCountLabel(requirementCount, "story")} queued or processed · ${formatCountLabel(generatedCaseCount, "case")} generated`
             : "AI-assisted test case generation workflow"
     };
   }
@@ -885,11 +886,11 @@ function describeWorkspaceTransaction(
   if (transaction.action === "requirement_import") {
     return {
       icon: <ImportIcon />,
-      eyebrow: "Requirement import",
+      eyebrow: "Story import",
       detail:
         importedCount || failedCount || totalRows
-          ? `${formatCountLabel(importedCount, "requirement")} imported · ${formatCountLabel(failedCount, "row")} failed`
-          : "Bulk requirement import"
+          ? `${formatCountLabel(importedCount, "story")} imported · ${formatCountLabel(failedCount, "row")} failed`
+          : "Bulk story import"
     };
   }
 
@@ -1364,6 +1365,7 @@ export function ExecutionsPage() {
   const [selectedOperationId, setSelectedOperationId] = useState("");
   const [focusedSuiteId, setFocusedSuiteId] = useState("");
   const [expandedExecutionSuiteIds, setExpandedExecutionSuiteIds] = useState<string[]>([]);
+  const [expandedExecutionModuleKeys, setExpandedExecutionModuleKeys] = useState<string[]>([]);
   const [selectedTestCaseId, setSelectedTestCaseId] = useState("");
   const [expandedExecutionStepGroupIds, setExpandedExecutionStepGroupIds] = useState<string[]>([]);
   const [expandedExecutionStepSections, setExpandedExecutionStepSections] = useState({ preconditions: true, testSteps: true });
@@ -1478,8 +1480,8 @@ export function ExecutionsPage() {
     queryKey: ["executions", projectId, appTypeId],
     queryFn: () => api.executions.list(projectId ? { project_id: projectId, app_type_id: appTypeId || undefined } : undefined),
     enabled: Boolean(projectId && isExecutionRunsView(testRunsView)),
-    refetchInterval: (query) => (query.state.data as Execution[] | undefined)
-      ?.some((execution) => ["queued", "running"].includes(String(execution.status).toLowerCase()))
+    refetchInterval: (query) => asArray<Execution>(query.state.data)
+      .some((execution) => ["queued", "running"].includes(String(execution.status).toLowerCase()))
       ? EXECUTION_POLL_INTERVAL_MS
       : false
   });
@@ -1513,6 +1515,12 @@ export function ExecutionsPage() {
     queryFn: () => api.requirements.list({ project_id: projectId }),
     enabled: Boolean(projectId)
   });
+  const executionDomainMetadataQuery = useQuery({
+    queryKey: ["domain-metadata", "execution-builder", projectId],
+    queryFn: api.metadata.domain,
+    enabled: Boolean(projectId && isCreateExecutionModalOpen),
+    staleTime: 10 * 60 * 1000
+  });
   const bugsQuery = useQuery({
     queryKey: ["execution-bugs", projectId],
     queryFn: () => api.issues.list({ project_id: projectId, page_size: 100, projection: "detail" }),
@@ -1520,7 +1528,7 @@ export function ExecutionsPage() {
   });
   const smartExecutionCasesQuery = useQuery({
     queryKey: ["smart-execution-cases", appTypeId, projectId],
-    queryFn: () => api.testCases.list({ app_type_id: appTypeId }),
+    queryFn: () => api.testCases.list({ app_type_id: appTypeId, projection: "summary" }),
     enabled: Boolean(appTypeId)
   });
   const scopedSuitesQuery = useQuery({
@@ -1650,12 +1658,12 @@ export function ExecutionsPage() {
       api.executionResults.update(id, input)
   });
 
-  const projects = projectsQuery.data || [];
-  const users = usersQuery.data || [];
-  const projectMembers = projectMembersQuery.data || [];
+  const projects = asArray(projectsQuery.data);
+  const users = asArray(usersQuery.data);
+  const projectMembers = asArray(projectMembersQuery.data);
   const executions = useMemo(
     () =>
-      [...(executionsQuery.data || [])].sort((left, right) => {
+      [...asArray(executionsQuery.data)].sort((left, right) => {
         const rightTimestamp =
           toTimestamp(right.created_at) ??
           toTimestamp(right.started_at) ??
@@ -1675,18 +1683,33 @@ export function ExecutionsPage() {
       }),
     [executionsQuery.data]
   );
-  const executionSchedules = executionSchedulesQuery.data || [];
-  const appTypes = appTypesQuery.data || [];
-  const requirements = requirementsQuery.data || [];
-  const bugs = (bugsQuery.data || []) as Issue[];
-  const smartExecutionLibraryCases = smartExecutionCasesQuery.data || [];
-  const scopeSuites = scopedSuitesQuery.data || [];
-  const executionResults = executionResultsQuery.data || [];
-  const allExecutionResults = allExecutionResultsQuery.data || [];
-  const integrations = integrationsQuery.data || [];
-  const testEngineIntegrations = testEngineIntegrationsQuery.data || [];
+  const executionSchedules = asArray(executionSchedulesQuery.data);
+  const appTypes = asArray(appTypesQuery.data);
+  const requirements = asArray(requirementsQuery.data);
+  const bugs = asArray<Issue>(bugsQuery.data);
+  const smartExecutionLibraryCases = asArray(smartExecutionCasesQuery.data);
+  const scopeSuites = asArray(scopedSuitesQuery.data);
+  const executionResults = asArray(executionResultsQuery.data);
+  const allExecutionResults = asArray(allExecutionResultsQuery.data);
+  const integrations = asArray(integrationsQuery.data);
+  const testEngineIntegrations = asArray(testEngineIntegrationsQuery.data);
   const selectedProject = projects.find((project) => String(project.id) === String(projectId)) || null;
   const selectedAppType = appTypes.find((appType) => appType.id === appTypeId) || null;
+  const smartExecutionReleaseOptions = useMemo(
+    () => asArray(executionDomainMetadataQuery.data?.jira?.versions)
+      .filter((version) => !version.archived)
+      .map((version) => ({ value: version.name, label: `${version.name}${version.released ? " · released" : ""}` })),
+    [executionDomainMetadataQuery.data?.jira?.versions]
+  );
+  const smartExecutionSprintOptions = useMemo(
+    () => asArray(executionDomainMetadataQuery.data?.jira?.sprints)
+      .map((sprint) => ({ value: sprint.name, label: `${sprint.name}${sprint.state ? ` · ${sprint.state}` : ""}` })),
+    [executionDomainMetadataQuery.data?.jira?.sprints]
+  );
+  const smartExecutionBuildOptions = useMemo(
+    () => [...new Set(executions.map((execution) => execution.build).filter((value): value is string => Boolean(value)))],
+    [executions]
+  );
   const assigneeOptions = useMemo<ExecutionAssigneeOption[]>(
     () => buildAssigneeOptions(projectMembers, users),
     [projectMembers, users]
@@ -1709,7 +1732,7 @@ export function ExecutionsPage() {
   );
   const workspaceTransactions = useMemo(
     () =>
-      (workspaceTransactionsQuery.data || []).filter((transaction) => isBatchProcessTransaction(transaction)),
+      asArray(workspaceTransactionsQuery.data).filter((transaction) => isBatchProcessTransaction(transaction)),
     [workspaceTransactionsQuery.data]
   );
   const workspaceTransactionStatusCounts = useMemo(
@@ -2307,6 +2330,7 @@ export function ExecutionsPage() {
 
   useEffect(() => {
     setExpandedExecutionSuiteIds([]);
+    setExpandedExecutionModuleKeys([]);
     setExecutionSuiteSearch("");
     setExecutionCaseSearch("");
   }, [selectedExecutionId]);
@@ -3042,9 +3066,16 @@ export function ExecutionsPage() {
       return;
     }
 
-    if (!smartExecutionReleaseScope.trim() && !smartExecutionAdditionalContext.trim() && !selectedSmartRequirementIds.length) {
+    if (
+      !executionRelease.trim()
+      && !executionSprint.trim()
+      && !executionBuild.trim()
+      && !smartExecutionReleaseScope.trim()
+      && !smartExecutionAdditionalContext.trim()
+      && !selectedSmartRequirementIds.length
+    ) {
       setSmartExecutionPreviewTone("error");
-      setSmartExecutionPreviewMessage("Select impacted requirements, add release scope, or add context so AI can identify impacted test coverage.");
+      setSmartExecutionPreviewMessage("Select a Release, Sprint, Build, impacted Story, or add change context so Qaira can retrieve relevant test evidence.");
       return;
     }
 
@@ -3053,7 +3084,10 @@ export function ExecutionsPage() {
         project_id: projectId,
         app_type_id: appTypeId,
         integration_id: smartExecutionIntegrationId || undefined,
-        release_scope: smartExecutionReleaseScope || undefined,
+        release: executionRelease.trim() || undefined,
+        sprint: executionSprint.trim() || undefined,
+        build: executionBuild.trim() || undefined,
+        scope_description: smartExecutionReleaseScope.trim() || undefined,
         additional_context: smartExecutionAdditionalContext || undefined,
         impacted_requirement_ids: selectedSmartRequirementIds.length ? selectedSmartRequirementIds : undefined,
         test_environment_id: selectedExecutionEnvironmentId || undefined,
@@ -3069,10 +3103,11 @@ export function ExecutionsPage() {
       );
       setExecutionName(response.execution_name || executionName);
       setSmartExecutionPreviewTone("success");
+      const evidenceSummary = response.evidence_summary;
       setSmartExecutionPreviewMessage(
         response.cases.length
-          ? `${response.matched_case_count} impacted case${response.matched_case_count === 1 ? "" : "s"} identified from ${response.source_case_count} existing case${response.source_case_count === 1 ? "" : "s"} using ${response.integration.name}${selectedSmartRequirementIds.length ? ` and ${selectedSmartRequirementIds.length} selected requirement${selectedSmartRequirementIds.length === 1 ? "" : "s"}` : ""}.`
-          : `No impacted cases were identified using ${response.integration.name}. Refine the release scope, add context, or try a narrower requirement filter.`
+          ? `${response.matched_case_count} impacted case${response.matched_case_count === 1 ? "" : "s"} selected from ${evidenceSummary?.failed_case_count || 0} failed case${evidenceSummary?.failed_case_count === 1 ? "" : "s"}, ${evidenceSummary?.scoped_bug_count || 0} scoped Bug${evidenceSummary?.scoped_bug_count === 1 ? "" : "s"}, and ${evidenceSummary?.scoped_requirement_count || 0} scoped ${evidenceSummary?.scoped_requirement_count === 1 ? "Story" : "Stories"}; ${response.integration.name} reviewed the bounded evidence.`
+          : `No linked test evidence was identified using ${response.integration.name}. Check the exact Release, Sprint, or Build values, or add a Story/change context.`
       );
     } catch (error) {
       resetSmartExecutionPreview();
@@ -3161,6 +3196,18 @@ export function ExecutionsPage() {
         sprint: executionSprint.trim() || undefined,
         build: executionBuild.trim() || undefined,
         name: executionName || undefined,
+        scope_source: executionCreateMode === "smart" ? "smart-run" : undefined,
+        default_suite: executionCreateMode === "smart" ? smartExecutionPreview?.default_suite : undefined,
+        smart_plan: executionCreateMode === "smart" && smartExecutionPreview
+          ? {
+              request_id: smartExecutionPreview.request_id,
+              generation_mode: smartExecutionPreview.generation_mode,
+              summary: smartExecutionPreview.summary,
+              evidence_summary: smartExecutionPreview.evidence_summary,
+              query_strategy: smartExecutionPreview.query_strategy,
+              selected_test_case_ids: selectedSmartCaseIds
+            }
+          : undefined,
         created_by: session.user.id
       });
 
@@ -4190,7 +4237,7 @@ export function ExecutionsPage() {
         `${suiteMetric?.passedCount || 0} passed`,
         `${suiteMetric?.failedCount || 0} failed`,
         `${suiteMetric?.blockedCount || 0} blocked`,
-        `${suiteImpactSummary.failedRequirementCount} impacted requirements`,
+        `${suiteImpactSummary.failedRequirementCount} impacted stories`,
         ...suiteCases.flatMap((testCase) => [
           testCase.id,
           testCase.title,
@@ -4818,7 +4865,7 @@ export function ExecutionsPage() {
     },
     {
       key: "requirements",
-      label: "Impacted requirements",
+      label: "Impacted stories",
       defaultVisible: false,
       render: (suite) => {
         const summary = selectedSuiteImpactSummaryById[suite.id] || EMPTY_EXECUTION_RUN_IMPACT_SUMMARY;
@@ -5476,6 +5523,66 @@ export function ExecutionsPage() {
         testCase={testCase}
       />
     ));
+    const getModuleExpansionKey = (moduleId: string) => `${selectedExecution?.id || "run"}:${suiteId || "direct"}:${moduleId}`;
+    const renderExecutionModuleHeader = (module: typeof moduleGroups[number]) => {
+      const passed = module.cases.filter((testCase) => caseDerivedStatus(testCase) === "passed").length;
+      const failed = module.cases.filter((testCase) => caseDerivedStatus(testCase) === "failed").length;
+      const blocked = module.cases.filter((testCase) => ["blocked", "running"].includes(caseDerivedStatus(testCase))).length;
+      const resolved = passed + failed + blocked;
+      const completion = module.cases.length ? Math.round((resolved / module.cases.length) * 100) : 0;
+      const passRate = resolved ? Math.round((passed / resolved) * 100) : 0;
+      const moduleAssignees = selectedExecution?.module_assignments?.[module.id] || [];
+      const expansionKey = getModuleExpansionKey(module.id);
+      const isExpanded = expandedExecutionModuleKeys.includes(expansionKey);
+      const resolvedSuiteId = suiteId || "";
+
+      return (
+        <div className="execution-module-scope-header">
+          <button
+            aria-expanded={isExpanded}
+            className="execution-module-scope-title execution-module-scope-toggle"
+            onClick={() => setExpandedExecutionModuleKeys((current) => current.includes(expansionKey)
+              ? current.filter((key) => key !== expansionKey)
+              : [...current, expansionKey])}
+            type="button"
+          >
+            <CollapseExpandIcon isExpanded={isExpanded} />
+            <LayersIcon />
+            <div>
+              <strong>{module.name}</strong>
+              <span>{module.cases.length} cases · {resolved} resolved</span>
+            </div>
+          </button>
+          <HierarchyMetricStrip
+            count={module.cases.length}
+            noun="case"
+            metrics={[
+              { label: "Complete", value: `${completion}%`, tone: completion === 100 ? "success" : completion ? "warning" : "neutral" },
+              { label: "Pass rate", value: resolved ? `${passRate}%` : "—", tone: !resolved ? "neutral" : passRate >= 85 ? "success" : passRate >= 65 ? "warning" : "danger" },
+              { label: "Failed", value: failed, tone: failed ? "danger" : "success" },
+              { label: "Blocked", value: blocked, tone: blocked ? "warning" : "success" }
+            ]}
+          />
+          <div className="execution-scope-assignee" title="Assign module responsibility">
+            <ExecutionAssigneeIcon />
+            <MultiAssigneePicker
+              disabled={!canExecuteRuns || module.id === "unassigned-module" || updateExecutionScopeAssignment.isPending}
+              emptyLabel={module.id === "unassigned-module" ? "No module owner" : "Inherit suite/run"}
+              onChange={(ids) => void handleScopeAssignmentChange("modules", module.id, ids)}
+              options={assigneeOptions}
+              selectedIds={moduleAssignees}
+            />
+          </div>
+          <ReportBugSplitActionButton
+            canUseAi={canUseAiBugTriage}
+            className="execution-scope-report-bug"
+            disabled={!canReportBugs || module.id === "unassigned-module" || !resolvedSuiteId}
+            onReportBug={() => handleReportSelectedExecutionIssue("module", { suiteId: resolvedSuiteId, suiteName, moduleId: module.id, moduleName: module.name })}
+            onReportBugWithAi={() => handleReportSelectedExecutionIssue("module", { suiteId: resolvedSuiteId, suiteName, moduleId: module.id, moduleName: module.name }, "ai")}
+          />
+        </div>
+      );
+    };
 
     return (
       <div className="execution-run-case-catalog">
@@ -5534,52 +5641,11 @@ export function ExecutionsPage() {
           suiteId ? (
             <div className="execution-module-tree">
               {moduleGroups.map((module) => {
-                const passed = module.cases.filter((testCase) => caseDerivedStatus(testCase) === "passed").length;
-                const failed = module.cases.filter((testCase) => caseDerivedStatus(testCase) === "failed").length;
-                const blocked = module.cases.filter((testCase) => ["blocked", "running"].includes(caseDerivedStatus(testCase))).length;
-                const resolved = passed + failed + blocked;
-                const completion = module.cases.length ? Math.round((resolved / module.cases.length) * 100) : 0;
-                const passRate = resolved ? Math.round((passed / resolved) * 100) : 0;
-                const moduleAssignees = selectedExecution?.module_assignments?.[module.id] || [];
+                const isExpanded = expandedExecutionModuleKeys.includes(getModuleExpansionKey(module.id));
                 return (
                   <section className="execution-module-scope" key={`${suiteId}-${module.id}`}>
-                    <div className="execution-module-scope-header">
-                      <div className="execution-module-scope-title">
-                        <LayersIcon />
-                        <div>
-                          <strong>{module.name}</strong>
-                          <span>{module.cases.length} cases · {resolved} resolved</span>
-                        </div>
-                      </div>
-                      <HierarchyMetricStrip
-                        count={module.cases.length}
-                        noun="case"
-                        metrics={[
-                          { label: "Complete", value: `${completion}%`, tone: completion === 100 ? "success" : completion ? "warning" : "neutral" },
-                          { label: "Pass rate", value: resolved ? `${passRate}%` : "—", tone: !resolved ? "neutral" : passRate >= 85 ? "success" : passRate >= 65 ? "warning" : "danger" },
-                          { label: "Failed", value: failed, tone: failed ? "danger" : "success" },
-                          { label: "Blocked", value: blocked, tone: blocked ? "warning" : "success" }
-                        ]}
-                      />
-                      <div className="execution-scope-assignee" title="Assign module responsibility">
-                        <ExecutionAssigneeIcon />
-                        <MultiAssigneePicker
-                          disabled={!canExecuteRuns || module.id === "unassigned-module" || updateExecutionScopeAssignment.isPending}
-                          emptyLabel={module.id === "unassigned-module" ? "No module owner" : "Inherit suite/run"}
-                          onChange={(ids) => void handleScopeAssignmentChange("modules", module.id, ids)}
-                          options={assigneeOptions}
-                          selectedIds={moduleAssignees}
-                        />
-                      </div>
-                      <ReportBugSplitActionButton
-                        canUseAi={canUseAiBugTriage}
-                        className="execution-scope-report-bug"
-                        disabled={!canReportBugs || module.id === "unassigned-module"}
-                        onReportBug={() => handleReportSelectedExecutionIssue("module", { suiteId, suiteName, moduleId: module.id, moduleName: module.name })}
-                        onReportBugWithAi={() => handleReportSelectedExecutionIssue("module", { suiteId, suiteName, moduleId: module.id, moduleName: module.name }, "ai")}
-                      />
-                    </div>
-                    <div className="tree-children">{renderCaseCards(module.cases)}</div>
+                    {renderExecutionModuleHeader(module)}
+                    {isExpanded ? <div className="tree-children">{renderCaseCards(module.cases)}</div> : null}
                   </section>
                 );
               })}
@@ -5591,6 +5657,31 @@ export function ExecutionsPage() {
               {!cases.length ? <div className="empty-state compact">{resolvedEmptyMessage}</div> : null}
             </div>
           )
+        ) : suiteId ? (
+          <div className="execution-module-tree execution-module-tree--list">
+            {moduleGroups.map((module) => {
+              const isExpanded = expandedExecutionModuleKeys.includes(getModuleExpansionKey(module.id));
+              return (
+                <section className="execution-module-scope" key={`${suiteId}-${module.id}-list`}>
+                  {renderExecutionModuleHeader(module)}
+                  {isExpanded ? (
+                    <DataTable
+                      columns={executionCaseListColumns}
+                      enableColumnResize
+                      enableHeaderColumnReorder
+                      emptyMessage="No cases match this module."
+                      getRowClassName={(testCase) => (selectedTestCaseId === testCase.id ? "is-active-row" : "")}
+                      getRowKey={(testCase, index) => `${testCase.suite_id || "direct"}-${module.id}-${testCase.id}-${index}`}
+                      onRowClick={(testCase) => focusExecutionCase(testCase.id)}
+                      rows={module.cases}
+                      storageKey={`${storageKey}:${module.id}`}
+                    />
+                  ) : null}
+                </section>
+              );
+            })}
+            {!cases.length ? <div className="empty-state compact">{resolvedEmptyMessage}</div> : null}
+          </div>
         ) : (
           <DataTable
             columns={executionCaseListColumns}
@@ -6836,7 +6927,7 @@ export function ExecutionsPage() {
                       </div>
                       <div className="mini-card">
                         <strong>{selectedExecutionImpactSummary.failedRequirementCount}/{selectedExecutionImpactSummary.totalRequirements}</strong>
-                        <span>Impacted requirements</span>
+                        <span>Impacted stories</span>
                       </div>
 
                     </div>
@@ -6847,10 +6938,10 @@ export function ExecutionsPage() {
                           <strong>Run impact areas</strong>
                           <span>
                             {selectedExecutionImpactSummary.failedCases.length
-                              ? `${selectedExecutionImpactSummary.failedCases.length} failed or blocked case${selectedExecutionImpactSummary.failedCases.length === 1 ? "" : "s"} mapped to ${selectedExecutionImpactSummary.failedRequirementCount} requirement${selectedExecutionImpactSummary.failedRequirementCount === 1 ? "" : "s"}.`
+                              ? `${selectedExecutionImpactSummary.failedCases.length} failed or blocked case${selectedExecutionImpactSummary.failedCases.length === 1 ? "" : "s"} mapped to ${selectedExecutionImpactSummary.failedRequirementCount} ${selectedExecutionImpactSummary.failedRequirementCount === 1 ? "story" : "stories"}.`
                               : selectedExecutionImpactSummary.totalRequirements
-                                ? `${selectedExecutionImpactSummary.totalRequirements} linked requirement${selectedExecutionImpactSummary.totalRequirements === 1 ? "" : "s"} in this run. No failed requirement impact yet.`
-                                : "No linked requirement impact detected for this run yet."}
+                                ? `${selectedExecutionImpactSummary.totalRequirements} linked ${selectedExecutionImpactSummary.totalRequirements === 1 ? "story" : "stories"} in this run. No failed story impact yet.`
+                                : "No linked story impact detected for this run yet."}
                           </span>
                         </div>
                         <span className={selectedExecutionImpactSummary.failureRate ? "count-pill warning" : "count-pill success"}>
@@ -6887,7 +6978,7 @@ export function ExecutionsPage() {
                                 <span>
                                   {[
                                     testCase.suiteName || "Direct case",
-                                    testCase.requirementTitles.length ? `Requirements: ${testCase.requirementTitles.join(" · ")}` : "No linked requirement",
+                                    testCase.requirementTitles.length ? `Stories: ${testCase.requirementTitles.join(" · ")}` : "No linked story",
                                     testCase.error || null
                                   ].filter(Boolean).join(" · ")}
                                 </span>
@@ -6900,7 +6991,7 @@ export function ExecutionsPage() {
 
                     <AiAssurancePanel
                       gaps={selectedRunEvidenceReadiness.gaps}
-                      provenance="Deterministic run results, case snapshots, requirement links, bugs, and external references"
+                      provenance="Deterministic run results, case snapshots, story links, bugs, and external references"
                       reviewState={["completed", "failed", "aborted"].includes(currentExecutionStatus) ? "review-required" : "evidence-forming"}
                       score={selectedRunEvidenceReadiness.score}
                       scoreLabel={selectedRunEvidenceReadiness.scoreLabel}
@@ -7087,7 +7178,7 @@ export function ExecutionsPage() {
                             ariaLabel="Search run suites"
                             onChange={setExecutionSuiteSearch}
                             placeholder="Search suites"
-                            subtitle="Search suite names, statuses, impacted requirements, and snapped case titles."
+                            subtitle="Search suite names, statuses, impacted stories, and snapped case titles."
                             title="Suite search"
                             type="search"
                             value={executionSuiteSearch}
@@ -7198,9 +7289,9 @@ export function ExecutionsPage() {
                                         <ExecutionRiskIcon />
                                       </ExecutionCardFact>
                                       <ExecutionCardFact
-                                        ariaLabel={`${suiteImpactSummary.failedRequirementCount} impacted requirements with failed or blocked cases`}
+                                        ariaLabel={`${suiteImpactSummary.failedRequirementCount} impacted stories with failed or blocked cases`}
                                         label={suiteImpactSummary.totalRequirements ? `${suiteImpactSummary.failedRequirementCount}/${suiteImpactSummary.totalRequirements}` : "0"}
-                                        title={suiteImpactSummary.impactedRequirements[0] ? `${suiteImpactSummary.impactedRequirements[0].title} · ${suiteImpactSummary.impactedRequirements[0].failureRate}% failure rate` : "No requirement impact detected in this suite"}
+                                        title={suiteImpactSummary.impactedRequirements[0] ? `${suiteImpactSummary.impactedRequirements[0].title} · ${suiteImpactSummary.impactedRequirements[0].failureRate}% failure rate` : "No story impact detected in this suite"}
                                         tone={suiteImpactSummary.failedRequirementCount ? "warning" : "neutral"}
                                       >
                                         <ExecutionRequirementImpactIcon />
@@ -7229,7 +7320,7 @@ export function ExecutionsPage() {
                                     </div>
 
                                     {suiteImpactSummary.impactedRequirements.length ? (
-                                      <div className="execution-suite-impact-row" aria-label={`${suite.name} impacted requirements`}>
+                                      <div className="execution-suite-impact-row" aria-label={`${suite.name} impacted stories`}>
                                         {suiteImpactSummary.impactedRequirements.slice(0, 4).map((requirement) => (
                                           <span className={requirement.failedCases ? "execution-impact-chip is-impacted" : "execution-impact-chip"} key={requirement.id}>
                                             <b>{requirement.title}</b>
@@ -7544,6 +7635,9 @@ export function ExecutionsPage() {
           executionRelease={executionRelease}
           executionSprint={executionSprint}
           executionBuild={executionBuild}
+          releaseOptions={smartExecutionReleaseOptions}
+          sprintOptions={smartExecutionSprintOptions}
+          buildOptions={smartExecutionBuildOptions}
           scopeSuites={scopeSuites}
           selectedAppType={selectedAppType?.name || ""}
           selectedDataSetId={selectedExecutionDataSetId}
@@ -8237,9 +8331,9 @@ function ExecutionListCard({
             <ExecutionRiskIcon />
           </ExecutionCardFact>
           <ExecutionCardFact
-            ariaLabel={`${impactSummary.failedRequirementCount} impacted requirements with failed or blocked cases`}
+            ariaLabel={`${impactSummary.failedRequirementCount} impacted stories with failed or blocked cases`}
             label={impactSummary.totalRequirements ? `${impactSummary.failedRequirementCount}/${impactSummary.totalRequirements}` : "0"}
-            title={topImpactedRequirement ? `${topImpactedRequirement.title} · ${topImpactedRequirement.failureRate}% failure rate` : "No requirement impact detected"}
+            title={topImpactedRequirement ? `${topImpactedRequirement.title} · ${topImpactedRequirement.failureRate}% failure rate` : "No story impact detected"}
             tone={impactSummary.failedRequirementCount ? "warning" : "neutral"}
           >
             <ExecutionRequirementImpactIcon />
@@ -8284,9 +8378,9 @@ function ExecutionListCard({
         </div>
 
         {visibleImpactedRequirements.length ? (
-          <div className="execution-card-impact-strip" aria-label="Run impacted requirements">
+          <div className="execution-card-impact-strip" aria-label="Run impacted stories">
             <div className="execution-card-impact-strip-head">
-              <strong>Impacted requirements</strong>
+              <strong>Impacted stories</strong>
               <span>{impactSummary.failedRequirementCount}/{impactSummary.totalRequirements} with failures</span>
             </div>
             <div className="execution-impact-chip-row">
@@ -10044,6 +10138,9 @@ function ExecutionCreateModal({
   executionRelease,
   executionSprint,
   executionBuild,
+  releaseOptions,
+  sprintOptions,
+  buildOptions,
   assigneeOptions,
   integrations,
   executionHookDraft,
@@ -10115,6 +10212,9 @@ function ExecutionCreateModal({
   executionRelease: string;
   executionSprint: string;
   executionBuild: string;
+  releaseOptions: Array<{ value: string; label: string }>;
+  sprintOptions: Array<{ value: string; label: string }>;
+  buildOptions: string[];
   assigneeOptions: ExecutionAssigneeOption[];
   integrations: Integration[];
   executionHookDraft: ExecutionHookDraft;
@@ -10162,7 +10262,14 @@ function ExecutionCreateModal({
 }) {
   const isSmartMode = canUseRunAi && executionCreateMode === "smart";
   const smartPreviewCases = smartExecutionPreview?.cases || [];
-  const hasSmartPlanningInput = Boolean(smartExecutionReleaseScope.trim() || smartExecutionAdditionalContext.trim() || selectedSmartRequirementIds.length);
+  const hasSmartPlanningInput = Boolean(
+    executionRelease.trim()
+    || executionSprint.trim()
+    || executionBuild.trim()
+    || smartExecutionReleaseScope.trim()
+    || smartExecutionAdditionalContext.trim()
+    || selectedSmartRequirementIds.length
+  );
   const libraryCaseById = useMemo(() => new Map(libraryCases.map((testCase) => [testCase.id, testCase])), [libraryCases]);
   const isEngineSmartMode = isSmartMode && executionStartMode !== "manual";
   const automatedSmartPreviewCount = smartPreviewCases.filter((testCase) => libraryCaseById.get(testCase.test_case_id)?.automated === "yes").length;
@@ -10260,14 +10367,29 @@ function ExecutionCreateModal({
             </div>
 
             <div className="execution-create-grid execution-create-grid--metadata">
-              <FormField label="Release">
-                <input placeholder="Release 5.8" value={executionRelease} onChange={(event) => onExecutionReleaseChange(event.target.value)} />
+              <FormField label="Release" hint={isSmartMode ? "Exact Jira Fix Version evidence key." : undefined}>
+                <select value={executionRelease} onChange={(event) => onExecutionReleaseChange(event.target.value)}>
+                  <option value="">No release filter</option>
+                  {executionRelease && !releaseOptions.some((option) => option.value === executionRelease) ? (
+                    <option value={executionRelease}>{executionRelease}</option>
+                  ) : null}
+                  {releaseOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+                </select>
               </FormField>
-              <FormField label="Sprint">
-                <input placeholder="Sprint 24" value={executionSprint} onChange={(event) => onExecutionSprintChange(event.target.value)} />
+              <FormField label="Sprint" hint={isSmartMode ? "Exact Jira Sprint evidence key." : undefined}>
+                <select value={executionSprint} onChange={(event) => onExecutionSprintChange(event.target.value)}>
+                  <option value="">No Sprint filter</option>
+                  {executionSprint && !sprintOptions.some((option) => option.value === executionSprint) ? (
+                    <option value={executionSprint}>{executionSprint}</option>
+                  ) : null}
+                  {sprintOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+                </select>
               </FormField>
-              <FormField label="Build">
-                <input placeholder="Build 2026.07.02" value={executionBuild} onChange={(event) => onExecutionBuildChange(event.target.value)} />
+              <FormField label="Build" hint={isSmartMode ? "Matches Qaira run and Bug build evidence." : undefined}>
+                <input list="smart-run-build-options" placeholder="Build 2026.07.02" value={executionBuild} onChange={(event) => onExecutionBuildChange(event.target.value)} />
+                <datalist id="smart-run-build-options">
+                  {buildOptions.map((build) => <option key={build} value={build} />)}
+                </datalist>
               </FormField>
             </div>
 
@@ -10331,7 +10453,7 @@ function ExecutionCreateModal({
                 type="button"
               >
                 <strong>AI Smart Run</strong>
-                <span>Pick impacted cases from release scope.</span>
+                <span>Build a risk-ranked run from Jira evidence.</span>
               </button>
               </div>
             ) : null}
@@ -10343,7 +10465,7 @@ function ExecutionCreateModal({
                 {isSmartMode
                   ? smartExecutionPreview
                     ? `${smartExecutionPreview.source_case_count} existing cases are available for impact analysis in this app type.`
-                    : "AI smart run screens the current app type's existing cases exported as CSV."
+                    : "Qaira retrieves scoped Stories, Bugs, prior run failures, and linked Test Cases before asking AI to review the plan."
                   : scopeSuites.length
                     ? `${scopeSuites.length} suites available in the current scope.`
                     : "No suites available in the current scope yet."}
@@ -10375,8 +10497,8 @@ function ExecutionCreateModal({
                   <section className="ai-studio-panel">
                     <div className="panel-head">
                       <div>
-                        <p className="eyebrow">Release impact prompt</p>
-                        <p>Shape the AI prompt with release scope, additional context, or both before previewing impacted coverage.</p>
+                        <p className="eyebrow">Evidence scope</p>
+                        <p>Release, Sprint, and Build above are exact evidence keys; matching records are unioned and deduplicated. Add narrative only when links need a relevance signal.</p>
                       </div>
                     </div>
 
@@ -10391,9 +10513,9 @@ function ExecutionCreateModal({
                       </select>
                     </FormField>
 
-                    <FormField label="Release scope" hint="Provide release scope, additional context, or both. AI can plan from either field.">
+                    <FormField label="Change and risk scope" hint="Optional narrative: touched modules, integrations, rollout risks, or regression concerns.">
                       <textarea
-                        placeholder="Summarize the release changes, touched modules, high-risk workflows, integrations, data movement, and regression concerns..."
+                        placeholder="Summarize changed workflows, modules, integrations, data movement, and regression risks..."
                         rows={7}
                         value={smartExecutionReleaseScope}
                         onChange={(event) => onSmartExecutionReleaseScopeChange(event.target.value)}
@@ -10402,18 +10524,18 @@ function ExecutionCreateModal({
 
                     <FormField label="Additional context" hint="Optional on its own too: rollout notes, known gaps, compliance focus, customer risk, or environment context.">
                       <textarea
-                        placeholder="Environment notes, rollout risks, known gaps, customer impact, compliance focus..."
+                        placeholder="Environment notes, known gaps, customer impact, compliance focus..."
                         rows={5}
                         value={smartExecutionAdditionalContext}
                         onChange={(event) => onSmartExecutionAdditionalContextChange(event.target.value)}
                       />
                     </FormField>
 
-                    <FormField label="Impacted requirements">
+                    <FormField label="Impacted stories">
                       <div className="execution-smart-requirements-panel">
                         <div className="execution-smart-requirement-toolbar">
                           <input
-                            placeholder="Filter linked requirements"
+                            placeholder="Filter linked stories"
                             value={smartExecutionRequirementSearch}
                             onChange={(event) => onSmartExecutionRequirementSearchChange(event.target.value)}
                           />
@@ -10452,7 +10574,7 @@ function ExecutionCreateModal({
                                   />
                                   <div className="execution-smart-requirement-copy">
                                     <strong>{requirement.title}</strong>
-                                    <span>{richTextToPlainText(requirement.description) || "Requirement-linked coverage available in this app type."}</span>
+                                    <span>{richTextToPlainText(requirement.description) || "Story-linked coverage available in this app type."}</span>
                                   </div>
                                   <span className="execution-smart-requirement-count">
                                     {requirement.linkedCaseCount} case{requirement.linkedCaseCount === 1 ? "" : "s"}
@@ -10462,21 +10584,21 @@ function ExecutionCreateModal({
                             })}
 
                             {!filteredSmartRequirementOptions.length ? (
-                              <div className="empty-state compact">No linked requirements match the current search.</div>
+                              <div className="empty-state compact">No linked stories match the current search.</div>
                             ) : null}
                           </div>
                         ) : (
-                          <div className="empty-state compact">No requirement-linked test cases are available for this app type yet.</div>
+                          <div className="empty-state compact">No story-linked test cases are available for this app type yet.</div>
                         )}
                       </div>
                     </FormField>
 
                     <div className="detail-summary compact-summary">
-                      <strong>{selectedSmartRequirementIds.length ? `${selectedSmartRequirementIds.length} impacted requirement${selectedSmartRequirementIds.length === 1 ? "" : "s"} selected` : "Requirement filter is optional"}</strong>
+                      <strong>{selectedSmartRequirementIds.length ? `${selectedSmartRequirementIds.length} impacted ${selectedSmartRequirementIds.length === 1 ? "story" : "stories"} selected` : "Story filter is optional"}</strong>
                       <span>
                         {selectedSmartRequirementIds.length
-                          ? "AI will screen only the cases linked to the selected requirements before building the Default suite plan."
-                          : "Choose impacted requirements if you want AI to narrow the candidate cases before planning the run."}
+                          ? "Selected Stories are added as explicit evidence alongside the Release, Sprint, Build, Bug, and prior-result scope."
+                          : "Choose impacted Stories to add explicit traceability evidence to the delivery scope."}
                       </span>
                     </div>
 
@@ -10490,17 +10612,48 @@ function ExecutionCreateModal({
                 <div className="ai-studio-main">
                   <div className="detail-summary">
                     <strong>{smartExecutionPreview ? `${selectedSmartExecutableCaseCount} impacted cases selected` : "AI Smart Run"}</strong>
-                    <span>{smartExecutionPreview ? smartExecutionPreview.summary : "Generate an impact-based run plan from impacted requirements, release scope, context, or all three."}</span>
+                    <span>{smartExecutionPreview ? smartExecutionPreview.summary : "Generate an evidence-backed plan from exact delivery scope, linked Stories, Bugs, failed results, and project context."}</span>
                     <span>
                       {smartExecutionPreview
                         ? isEngineSmartMode
-                          ? `${smartExecutionPreview.source_case_count} cases were screened. ${automatedSmartPreviewCount} automated cases can run through Test Engine; ${manualSmartPreviewCount} manual cases stay out of engine execution.`
+                          ? `${smartExecutionPreview.source_case_count} cases were screened. ${automatedSmartPreviewCount} automated cases can run through Test Engine; ${manualSmartPreviewCount} non-automated cases stay out of engine execution.`
                           : `${smartExecutionPreview.source_case_count} existing cases were screened and ${smartExecutionPreview.matched_case_count} cases were suggested for this run.`
                         : selectedSmartRequirementIds.length
-                          ? `AI will use the selected project, app type, run context, and only the cases linked to ${selectedSmartRequirementIds.length} selected requirement${selectedSmartRequirementIds.length === 1 ? "" : "s"}.`
-                          : "AI uses the selected project, app type, run context, and existing cases exported as CSV."}
+                          ? `AI will use the selected project, app type, delivery evidence, and ${selectedSmartRequirementIds.length} explicitly selected ${selectedSmartRequirementIds.length === 1 ? "Story" : "Stories"}.`
+                          : "Qaira queries the selected project and app type first, compresses only relevant evidence, then asks AI to review the bounded plan."}
                     </span>
                   </div>
+
+                  {smartExecutionPreview?.evidence_summary ? (
+                    <div aria-label="Smart Run evidence summary" className="metric-strip execution-smart-evidence-strip" role="group">
+                      <div className="mini-card">
+                        <span>Failed cases</span>
+                        <strong>{smartExecutionPreview.evidence_summary.failed_case_count}</strong>
+                        <small>from matching runs</small>
+                      </div>
+                      <div className="mini-card">
+                        <span>Blocked cases</span>
+                        <strong>{smartExecutionPreview.evidence_summary.blocked_case_count}</strong>
+                        <small>from matching runs</small>
+                      </div>
+                      <div className="mini-card">
+                        <span>Scoped Bugs</span>
+                        <strong>{smartExecutionPreview.evidence_summary.scoped_bug_count}</strong>
+                        <small>expanded through links</small>
+                      </div>
+                      <div className="mini-card">
+                        <span>Scoped Stories</span>
+                        <strong>{smartExecutionPreview.evidence_summary.scoped_requirement_count}</strong>
+                        <small>linked coverage</small>
+                      </div>
+                    </div>
+                  ) : null}
+
+                  {smartExecutionPreview?.evidence_summary?.scan_truncated ? (
+                    <p className="inline-message warning-message">
+                      This project exceeds the safe synchronous scan limit. The plan keeps failed and Bug-linked cases first; narrow Release, Sprint, or Build before sign-off to verify the remaining scope.
+                    </p>
+                  ) : null}
 
                   {smartExecutionPreviewMessage ? (
                     <p className={smartExecutionPreviewTone === "error" ? "inline-message error-message" : "inline-message success-message"}>
@@ -10556,7 +10709,8 @@ function ExecutionCreateModal({
                   <div className="execution-smart-impact-list">
                     {smartPreviewCases.map((testCase) => {
                       const isSelected = selectedSmartExecutionCaseIds.includes(testCase.test_case_id);
-                      const isAutomatedSmartCase = libraryCaseById.get(testCase.test_case_id)?.automated === "yes";
+                      const automationState = libraryCaseById.get(testCase.test_case_id)?.automated;
+                      const isAutomatedSmartCase = automationState === "yes";
                       const isDisabledForEngine = isEngineSmartMode && !isAutomatedSmartCase;
 
                       return (
@@ -10587,8 +10741,25 @@ function ExecutionCreateModal({
                                 <span className="count-pill">
                                   {testCase.step_count} step{testCase.step_count === 1 ? "" : "s"}
                                 </span>
-                                <span className={isAutomatedSmartCase ? "count-pill success" : "count-pill"}>
-                                  {isAutomatedSmartCase ? "Automated" : "Manual"}
+                                {testCase.failure_count ? (
+                                  <span className="count-pill danger">
+                                    {testCase.failure_count} failure{testCase.failure_count === 1 ? "" : "s"}
+                                  </span>
+                                ) : null}
+                                {testCase.blocked_count ? (
+                                  <span className="count-pill warning">
+                                    {testCase.blocked_count} blocked
+                                  </span>
+                                ) : null}
+                                {testCase.bug_count ? (
+                                  <span className="count-pill warning">
+                                    {testCase.bug_count} Bug{testCase.bug_count === 1 ? "" : "s"}
+                                  </span>
+                                ) : null}
+                                <span
+                                  className={isAutomatedSmartCase ? "count-pill success" : "count-pill"}
+                                >
+                                  {isAutomatedSmartCase ? "Automated" : "Not automated"}
                                 </span>
                               </div>
                             </div>
@@ -10599,9 +10770,10 @@ function ExecutionCreateModal({
                               <strong>{testCase.suite_names.length ? testCase.suite_names.join(" · ") : "No suite mapping"}</strong>
                               <span>
                                 {testCase.requirement_titles.length
-                                  ? `Requirements: ${testCase.requirement_titles.join(" · ")}`
-                                  : "No linked requirements"}
+                                  ? `Stories: ${testCase.requirement_titles.join(" · ")}`
+                                  : "No linked stories"}
                               </span>
+                              {testCase.module_names?.length ? <span>Modules: {testCase.module_names.join(" · ")}</span> : null}
                             </div>
                           </div>
                         </label>

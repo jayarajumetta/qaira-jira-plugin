@@ -205,7 +205,7 @@ export async function rovoAction(payload = {}, context = {}) {
       if (!issueKey) {
         return {
           status: 'needs-input',
-          message: 'Select or provide a Jira Story/requirement key before drafting test cases.'
+          message: 'Select or provide a Jira Story key before drafting test cases.'
         };
       }
       return await handleQairaApi({

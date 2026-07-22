@@ -10,9 +10,9 @@ export type IterationHealthInput = {
 
 export type ModuleHealthInput = {
   priority?: number | null;
-  linkedRequirement: boolean;
-  stepCount: number;
-  automated: boolean;
+  linkedRequirement?: boolean;
+  stepCount?: number;
+  automated?: boolean;
   recentStatuses: string[];
 };
 
@@ -29,8 +29,8 @@ const isCriticalOrHigh = (value?: string | null) => /^(critical|blocker|highest|
 export function deriveIterationHealth(items: IterationHealthInput[], automationEnabled: boolean) {
   const completedRequirementCount = items.filter((item) => isDone(item.status)).length;
   const readinessScores = items.map((item) => Math.round(
-    automationEnabled
-      ? (item.passPercent * 0.55) + ((item.automationPercent || 0) * 0.45)
+    automationEnabled && Number.isFinite(item.automationPercent)
+      ? (item.passPercent * 0.55) + (Number(item.automationPercent) * 0.45)
       : item.passPercent
   ));
   const caseStatusById = new Map<string, string | null>();
@@ -110,6 +110,14 @@ export function deriveIterationHealth(items: IterationHealthInput[], automationE
 }
 
 export function deriveModuleHealth(items: ModuleHealthInput[]) {
+  const traceabilityKnownItems = items.filter((item) => typeof item.linkedRequirement === "boolean");
+  const executableKnownItems = items.filter((item) => Number.isFinite(item.stepCount));
+  const automationKnownItems = items.filter((item) => typeof item.automated === "boolean");
+  const unknownSummaryCount = items.filter((item) =>
+    typeof item.linkedRequirement !== "boolean"
+      || !Number.isFinite(item.stepCount)
+      || typeof item.automated !== "boolean"
+  ).length;
   const finalizedStatuses = items.flatMap((item) => item.recentStatuses)
     .map((status) => String(status || "").toLowerCase())
     .filter((status) => ["passed", "failed", "blocked"].includes(status));
@@ -119,17 +127,19 @@ export function deriveModuleHealth(items: ModuleHealthInput[]) {
     .filter((status) => ["passed", "failed", "blocked"].includes(status));
   const latestPassedStatuses = latestExecutableStatuses.filter((status) => status === "passed");
   const riskCount = items.filter((item) =>
-    !item.linkedRequirement
-      || item.stepCount === 0
+    item.linkedRequirement === false
+      || (Number.isFinite(item.stepCount) && Number(item.stepCount) === 0)
       || isFailed(item.recentStatuses[0])
-      || (Number(item.priority || 3) <= 2 && !item.automated)
+      || (Number(item.priority || 3) <= 2 && item.automated === false)
   ).length;
 
   return {
     count: items.length,
-    traceabilityPercent: percent(items.filter((item) => item.linkedRequirement).length, items.length),
-    executablePercent: percent(items.filter((item) => item.stepCount > 0).length, items.length),
-    automationPercent: percent(items.filter((item) => item.automated).length, items.length),
+    traceabilityPercent: percent(traceabilityKnownItems.filter((item) => item.linkedRequirement).length, traceabilityKnownItems.length),
+    executablePercent: percent(executableKnownItems.filter((item) => Number(item.stepCount) > 0).length, executableKnownItems.length),
+    automationPercent: percent(automationKnownItems.filter((item) => item.automated).length, automationKnownItems.length),
+    summaryComplete: unknownSummaryCount === 0,
+    unknownSummaryCount,
     executionPercent: percent(latestExecutableStatuses.length, items.length),
     passRatePercent: finalizedStatuses.length ? percent(passedStatuses.length, finalizedStatuses.length) : null,
     latestPassRatePercent: latestExecutableStatuses.length ? percent(latestPassedStatuses.length, latestExecutableStatuses.length) : null,

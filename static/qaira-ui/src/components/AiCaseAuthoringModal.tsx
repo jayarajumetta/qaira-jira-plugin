@@ -155,7 +155,7 @@ export function AiCaseAuthoringModal({
             <div className="modal-title-info-row">
               <h2 className="dialog-title" id="ai-case-authoring-title">Complete this test case</h2>
               <InfoTooltip
-                content="Use the linked requirement, current draft, and optional extra guidance to rephrase steps, fill gaps, and declare reusable test data for this case."
+                content="Use the linked story, current draft, and optional extra guidance to rephrase steps, fill gaps, and declare reusable test data for this case."
                 label="AI authoring information"
               />
             </div>
@@ -173,13 +173,13 @@ export function AiCaseAuthoringModal({
               <>
             <section className="ai-case-authoring-panel">
               <div className="record-grid">
-                <FormField label="Requirement">
+                <FormField label="Story">
                   <select
                     data-autofocus="true"
                     value={requirementId}
                     onChange={(event) => onRequirementChange(event.target.value)}
                   >
-                    <option value="">Select a requirement</option>
+                    <option value="">Select a story</option>
                     {requirements.map((requirement) => (
                       <option key={requirement.id} value={requirement.id}>
                         {requirement.title}
@@ -203,10 +203,10 @@ export function AiCaseAuthoringModal({
               {selectedRequirement ? (
                 <div className="detail-summary compact-summary">
                   <strong>{selectedRequirement.title}</strong>
-                  <span>{richTextToPlainText(selectedRequirement.description) || "No requirement description available yet."}</span>
+                  <span>{richTextToPlainText(selectedRequirement.description) || "No story description available yet."}</span>
                 </div>
               ) : (
-                <div className="empty-state compact">Choose the requirement this case should satisfy before generating.</div>
+                <div className="empty-state compact">Choose the story this case should satisfy before generating.</div>
               )}
 
               <div className="ai-studio-sidebar-divider" aria-hidden="false">
@@ -264,7 +264,7 @@ export function AiCaseAuthoringModal({
                     </article>
                   ))
                 ) : (
-                  <div className="empty-state compact">No drafted steps yet. AI will draft the case from the requirement and your extra context.</div>
+                  <div className="empty-state compact">No drafted steps yet. AI will draft the case from the story and your extra context.</div>
                 )}
                 {sourceDraft.steps.length > 6 ? (
                   <div className="empty-state compact">+ {sourceDraft.steps.length - 6} more drafted step{sourceDraft.steps.length - 6 === 1 ? "" : "s"} included in the prompt.</div>
@@ -291,7 +291,7 @@ export function AiCaseAuthoringModal({
               <div className="ai-case-authoring-preview">
                 <div className="detail-summary">
                   <strong>{preview.title}</strong>
-                  <span>{preview.summary || "AI completed the case using the selected requirement and current draft context."}</span>
+                  <span>{preview.summary || "AI completed the case using the selected story and current draft context."}</span>
                 </div>
 
                 <div className="metric-strip compact ai-case-authoring-metrics">

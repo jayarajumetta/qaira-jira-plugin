@@ -1,4 +1,4 @@
-const formatDisplayId = (value: string) => value.replace(/^RC([_-]?)/i, "Req$1");
+const formatDisplayId = (value: string) => value.replace(/^RC([_-]?)/i, "Story$1");
 
 export function DisplayIdBadge({
   value,

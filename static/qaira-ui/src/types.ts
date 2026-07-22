@@ -242,7 +242,9 @@ export type Requirement = {
   iteration_id?: string | null;
   title: string;
   description: string | null;
+  gherkin_scenarios?: string[];
   external_references?: string[];
+  detail_complete?: boolean;
   labels?: string[];
   sprint?: string | null;
   sprint_id?: string | null;
@@ -394,6 +396,33 @@ export type AiBugDraftPreview = {
   };
   citations: Array<{ type: string; id: string; title?: string | null }>;
   provenance: AiAssistanceProvenance & { usage?: Record<string, number> | null };
+};
+
+export type AiBugTriageRecommendation = {
+  issue_id: string;
+  display_id: string;
+  title: string;
+  category: string;
+  current_priority: "Highest" | "High" | "Medium" | "Low" | "Lowest";
+  recommended_priority: "Highest" | "High" | "Medium" | "Low" | "Lowest";
+  explanation: string;
+  signals: string[];
+  review_actions: string[];
+};
+
+export type AiBugTriagePreview = AiAssistedPreviewBase & {
+  scope: {
+    project_id: string;
+    project_key: string;
+    issue_count: number;
+    maximum_issue_count: number;
+  };
+  summary: string;
+  triage: AiBugTriageRecommendation[];
+  review_sequence: string[];
+  limitations: string[];
+  preview_only: true;
+  decision_requires_human_approval: true;
 };
 
 export type IntegrationType =
@@ -926,12 +955,36 @@ export type SmartExecutionImpactCase = {
   priority: number | null;
   status: string | null;
   suite_names: string[];
+  module_names?: string[];
   requirement_titles: string[];
   step_count: number;
   reason: string;
   signals?: string[];
   risk_score?: number;
   impact_level: "critical" | "high" | "medium" | "low";
+  failure_count?: number;
+  blocked_count?: number;
+  bug_count?: number;
+  last_failure_at?: string | null;
+  selection_basis?: string[];
+  evidence?: {
+    result_ids: string[];
+    bug_ids: string[];
+    requirement_ids: string[];
+    run_ids: string[];
+  };
+};
+
+export type SmartExecutionEvidenceSummary = {
+  scoped_requirement_count: number;
+  scoped_bug_count: number;
+  scoped_run_count: number;
+  failed_case_count: number;
+  blocked_case_count: number;
+  candidate_case_count: number;
+  returned_case_count: number;
+  scanned_case_count: number;
+  scan_truncated: boolean;
 };
 
 export type SmartExecutionPreviewResponse = {
@@ -949,11 +1002,21 @@ export type SmartExecutionPreviewResponse = {
     id: string;
     name: string;
   };
+  delivery_scope?: {
+    release: string | null;
+    sprint: string | null;
+    build: string | null;
+  };
   source_case_count: number;
   matched_case_count: number;
+  evidence_summary?: SmartExecutionEvidenceSummary;
+  query_strategy?: string[];
+  retrieved_context_count?: number;
   execution_name: string;
   summary: string;
   cases: SmartExecutionImpactCase[];
+  request_id?: string;
+  generation_mode?: "llm" | "deterministic" | string;
 };
 
 export type TestSuite = {
@@ -1007,6 +1070,10 @@ export type TestCase = {
   step_count?: number;
   step_types?: TestStepType[];
   api_only?: boolean;
+  detail_complete?: boolean;
+  summary_complete?: boolean;
+  external_reference_count?: number;
+  external_references_truncated?: boolean;
   [key: string]: unknown;
   created_by?: string | null;
   updated_by?: string | null;

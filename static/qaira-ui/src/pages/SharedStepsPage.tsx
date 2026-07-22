@@ -37,6 +37,7 @@ import { useCurrentAppType, useCurrentProject } from "../hooks/useCurrentProject
 import { useFeatureFlags } from "../hooks/useFeatureFlags";
 import { api } from "../lib/api";
 import { formatAuditTimestamp, resolveAuditUserLabel } from "../lib/auditDisplay";
+import { asArray } from "../lib/collectionGuards";
 import { readDefaultCatalogViewMode } from "../lib/viewPreferences";
 import { areFeatureFlagsEnabled } from "../lib/featureFlags";
 import { hasPermission } from "../lib/permissions";
@@ -120,7 +121,7 @@ const cloneSharedGroupStep = (
 const draftFromGroup = (group: SharedStepGroup): SharedGroupDraft => ({
   name: group.name,
   description: group.description || "",
-  steps: (group.steps || []).map((step) => ({
+  steps: asArray(group.steps).map((step) => ({
     id: createDraftStepId(),
     action: step.action || "",
     expected_result: step.expected_result || "",
@@ -216,41 +217,41 @@ export function SharedStepsPage() {
 
   const projectsQuery = useQuery({
     queryKey: ["projects"],
-    queryFn: api.projects.list
+    queryFn: async () => asArray(await api.projects.list())
   });
   const appTypesQuery = useQuery({
     queryKey: ["app-types", projectId],
-    queryFn: () => api.appTypes.list({ project_id: projectId }),
+    queryFn: async () => asArray(await api.appTypes.list({ project_id: projectId })),
     enabled: Boolean(projectId)
   });
   const sharedGroupsQuery = useQuery({
     queryKey: ["shared-step-groups", appTypeId],
-    queryFn: () => api.sharedStepGroups.list({ app_type_id: appTypeId }),
+    queryFn: async () => asArray(await api.sharedStepGroups.list({ app_type_id: appTypeId })),
     enabled: Boolean(appTypeId)
   });
   const requirementsQuery = useQuery({
     queryKey: ["shared-steps-requirements", projectId],
-    queryFn: () => api.requirements.list({ project_id: projectId }),
+    queryFn: async () => asArray(await api.requirements.list({ project_id: projectId })),
     enabled: Boolean(projectId)
   });
   const testCasesQuery = useQuery({
     queryKey: ["shared-steps-test-cases", appTypeId],
-    queryFn: () => api.testCases.list({ app_type_id: appTypeId }),
+    queryFn: async () => asArray(await api.testCases.list({ app_type_id: appTypeId })),
     enabled: Boolean(appTypeId)
   });
   const executionResultsQuery = useQuery({
     queryKey: ["shared-steps-execution-results", appTypeId],
-    queryFn: () => api.executionResults.list({ app_type_id: appTypeId }),
+    queryFn: async () => asArray(await api.executionResults.list({ app_type_id: appTypeId })),
     enabled: Boolean(appTypeId)
   });
   const suitesQuery = useQuery({
     queryKey: ["shared-steps-test-suites", appTypeId],
-    queryFn: () => api.testSuites.list({ app_type_id: appTypeId }),
+    queryFn: async () => asArray(await api.testSuites.list({ app_type_id: appTypeId })),
     enabled: Boolean(appTypeId)
   });
   const usersQuery = useQuery({
     queryKey: ["users"],
-    queryFn: api.users.list
+    queryFn: async () => asArray(await api.users.list())
   });
 
   const createSharedGroup = useMutation({ mutationFn: api.sharedStepGroups.create });
@@ -260,14 +261,14 @@ export function SharedStepsPage() {
   });
   const deleteSharedGroup = useMutation({ mutationFn: api.sharedStepGroups.delete });
 
-  const projects = projectsQuery.data || [];
-  const appTypes = appTypesQuery.data || [];
-  const sharedGroups = sharedGroupsQuery.data || [];
-  const requirements = requirementsQuery.data || [];
-  const testCases = testCasesQuery.data || [];
-  const executionResults = executionResultsQuery.data || [];
-  const suites = suitesQuery.data || [];
-  const users = (usersQuery.data || []) as User[];
+  const projects = asArray(projectsQuery.data);
+  const appTypes = asArray(appTypesQuery.data);
+  const sharedGroups = asArray(sharedGroupsQuery.data);
+  const requirements = asArray(requirementsQuery.data);
+  const testCases = asArray(testCasesQuery.data);
+  const executionResults = asArray(executionResultsQuery.data);
+  const suites = asArray(suitesQuery.data);
+  const users = asArray<User>(usersQuery.data);
   const userById = useMemo(
     () =>
       users.reduce<Record<string, User>>((accumulator, user) => {
@@ -470,7 +471,7 @@ export function SharedStepsPage() {
         group.id,
         group.name,
         richTextToPlainText(group.description || ""),
-        ...(group.steps || []).map((step) => `${richTextToPlainText(step.action || "")} ${richTextToPlainText(step.expected_result || "")}`)
+        ...asArray(group.steps).map((step) => `${richTextToPlainText(step.action || "")} ${richTextToPlainText(step.expected_result || "")}`)
       ]
         .join(" ")
         .toLowerCase()
@@ -484,7 +485,7 @@ export function SharedStepsPage() {
   );
   const historyBySharedGroupId = useMemo(() => {
     const groupIdsByCaseId = sharedGroups.reduce<Record<string, string[]>>((map, group) => {
-      (group.used_test_cases || []).forEach((testCase) => {
+      asArray(group.used_test_cases).forEach((testCase) => {
         map[testCase.id] = map[testCase.id] || [];
         map[testCase.id].push(group.id);
       });
@@ -1131,7 +1132,7 @@ export function SharedStepsPage() {
 
   const coverageMeta = {
     total: sharedGroups.length,
-    totalSteps: sharedGroups.reduce((count, group) => count + (group.step_count || group.steps.length || 0), 0),
+    totalSteps: sharedGroups.reduce((count, group) => count + (group.step_count || asArray(group.steps).length), 0),
     usedInCases: sharedGroups.reduce((count, group) => count + (group.usage_count || 0), 0)
   };
   const sharedStepPreview = richTextToPlainText(groupDraft.steps[0]?.action || groupDraft.steps[0]?.expected_result || "");

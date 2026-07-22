@@ -145,7 +145,7 @@ export function AiDesignStudioModal({
   const selectedRequirementCount = selectedRequirementIds.length;
   const selectedRequirementLabel = allowMultipleRequirements
     ? `${selectedRequirementCount} selected`
-    : requirements.find((requirement) => requirement.id === selectedRequirementIds[0])?.title || "No requirement selected";
+    : requirements.find((requirement) => requirement.id === selectedRequirementIds[0])?.title || "No story selected";
   const scopedPreviewRequirements = selectedRequirementIds.length
     ? requirements.filter((requirement) => selectedRequirementIds.includes(requirement.id))
     : requirements;
@@ -185,7 +185,7 @@ export function AiDesignStudioModal({
     return [requirement.display_id, requirement.id, requirement.title, requirement.description, requirement.status, String(requirement.priority ?? "")]
       .some((value) => String(value || "").toLowerCase().includes(query));
   });
-  const schedulerHelpText = scheduleHelperText || "Queue one AI generation run per selected requirement. Generated cases land back in the library with accept and reject review actions.";
+  const schedulerHelpText = scheduleHelperText || "Queue one AI generation run per selected story. Generated cases land back in the library with accept and reject review actions.";
   const selectedPreviewCount = previewCases.filter((item) => selectedPreviewCaseIds.includes(item.client_id)).length;
   const isEveryPreviewSelected = Boolean(previewCases.length) && selectedPreviewCount === previewCases.length;
   const handleTogglePreviewCase = (clientId: string, checked: boolean) => {
@@ -217,7 +217,7 @@ export function AiDesignStudioModal({
         return;
       }
       const sections = [
-        "QAira smart context pack: use this as supporting evidence only; generated test cases must still map to the selected requirements.",
+        "QAira smart context pack: use this as supporting evidence only; generated test cases must still map to the selected stories.",
         requirementSection,
         knowledgeSection,
         fileContext.section
@@ -225,7 +225,7 @@ export function AiDesignStudioModal({
 
       onAdditionalContextChange(mergeAiContextPack(additionalContext, sections));
       setSmartContextMessage([
-        `Added ${selectedRequirements.length} requirement${selectedRequirements.length === 1 ? "" : "s"}`,
+        `Added ${selectedRequirements.length} ${selectedRequirements.length === 1 ? "story" : "stories"}`,
         `${(knowledgePackage.knowledge || []).length} knowledge item${(knowledgePackage.knowledge || []).length === 1 ? "" : "s"}`,
         fileContext.section ? `file context compressed ${fileContext.totalOriginalChars.toLocaleString()}→${fileContext.totalPackedChars.toLocaleString()} chars` : "",
         fileContext.skipped.length ? `Skipped: ${fileContext.skipped.join(", ")}` : ""
@@ -258,12 +258,12 @@ export function AiDesignStudioModal({
         <div className="ai-studio-header">
           <div className="ai-studio-header-copy">
             <p className="dialog-context-label">{requirementLabel}</p>
-            <h2 className="dialog-title" id="ai-requirement-selection-title">Select requirements</h2>
+            <h2 className="dialog-title" id="ai-requirement-selection-title">Select stories</h2>
             <p>{selectedRequirementCount} of {requirements.length} selected</p>
           </div>
-          <DialogCloseButton label="Close requirement selection" onClick={closeRequirementDialog} />
+          <DialogCloseButton label="Close story selection" onClick={closeRequirementDialog} />
         </div>
-        <FormField label="Search requirements">
+        <FormField label="Search stories">
           <input
             autoFocus
             placeholder="Search title, description, status, or priority"
@@ -294,7 +294,7 @@ export function AiDesignStudioModal({
               </div>
             </label>
           ))}
-          {!filteredRequirements.length ? <div className="empty-state compact">No requirements match the current search.</div> : null}
+          {!filteredRequirements.length ? <div className="empty-state compact">No stories match the current search.</div> : null}
         </div>
         <div className="action-row ai-studio-footer">
           <button className="ghost-button" onClick={() => onRequirementSelectionChange(requirements.map((requirement) => requirement.id))} type="button">
@@ -329,7 +329,7 @@ export function AiDesignStudioModal({
             <div className="modal-title-info-row">
               <h2 className="dialog-title ai-studio-title" id="ai-design-studio-title">AI test case generation</h2>
               <InfoTooltip
-                content="Shape the LLM prompt with source requirements, extra context, photos, and external links before reviewing the generated cases for approval."
+                content="Shape the LLM prompt with source stories, extra context, photos, and external links before reviewing the generated cases for approval."
                 label="AI test case generation information"
               />
             </div>
@@ -352,7 +352,7 @@ export function AiDesignStudioModal({
                         className="ghost-button compact ai-requirement-dialog-button"
                         data-autofocus="true"
                         onClick={() => setIsRequirementDialogOpen(true)}
-                        title="Expand requirement selection"
+                        title="Expand story selection"
                         type="button"
                       >
                         <AiExpandIcon />
@@ -392,7 +392,7 @@ export function AiDesignStudioModal({
                     </FormField>
 
                     {onSchedule && onParallelRequirementCountChange ? (
-                      <FormField label="Requirements in parallel">
+                      <FormField label="Stories in parallel">
                         <input
                           min="1"
                           max="5"
@@ -438,7 +438,7 @@ export function AiDesignStudioModal({
                   <div className="ai-smart-context-card">
                     <div>
                       <strong>Smart context</strong>
-                      <span>Pull selected requirements, relevant AI Knowledge, and safe text files into a size-limited prompt pack.</span>
+                      <span>Pull selected stories, relevant AI Knowledge, and safe text files into a size-limited prompt pack.</span>
                     </div>
                     <div className="ai-smart-context-actions">
                       <label className="ghost-button compact ai-context-file-button">
@@ -578,7 +578,7 @@ export function AiDesignStudioModal({
                   {!existingCases.length ? (
                     <div className="empty-state compact ai-generation-empty-state">
                       <strong>No linked cases yet</strong>
-                      <span>The selected requirement scope has no reusable test cases attached.</span>
+                      <span>The selected story scope has no reusable test cases attached.</span>
                     </div>
                   ) : null}
                 </div>
@@ -588,7 +588,7 @@ export function AiDesignStudioModal({
                 <div className="panel-head">
                   <div>
                     <p className="eyebrow">AI draft cases</p>
-                    <p>Review the generated drafts, select the cases to accept, and adjust requirement mapping if needed.</p>
+                    <p>Review the generated drafts, select the cases to accept, and adjust story mapping if needed.</p>
                   </div>
                   {previewCases.length ? (
                     <label className="checkbox-field ai-preview-select-all">
@@ -628,7 +628,7 @@ export function AiDesignStudioModal({
 
                       {scopedPreviewRequirements.length ? (
                         <div className="ai-case-requirements">
-                          <strong>Requirement mapping</strong>
+                          <strong>Story mapping</strong>
                           <div className="selection-chip-row">
                             {scopedPreviewRequirements.map((requirement) => {
                               const isSelected = item.requirement_ids.includes(requirement.id);

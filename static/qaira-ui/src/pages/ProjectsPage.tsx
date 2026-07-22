@@ -1,6 +1,6 @@
 import { FormEvent, useCallback, useDeferredValue, useEffect, useMemo, useState } from "react";
-import type { CSSProperties } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import type { CSSProperties, ReactNode } from "react";
+import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
 import { AddIcon, GithubIcon, GoogleDriveIcon, OpenIcon, PlayIcon, TrashIcon } from "../components/AppIcons";
 import { AppTypeDropdown, AppTypeInlineValue } from "../components/AppTypeDropdown";
@@ -13,8 +13,10 @@ import { DataTable, type DataTableColumn } from "../components/DataTable";
 import { DisplayIdBadge } from "../components/DisplayIdBadge";
 import { FormField } from "../components/FormField";
 import { InfoTooltip } from "../components/InfoTooltip";
+import { LoadingState } from "../components/LoadingState";
 import { Panel } from "../components/Panel";
 import { ProgressMeter } from "../components/ProgressMeter";
+import { ProjectTraceabilityMap } from "../components/ProjectTraceabilityMap";
 import { RichTextContent, RichTextEditor, richTextToPlainText } from "../components/RichTextEditor";
 import {
   TileCardAppTypesIcon,
@@ -30,17 +32,18 @@ import { TileCardSkeletonGrid } from "../components/TileCardSkeletonGrid";
 import { ToastMessage } from "../components/ToastMessage";
 import { WorkspaceBackButton, WorkspaceMasterDetail } from "../components/WorkspaceMasterDetail";
 import { useDeleteConfirmation } from "../components/DeleteConfirmationDialog";
-import { useCurrentProject } from "../hooks/useCurrentProject";
+import { useCurrentAppType, useCurrentProject } from "../hooks/useCurrentProject";
 import { useDomainMetadata } from "../hooks/useDomainMetadata";
 import { useWorkspaceData } from "../hooks/useWorkspaceData";
 import { useAuth } from "../auth/AuthContext";
 import { formatAuditTimestamp } from "../lib/auditDisplay";
+import { getVerifiedNextPageCursor, normalizePagedResult } from "../lib/collectionGuards";
 import { readDefaultCatalogViewMode } from "../lib/viewPreferences";
 import { hasPermission } from "../lib/permissions";
 import { resolveVisibleEmail } from "../lib/userDisplay";
-import type { AppType, Execution, ExecutionResult, Project, WorkspaceTransaction } from "../types";
+import type { AppType, Execution, ExecutionResult, Issue, Project, Requirement, TestCase, TestCaseModule, WorkspaceTransaction } from "../types";
 
-type ProjectSection = "members" | "appTypes";
+type ProjectSection = "traceability" | "members" | "appTypes";
 
 type ProjectAppTypeDraft = {
   id: string;
@@ -272,7 +275,7 @@ const resolveProjectHealth = ({
 
 const getProjectInsight = (item: Omit<ProjectPortfolioItem, "insight">) => {
   if (!item.requirementCount && !item.testCaseCount) {
-    return "Start by importing requirements or creating the first test suite.";
+    return "Start by importing stories or creating the first test suite.";
   }
 
   if (item.latestFailedCount > 0 || item.latestBlockedCount > 0) {
@@ -284,7 +287,7 @@ const getProjectInsight = (item: Omit<ProjectPortfolioItem, "insight">) => {
   }
 
   if (item.coverage.totalRequirements > 0 && item.coverage.coveragePercent < 80) {
-    return "Requirement traceability has gaps. Link uncovered requirements before release planning.";
+    return "Story traceability has gaps. Link uncovered stories before release planning.";
   }
 
   if (item.passCoverage.totalCases > 0 && item.passCoverage.coveragePercent >= 80) {
@@ -318,6 +321,42 @@ function ProjectProgressBar({
   );
 }
 
+function PortfolioMetricCard({
+  label,
+  value,
+  caption,
+  evidence,
+  tone
+}: {
+  label: string;
+  value: ReactNode;
+  caption: string;
+  evidence: string[];
+  tone?: "danger" | "warning" | "success" | "info";
+}) {
+  const [isEvidenceOpen, setIsEvidenceOpen] = useState(false);
+  return (
+    <article className={["project-stat-card", tone, isEvidenceOpen ? "is-evidence-open" : ""].filter(Boolean).join(" ")}>
+      <button
+        aria-expanded={isEvidenceOpen}
+        className="project-stat-card-trigger metric-evidence-trigger"
+        onClick={() => setIsEvidenceOpen((current) => !current)}
+        type="button"
+      >
+        <span>{label}</span>
+        <strong>{value}</strong>
+        <small>{caption}</small>
+        <span className="metric-evidence-hint">{isEvidenceOpen ? "Hide evidence" : "View evidence"}</span>
+      </button>
+      {isEvidenceOpen ? (
+        <ul className="project-stat-evidence" aria-label={`${label} evidence`}>
+          {evidence.map((item) => <li key={item}>{item}</li>)}
+        </ul>
+      ) : null}
+    </article>
+  );
+}
+
 export function ProjectsPage() {
   const queryClient = useQueryClient();
   const navigate = useNavigate();
@@ -339,11 +378,13 @@ export function ProjectsPage() {
     testSuites: loadProjectMetrics,
     testCases: loadProjectMetrics,
     executions: loadProjectMetrics,
-    executionResults: loadProjectMetrics
+    executionResults: loadProjectMetrics,
+    testCasesProjection: "summary"
   });
   const [selectedProjectId, setSelectedProjectId] = useCurrentProject();
   const [focusedProjectId, setFocusedProjectId] = useState("");
-  const [section, setSection] = useState<ProjectSection>("members");
+  const [section, setSection] = useState<ProjectSection>("traceability");
+  const [traceabilityAppTypeId, setTraceabilityAppTypeId] = useState("");
   const [message, setMessage] = useState("");
   const [messageTone, setMessageTone] = useState<"success" | "error">("success");
   const [isCreateModalOpen, setIsCreateModalOpen] = useState(false);
@@ -416,6 +457,7 @@ export function ProjectsPage() {
   );
   const scopedProject = focusedProject || selectedProject;
   const projectId = scopedProject?.id;
+  const [, setCurrentAppTypeId] = useCurrentAppType(projectId);
 
   useEffect(() => {
     if (focusedProjectId && !projectItems.some((project) => String(project.id) === String(focusedProjectId))) {
@@ -762,8 +804,14 @@ export function ProjectsPage() {
 
   const portfolioSummary = useMemo(() => {
     const totalProjects = projectPortfolioItems.length;
-    const riskyProjects = projectPortfolioItems.filter((item) => item.healthTone === "danger").length;
-    const releaseReadyProjects = projectPortfolioItems.filter((item) => item.healthTone === "success").length;
+    const riskyItems = projectPortfolioItems.filter((item) => item.healthTone === "danger");
+    const watchItems = projectPortfolioItems.filter((item) => item.healthTone === "warning");
+    const releaseReadyItems = projectPortfolioItems.filter((item) => item.healthTone === "success");
+    const assessedItems = projectPortfolioItems.filter((item) => item.healthTone !== "neutral");
+    const riskyProjects = riskyItems.length;
+    const watchProjects = watchItems.length;
+    const releaseReadyProjects = releaseReadyItems.length;
+    const attentionProjects = riskyProjects + watchProjects;
     const averageRequirementCoverage = totalProjects
       ? Math.round(projectPortfolioItems.reduce((sum, item) => sum + item.coverage.coveragePercent, 0) / totalProjects)
       : 0;
@@ -773,14 +821,37 @@ export function ProjectsPage() {
     const overallHealth = totalProjects
       ? Math.round(projectPortfolioItems.reduce((sum, item) => sum + item.readinessScore, 0) / totalProjects)
       : 0;
+    const totalStories = projectPortfolioItems.reduce((sum, item) => sum + item.coverage.totalRequirements, 0);
+    const coveredStories = projectPortfolioItems.reduce((sum, item) => sum + item.coverage.coveredRequirements, 0);
+    const totalCases = projectPortfolioItems.reduce((sum, item) => sum + item.automationCoverage.totalCases, 0);
+    const automatedCases = projectPortfolioItems.reduce((sum, item) => sum + item.automationCoverage.automatedCases, 0);
+    const riskyLatestFailed = riskyItems.reduce((sum, item) => sum + item.latestFailedCount, 0);
+    const riskyLatestBlocked = riskyItems.reduce((sum, item) => sum + item.latestBlockedCount, 0);
+    const riskyLowPassProjects = riskyItems.filter((item) => item.passCoverage.totalCases > 0 && item.passCoverage.coveragePercent < 60).length;
+    const readyWithExecutionEvidence = releaseReadyItems.filter((item) => Boolean(item.latestExecution)).length;
+    const releaseReadyAverage = releaseReadyItems.length
+      ? Math.round(releaseReadyItems.reduce((sum, item) => sum + item.readinessScore, 0) / releaseReadyItems.length)
+      : 0;
 
     return {
       totalProjects,
       riskyProjects,
+      watchProjects,
+      attentionProjects,
       releaseReadyProjects,
+      assessedProjects: assessedItems.length,
       averageRequirementCoverage,
       averageAutomationCoverage,
-      overallHealth
+      overallHealth,
+      totalStories,
+      coveredStories,
+      totalCases,
+      automatedCases,
+      riskyLatestFailed,
+      riskyLatestBlocked,
+      riskyLowPassProjects,
+      readyWithExecutionEvidence,
+      releaseReadyAverage
     };
   }, [projectPortfolioItems]);
 
@@ -876,6 +947,87 @@ export function ProjectsPage() {
     () => (appTypes.data || []).filter((item) => String(item.project_id) === String(projectId)),
     [appTypes.data, projectId]
   );
+  const traceabilityModulesQuery = useQuery({
+    queryKey: ["project-traceability-modules", projectId, traceabilityAppTypeId],
+    queryFn: () => api.testCaseModules.list({ app_type_id: traceabilityAppTypeId }),
+    enabled: Boolean(projectId && traceabilityAppTypeId && loadProjectMetrics),
+    staleTime: 30_000
+  });
+  const traceabilityRequirementsQuery = useInfiniteQuery({
+    queryKey: ["project-traceability-requirements", projectId],
+    queryFn: ({ pageParam }) => api.requirements.listPage({
+      project_id: projectId,
+      page_size: 50,
+      cursor: pageParam,
+      projection: "summary"
+    }).then((value) => normalizePagedResult<Requirement>(value)),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (lastPage, _pages, _lastPageParam, pageParams) => {
+      const cursor = getVerifiedNextPageCursor(lastPage);
+      return cursor && !pageParams.includes(cursor) ? cursor : undefined;
+    },
+    enabled: Boolean(projectId && focusedProject && section === "traceability" && loadProjectMetrics),
+    staleTime: 30_000
+  });
+  const traceabilityCasesQuery = useInfiniteQuery({
+    queryKey: ["project-traceability-cases", projectId, traceabilityAppTypeId],
+    queryFn: ({ pageParam }) => api.testCases.listPage({
+      app_type_id: traceabilityAppTypeId,
+      page_size: 50,
+      cursor: pageParam,
+      projection: "summary"
+    }).then((value) => normalizePagedResult<TestCase>(value)),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (lastPage, _pages, _lastPageParam, pageParams) => {
+      const cursor = getVerifiedNextPageCursor(lastPage);
+      return cursor && !pageParams.includes(cursor) ? cursor : undefined;
+    },
+    enabled: Boolean(projectId && focusedProject && traceabilityAppTypeId && section === "traceability" && loadProjectMetrics),
+    staleTime: 30_000
+  });
+  const traceabilityBugsQuery = useInfiniteQuery({
+    queryKey: ["project-traceability-bugs", projectId],
+    queryFn: ({ pageParam }) => api.issues.listPage({
+      project_id: projectId,
+      page_size: 50,
+      cursor: pageParam,
+      projection: "detail"
+    }).then((value) => normalizePagedResult<Issue>(value)),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (lastPage, _pages, _lastPageParam, pageParams) => {
+      const cursor = getVerifiedNextPageCursor(lastPage);
+      return cursor && !pageParams.includes(cursor) ? cursor : undefined;
+    },
+    enabled: Boolean(projectId && focusedProject && section === "traceability" && loadProjectMetrics),
+    staleTime: 30_000
+  });
+  const traceabilityRequirements = useMemo(
+    () => traceabilityRequirementsQuery.data?.pages.flatMap((page) => page.items) || [],
+    [traceabilityRequirementsQuery.data]
+  );
+  const traceabilityCases = useMemo(
+    () => traceabilityCasesQuery.data?.pages.flatMap((page) => page.items) || [],
+    [traceabilityCasesQuery.data]
+  );
+  const traceabilityBugs = useMemo(
+    () => traceabilityBugsQuery.data?.pages.flatMap((page) => page.items) || [],
+    [traceabilityBugsQuery.data]
+  );
+  const isTraceabilityLoading = traceabilityRequirementsQuery.isLoading || traceabilityCasesQuery.isLoading || traceabilityBugsQuery.isLoading || traceabilityModulesQuery.isLoading;
+  const isTraceabilityError = traceabilityRequirementsQuery.isError || traceabilityCasesQuery.isError || traceabilityBugsQuery.isError || traceabilityModulesQuery.isError;
+  const hasMoreTraceability = Boolean(traceabilityRequirementsQuery.hasNextPage || traceabilityCasesQuery.hasNextPage || traceabilityBugsQuery.hasNextPage);
+  const isLoadingMoreTraceability = traceabilityRequirementsQuery.isFetchingNextPage || traceabilityCasesQuery.isFetchingNextPage || traceabilityBugsQuery.isFetchingNextPage;
+  const traceabilityLoadMoreError = traceabilityRequirementsQuery.isFetchNextPageError || traceabilityCasesQuery.isFetchNextPageError || traceabilityBugsQuery.isFetchNextPageError;
+  useEffect(() => {
+    if (!scopedAppTypes.length) {
+      setTraceabilityAppTypeId("");
+      return;
+    }
+    if (!scopedAppTypes.some((item) => item.id === traceabilityAppTypeId)) {
+      setTraceabilityAppTypeId(scopedAppTypes[0].id);
+      setCurrentAppTypeId(scopedAppTypes[0].id);
+    }
+  }, [scopedAppTypes, setCurrentAppTypeId, traceabilityAppTypeId]);
   const assignableProjectRoles = useMemo(
     () => (roles.data || []).filter((role) => role.id !== "jira-admin"),
     [roles.data]
@@ -1307,12 +1459,12 @@ export function ProjectsPage() {
       description: "Open members, app types, integrations, and project summary."
     },
     {
-      label: "Open requirements",
+      label: "Open stories",
       icon: <TileCardRequirementIcon />,
       onClick: () => openPortfolioProjectPath(item, "/requirements"),
       featureKeys: ["qaira.manual.requirements"],
       requiredPermissions: ["requirement.view"],
-      description: "Review requirement scope and coverage links."
+      description: "Review story scope and coverage links."
     },
     {
       label: "Open test cases",
@@ -1435,7 +1587,7 @@ export function ProjectsPage() {
       render: (item) => (
         <div className="projects-list-meta-cell">
           <strong>{item.appTypeCount} app types</strong>
-          <span>{item.suiteCount} suites / {item.requirementCount} reqs / {item.testCaseCount} cases</span>
+          <span>{item.suiteCount} suites / {item.requirementCount} stories / {item.testCaseCount} cases</span>
         </div>
       )
     },
@@ -1456,7 +1608,7 @@ export function ProjectsPage() {
       sortValue: (item) => item.coverage.coveragePercent,
       render: (item) => (
         <div className="projects-list-meta-cell">
-          <span>Req {item.coverage.coveragePercent}%</span>
+          <span>Story {item.coverage.coveragePercent}%</span>
           <span>Auto {item.automationCoverage.coveragePercent}%</span>
           <span>Pass {item.passCoverage.coveragePercent}%</span>
         </div>
@@ -1503,15 +1655,19 @@ export function ProjectsPage() {
       <section className="projects-command-card">
         <div className="projects-command-copy">
           <h2 className="page-header-title">Projects</h2>
-          <p>Monitor project health, automation maturity, execution confidence and delivery blockers from one workspace.</p>
         </div>
-          <div className="projects-command-insight">
+        <div className="projects-command-insight">
           <span className="projects-ai-chip">AI Insight</span>
-          <h3>{portfolioSummary.riskyProjects || "No"} project{portfolioSummary.riskyProjects === 1 ? "" : "s"} need attention</h3>
+          <h3>{portfolioSummary.attentionProjects || "No"} project{portfolioSummary.attentionProjects === 1 ? "" : "s"} {portfolioSummary.attentionProjects === 1 ? "needs" : "need"} attention</h3>
+          <div className="projects-command-evidence" aria-label="Portfolio attention evidence">
+            <span><strong>{portfolioSummary.riskyProjects}</strong> risky</span>
+            <span><strong>{portfolioSummary.watchProjects}</strong> watch</span>
+            <span><strong>{portfolioSummary.riskyLatestFailed + portfolioSummary.riskyLatestBlocked}</strong> failed or blocked latest results</span>
+          </div>
           <p>
-            {portfolioSummary.riskyProjects
-              ? "Review risky projects before release planning. Low pass rate and blocked cases are weighted into readiness."
-              : "Portfolio readiness is stable. Keep execution evidence fresh as project scope changes."}
+            {portfolioSummary.attentionProjects
+              ? "Evidence combines latest execution outcomes, Story traceability, and pass coverage. Review the affected project cards before release planning."
+              : "No project currently crosses the watch or risk threshold. Keep execution evidence current as delivery scope changes."}
           </p>
           <div className="projects-health-ring" style={{ "--score": `${portfolioSummary.overallHealth}%` } as CSSProperties}>
             <strong>{portfolioSummary.overallHealth}%</strong>
@@ -1520,32 +1676,56 @@ export function ProjectsPage() {
         </div>
       </section>
 
-      <section className="projects-stats-grid" aria-label="Portfolio summary">
-        <article className="project-stat-card">
-          <span>Total Projects</span>
-          <strong>{portfolioSummary.totalProjects}</strong>
-          <small>{formatCompactCount(projectPortfolioItems.filter((item) => item.appTypeCount > 0).length, "project")} with app types</small>
-        </article>
-        <article className="project-stat-card danger">
-          <span>Risky Projects</span>
-          <strong>{portfolioSummary.riskyProjects}</strong>
-          <small>Needs immediate review</small>
-        </article>
-        <article className="project-stat-card warning">
-          <span>Release Ready</span>
-          <strong>{portfolioSummary.releaseReadyProjects}</strong>
-          <small>Passing health threshold</small>
-        </article>
-        <article className="project-stat-card success">
-          <span>Requirement Coverage</span>
-          <strong>{portfolioSummary.averageRequirementCoverage}%</strong>
-          <small>Average across scope</small>
-        </article>
-        <article className="project-stat-card info">
-          <span>Automation Coverage</span>
-          <strong>{portfolioSummary.averageAutomationCoverage}%</strong>
-          <small>Automation maturity</small>
-        </article>
+      <section className="projects-stats-grid metric-strip page-metric-strip" aria-label="Portfolio summary">
+        <PortfolioMetricCard
+          caption="Jira projects in portfolio"
+          evidence={[
+            `${projectPortfolioItems.filter((item) => item.appTypeCount > 0).length} with app types`,
+            `${portfolioSummary.assessedProjects} with assessable QA scope`
+          ]}
+          label="Total Projects"
+          value={portfolioSummary.totalProjects}
+        />
+        <PortfolioMetricCard
+          caption="Needs immediate review"
+          evidence={[
+            `${portfolioSummary.riskyLatestFailed + portfolioSummary.riskyLatestBlocked} failed or blocked in latest runs`,
+            `${portfolioSummary.riskyLowPassProjects} below the 60% pass-confidence threshold`
+          ]}
+          label="Risky Projects"
+          tone="danger"
+          value={portfolioSummary.riskyProjects}
+        />
+        <PortfolioMetricCard
+          caption="Passing health threshold"
+          evidence={[
+            `${portfolioSummary.readyWithExecutionEvidence} with execution evidence`,
+            `${portfolioSummary.releaseReadyAverage}% average readiness`
+          ]}
+          label="Release Ready"
+          tone="success"
+          value={portfolioSummary.releaseReadyProjects}
+        />
+        <PortfolioMetricCard
+          caption="Average across project scope"
+          evidence={[
+            `${portfolioSummary.coveredStories} of ${portfolioSummary.totalStories} Stories linked`,
+            `${portfolioSummary.totalStories - portfolioSummary.coveredStories} coverage gaps`
+          ]}
+          label="Story Coverage"
+          tone="success"
+          value={`${portfolioSummary.averageRequirementCoverage}%`}
+        />
+        <PortfolioMetricCard
+          caption="Automation maturity"
+          evidence={[
+            `${portfolioSummary.automatedCases} of ${portfolioSummary.totalCases} cases automated`,
+            `${portfolioSummary.totalCases - portfolioSummary.automatedCases} manual or incomplete`
+          ]}
+          label="Automation Coverage"
+          tone="info"
+          value={`${portfolioSummary.averageAutomationCoverage}%`}
+        />
       </section>
 
       <WorkspaceMasterDetail
@@ -1646,8 +1826,8 @@ export function ProjectsPage() {
                     const { project, coverage, automationCoverage, passCoverage } = item;
                     const isSelected = String(selectedProjectId) === String(project.id);
                     const requirementCoverageDetail = coverage.totalRequirements
-                      ? `${coverage.coveredRequirements}/${coverage.totalRequirements} requirements covered`
-                      : "No requirements available to measure coverage";
+                      ? `${coverage.coveredRequirements}/${coverage.totalRequirements} stories covered`
+                      : "No stories available to measure coverage";
                     const automationCoverageDetail = automationCoverage.totalCases
                       ? `${automationCoverage.automatedCases}/${automationCoverage.totalCases} cases automated`
                       : "No test cases available to measure automation coverage";
@@ -1734,7 +1914,7 @@ export function ProjectsPage() {
                         <div className="project-card-progress-stack" aria-label={`${project.name} coverage summary`}>
                           <ProjectProgressBar
                             detail={requirementCoverageDetail}
-                            label="Requirement coverage"
+                            label="Story coverage"
                             tone={getMetricTone(coverage.coveredRequirements, coverage.totalRequirements)}
                             value={coverage.coveragePercent}
                           />
@@ -1765,7 +1945,7 @@ export function ProjectsPage() {
                           <span><b>{item.memberCount}</b> Members</span>
                           <span><b>{item.suiteCount}</b> Suites</span>
                           <span><b>{item.testCaseCount}</b> Cases</span>
-                          <span><b>{item.requirementCount}</b> Requirements</span>
+                          <span><b>{item.requirementCount}</b> Stories</span>
                         </div>
 
                         <div className={`project-risk-note ${item.healthTone}`}>
@@ -1813,43 +1993,47 @@ export function ProjectsPage() {
                   <div className="metric-strip">
                     <button
                       aria-label={`Open members for ${focusedProject.name}`}
-                      className="mini-card project-metric-link-card"
+                      className="mini-card project-metric-link-card metric-evidence-trigger"
                       onClick={() => openProjectSection("members")}
                       type="button"
                     >
                       <strong>{scopedMembers.length}</strong>
                       <span>Members</span>
+                      <span className="metric-evidence-hint">Open evidence</span>
                     </button>
                     <button
                       aria-label={`Open app types for ${focusedProject.name}`}
-                      className="mini-card project-metric-link-card"
+                      className="mini-card project-metric-link-card metric-evidence-trigger"
                       onClick={() => openProjectSection("appTypes")}
                       type="button"
                     >
                       <strong>{selectedProjectAppTypeCount}</strong>
                       <span>App types</span>
+                      <span className="metric-evidence-hint">Open evidence</span>
                     </button>
                     <button
-                      aria-label={`Open requirements for ${focusedProject.name}`}
-                      className="mini-card project-metric-link-card"
+                      aria-label={`Open stories for ${focusedProject.name}`}
+                      className="mini-card project-metric-link-card metric-evidence-trigger"
                       onClick={() => openProjectWorkspacePage("/requirements")}
                       type="button"
                     >
                       <strong>{selectedProjectRequirementCount}</strong>
-                      <span>Requirements</span>
+                      <span>Stories</span>
+                      <span className="metric-evidence-hint">Open evidence</span>
                     </button>
                     <button
                       aria-label={`Open test cases for ${focusedProject.name}`}
-                      className="mini-card project-metric-link-card"
+                      className="mini-card project-metric-link-card metric-evidence-trigger"
                       onClick={() => openProjectWorkspacePage("/test-cases")}
                       type="button"
                     >
                       <strong>{selectedProjectTestCaseCount}</strong>
                       <span>Test cases</span>
+                      <span className="metric-evidence-hint">Open evidence</span>
                     </button>
                     <button
                       aria-label={`Open execution results for ${focusedProject.name}`}
-                      className="mini-card project-metric-link-card"
+                      className="mini-card project-metric-link-card metric-evidence-trigger"
                       onClick={() => openProjectWorkspacePage("/executions")}
                       type="button"
                     >
@@ -1859,6 +2043,7 @@ export function ProjectsPage() {
                           ? `Pass rate · ${selectedProjectPassCoverage.passedCases}/${selectedProjectPassCoverage.totalCases} passed`
                           : "Pass rate"}
                       </span>
+                      <span className="metric-evidence-hint">Open evidence</span>
                     </button>
                   </div>
                   <div className="action-row">
@@ -1901,10 +2086,59 @@ export function ProjectsPage() {
               value={section}
               onChange={setSection}
               items={[
+                { value: "traceability", label: "Traceability Map", meta: traceabilityAppTypeId ? "Live" : "—" },
                 { value: "members", label: "Members", meta: `${scopedMembers.length}` },
                 { value: "appTypes", label: "App Types", meta: `${scopedAppTypes.length}` }
               ]}
             />
+
+            {section === "traceability" ? (
+              <Panel title="Traceability map" subtitle="Explore Story-to-Bug coverage for one app type without leaving the project.">
+                {scopedAppTypes.length && traceabilityAppTypeId ? (
+                  isTraceabilityLoading ? <LoadingState label="Loading app-type traceability" /> : isTraceabilityError ? (
+                    <div className="empty-state compact">
+                      <strong>Traceability data could not be loaded.</strong>
+                      <span>Retry the Jira Story, module, test case, and Bug queries without leaving this project.</span>
+                      <button className="ghost-button compact" onClick={() => {
+                        void traceabilityRequirementsQuery.refetch();
+                        void traceabilityCasesQuery.refetch();
+                        void traceabilityBugsQuery.refetch();
+                        void traceabilityModulesQuery.refetch();
+                      }} type="button">Retry map</button>
+                    </div>
+                  ) : <ProjectTraceabilityMap
+                    appTypes={scopedAppTypes}
+                    bugs={traceabilityBugs}
+                    hasMore={hasMoreTraceability}
+                    isLoadingMore={isLoadingMoreTraceability}
+                    loadMoreError={traceabilityLoadMoreError}
+                    modules={(traceabilityModulesQuery.data || []) as TestCaseModule[]}
+                    onAppTypeChange={(id) => {
+                      setTraceabilityAppTypeId(id);
+                      setCurrentAppTypeId(id);
+                    }}
+                    onOpen={(kind, id) => {
+                      const target = kind === "requirement"
+                        ? `/requirements?requirement=${encodeURIComponent(id)}`
+                        : kind === "bug"
+                          ? `/issues?issue=${encodeURIComponent(id)}`
+                          : kind === "module"
+                            ? `/test-cases?module=${encodeURIComponent(id)}`
+                            : `/test-cases?case=${encodeURIComponent(id)}`;
+                      navigate(target);
+                    }}
+                    onLoadMore={() => {
+                      if (traceabilityRequirementsQuery.hasNextPage) void traceabilityRequirementsQuery.fetchNextPage();
+                      if (traceabilityCasesQuery.hasNextPage) void traceabilityCasesQuery.fetchNextPage();
+                      if (traceabilityBugsQuery.hasNextPage) void traceabilityBugsQuery.fetchNextPage();
+                    }}
+                    requirements={traceabilityRequirements}
+                    selectedAppTypeId={traceabilityAppTypeId}
+                    testCases={traceabilityCases}
+                  />
+                ) : <div className="empty-state compact">Add an app type to build its traceability map.</div>}
+              </Panel>
+            ) : null}
 
             {section === "members" ? (
               <Panel title="Project members" subtitle={projectId ? `Assignments for ${scopedProject?.name}` : "Select a project first"}>

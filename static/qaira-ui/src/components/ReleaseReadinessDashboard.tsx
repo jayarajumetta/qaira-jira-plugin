@@ -111,7 +111,9 @@ export function ReleaseReadinessDashboard() {
     roles: false,
     projectMembers: false,
     appTypes: false,
-    testSuites: false
+    testSuites: false,
+    issuesProjection: "summary",
+    testCasesProjection: "summary"
   });
   const projects = workspace.projects.data || [];
   const activeProjectId = String(projectId || projects[0]?.id || "");
@@ -135,6 +137,13 @@ export function ReleaseReadinessDashboard() {
   );
   const testCases = workspace.testCases.data || [];
   const issues = workspace.issues.data || [];
+  const evidenceScopeIncomplete = requirements.length >= 100
+    || testCases.length >= 100
+    || issues.length >= 100
+    || testCases.some((testCase) =>
+      !testCase.app_type_id
+      || (testCase.detail_complete === false && testCase.summary_complete !== true)
+    );
   const scopeOptions = useMemo(
     () => releaseReadinessScopeOptions(requirements, executions, issues),
     [executions, issues, requirements]
@@ -249,6 +258,12 @@ export function ReleaseReadinessDashboard() {
         </div>
       </header>
 
+      {evidenceScopeIncomplete ? (
+        <div className="inline-message" role="status">
+          Readiness is provisional: this view uses a bounded 100-record summary sample and leaves legacy unknown metadata out of definitive conclusions. Use the linked workspaces to review the complete paged scope.
+        </div>
+      ) : null}
+
       <section aria-label="Release scope" className="readiness-scope-bar">
         <div className="readiness-scope-heading">
           <span className="readiness-live-dot" />
@@ -267,7 +282,7 @@ export function ReleaseReadinessDashboard() {
         <>
           <section className={`readiness-decision is-${model.decision.state}`}>
             <div className="readiness-decision-copy">
-              <div className="readiness-decision-status"><span />{model.decision.label}</div>
+              <div className="readiness-decision-status"><span />{evidenceScopeIncomplete ? "Provisional · " : ""}{model.decision.label}</div>
               <h2>{model.decision.summary}</h2>
               <p>{model.decision.primaryAction}</p>
               <div className="readiness-decision-chips">
@@ -278,7 +293,7 @@ export function ReleaseReadinessDashboard() {
               </div>
             </div>
             <div className="readiness-score" style={scoreStyle}>
-              <div><span>Readiness</span><strong>{model.metrics.readinessScore}</strong><small>out of 100</small></div>
+              <div><span>Readiness</span><strong>{model.metrics.readinessScore}</strong><small>{evidenceScopeIncomplete ? "bounded evidence" : "out of 100"}</small></div>
             </div>
             <div className="readiness-confidence">
               <span>Evidence confidence <strong>{model.metrics.confidence}%</strong></span>
@@ -291,8 +306,8 @@ export function ReleaseReadinessDashboard() {
             </div>
           </section>
 
-          <section aria-label="Readiness metrics" className="readiness-metric-grid">
-            <MetricCard detail={`${model.metrics.coveredRequirementCount} of ${model.metrics.requirementCount} requirements linked`} label="Requirement coverage" progress={model.metrics.coverage} tone={model.metrics.coverage >= 90 ? "green" : "amber"} value={`${model.metrics.coverage}%`} />
+          <section aria-label="Readiness metrics" className="readiness-metric-grid metric-strip page-metric-strip">
+            <MetricCard detail={`${model.metrics.coveredRequirementCount} of ${model.metrics.requirementCount} stories linked`} label="Story coverage" progress={model.metrics.coverage} tone={model.metrics.coverage >= 90 ? "green" : "amber"} value={`${model.metrics.coverage}%`} />
             <MetricCard detail={`${model.metrics.executedCaseCount} of ${model.metrics.plannedCaseCount} cases completed`} label="Execution completion" progress={model.metrics.completion} tone={model.metrics.completion >= 95 ? "green" : "blue"} value={`${model.metrics.completion}%`} />
             <MetricCard detail={`${model.metrics.failedCount} failed · ${model.metrics.blockedCount} blocked`} label="Latest-result pass rate" progress={model.metrics.passRate} tone={model.metrics.passRate >= 90 ? "green" : "red"} value={`${model.metrics.passRate}%`} />
             <MetricCard detail={`${model.metrics.openCriticalBugCount} critical · ${model.metrics.openHighBugCount} high`} label="Open scoped bugs" tone={model.metrics.openCriticalBugCount ? "red" : model.metrics.openHighBugCount ? "amber" : "green"} value={String(model.metrics.openBugCount)} />
@@ -301,7 +316,7 @@ export function ReleaseReadinessDashboard() {
           <nav aria-label="Readiness report views" className="readiness-view-tabs">
             {([
               ["brief", "Decision brief", "Gates and leading risks"],
-              ["traceability", "Traceability", "Requirement-to-evidence matrix"],
+              ["traceability", "Traceability", "Story-to-evidence matrix"],
               ["execution", "Execution evidence", "Runs and latest results"]
             ] as const).map(([id, label, detail]) => (
               <button aria-current={activeView === id ? "page" : undefined} className={activeView === id ? "is-active" : ""} key={id} onClick={() => setActiveView(id)} type="button">
@@ -338,7 +353,7 @@ export function ReleaseReadinessDashboard() {
                 <header><div><p className="readiness-section-kicker">Traceability path</p><h2>Where confidence is lost</h2><span>Follow scope from intent to release evidence.</span></div></header>
                 <div className="readiness-path">
                   {[
-                    { label: "Requirements", value: model.metrics.requirementCount, detail: "Jira scope", to: "/requirements" },
+                    { label: "Stories", value: model.metrics.requirementCount, detail: "Jira scope", to: "/requirements" },
                     { label: "Covered", value: model.metrics.coveredRequirementCount, detail: `${model.metrics.coverage}% mapped`, to: "/test-cases" },
                     { label: "Planned tests", value: model.metrics.plannedCaseCount, detail: "Linked cases", to: "/test-cases" },
                     { label: "Executed", value: model.metrics.executedCaseCount, detail: `${model.metrics.completion}% complete`, to: "/executions" },
@@ -353,7 +368,7 @@ export function ReleaseReadinessDashboard() {
               </section>
 
               <section className="readiness-panel readiness-risk-panel">
-                <header><div><p className="readiness-section-kicker">Priority queue</p><h2>Requirements needing attention</h2><span>Ranked by priority, missing coverage, latest failures, blockers, and open linked bugs.</span></div><button onClick={() => setActiveView("traceability")} type="button">View matrix →</button></header>
+                <header><div><p className="readiness-section-kicker">Priority queue</p><h2>Stories needing attention</h2><span>Ranked by priority, missing coverage, latest failures, blockers, and open linked bugs.</span></div><button onClick={() => setActiveView("traceability")} type="button">View matrix →</button></header>
                 <div className="readiness-risk-list">
                   {model.hotspots.slice(0, 5).map((hotspot) => (
                     <button key={hotspot.id} onClick={() => navigate(`/requirements?requirement=${encodeURIComponent(hotspot.id)}`)} type="button">
@@ -362,7 +377,7 @@ export function ReleaseReadinessDashboard() {
                       <span>{hotspot.coverageCount} tests · {hotspot.openBugCount} bugs</span>
                     </button>
                   ))}
-                  {!model.hotspots.length ? <div className="readiness-empty">No requirements are mapped to this scope yet.</div> : null}
+                  {!model.hotspots.length ? <div className="readiness-empty">No stories are mapped to this scope yet.</div> : null}
                 </div>
               </section>
             </div>
@@ -370,10 +385,10 @@ export function ReleaseReadinessDashboard() {
 
           {activeView === "traceability" ? (
             <section className="readiness-panel readiness-matrix-panel">
-              <header><div><p className="readiness-section-kicker">Traceability analysis</p><h2>Requirement → tests → latest evidence → bugs</h2><span>One row per Jira requirement, ranked by explainable risk.</span></div><div className="readiness-legend"><span><i className="is-pass" />Healthy</span><span><i className="is-warning" />Review</span><span><i className="is-block" />Blocked</span></div></header>
+              <header><div><p className="readiness-section-kicker">Traceability analysis</p><h2>Story → tests → latest evidence → bugs</h2><span>One row per Jira story, ranked by explainable risk.</span></div><div className="readiness-legend"><span><i className="is-pass" />Healthy</span><span><i className="is-warning" />Review</span><span><i className="is-block" />Blocked</span></div></header>
               <div className="readiness-table-wrap">
                 <table className="readiness-matrix">
-                  <thead><tr><th>Requirement</th><th>Priority</th><th>Coverage</th><th>Latest results</th><th>Open bugs</th><th>Risk</th></tr></thead>
+                  <thead><tr><th>Story</th><th>Priority</th><th>Coverage</th><th>Latest results</th><th>Open bugs</th><th>Risk</th></tr></thead>
                   <tbody>
                     {model.hotspots.map((hotspot) => (
                       <tr
@@ -397,7 +412,7 @@ export function ReleaseReadinessDashboard() {
                     ))}
                   </tbody>
                 </table>
-                {!model.hotspots.length ? <div className="readiness-empty">No requirement traceability is available for {scopeLabel}.</div> : null}
+                {!model.hotspots.length ? <div className="readiness-empty">No story traceability is available for {scopeLabel}.</div> : null}
               </div>
             </section>
           ) : null}

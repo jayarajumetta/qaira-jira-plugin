@@ -2,8 +2,8 @@ import type { ReactNode } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { NavLink, Outlet, useLocation, useNavigate } from "react-router-dom";
-import { useQuery } from "@tanstack/react-query";
-import { realtime, showFlag } from "@forge/bridge";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { NavigationTarget, realtime, router, showFlag } from "@forge/bridge";
 import { useAuth } from "../auth/AuthContext";
 import { useLocalization } from "../context/LocalizationContext";
 import { AppTypeInlineValue } from "./AppTypeDropdown";
@@ -46,6 +46,7 @@ import type { AppNotification, AppType, Project } from "../types";
 
 const MOBILE_SIDEBAR_BREAKPOINT = "(max-width: 768px)";
 const NOTIFICATION_REALTIME_CHANNEL = "qaira-notifications";
+const JIRA_PROJECT_PAGE_MODULE_KEY = "qaira-project-workspace";
 
 const navigation = [
   {
@@ -149,6 +150,7 @@ type SidebarScopeSelectorProps = {
   isCollapsed: boolean;
   isLoadingProjects: boolean;
   onProjectChange: (value: string | number) => void;
+  onProjectNavigate: (value: string | number) => void;
   projectId: string;
   projects: Project[];
 };
@@ -243,6 +245,7 @@ function SidebarScopeSelector({
   isCollapsed,
   isLoadingProjects,
   onProjectChange,
+  onProjectNavigate,
   projectId,
   projects
 }: SidebarScopeSelectorProps) {
@@ -375,12 +378,14 @@ function SidebarScopeSelector({
 
   const selectProject = (targetProjectId: string) => {
     onProjectChange(targetProjectId);
+    onProjectNavigate(targetProjectId);
     setExpandedProjectIds((current) => current.includes(targetProjectId) ? current : [...current, targetProjectId]);
     setProjectSearch("");
   };
 
   const selectAppType = (targetProjectId: string, targetAppTypeId: string) => {
     setCurrentScope(targetProjectId, targetAppTypeId);
+    onProjectNavigate(targetProjectId);
     setIsOpen(false);
     setProjectSearch("");
   };
@@ -484,6 +489,7 @@ function SidebarScopeSelector({
 }
 
 export function AppShell() {
+  const queryClient = useQueryClient();
   const location = useLocation();
   const navigate = useNavigate();
   const { session, error, clearError } = useAuth();
@@ -496,9 +502,10 @@ export function AppShell() {
     staleTime: 60 * 1000
   });
   const featureFlagsQuery = useFeatureFlags(Boolean(session));
-  const serverUnreadNotificationsQuery = useQuery({
-    queryKey: ["notifications", "unread"],
-    queryFn: () => api.notifications.list({ status: "unread" }),
+  const [sidebarProjectId, setSidebarProjectId] = useCurrentProject();
+  const serverUnreadNotificationCountQuery = useQuery({
+    queryKey: ["notifications", "unread", sidebarProjectId || "workspace"],
+    queryFn: api.notifications.unreadCount,
     enabled: Boolean(session),
     refetchInterval: 300_000,
     staleTime: 240_000
@@ -508,7 +515,6 @@ export function AppShell() {
   const [isMobileViewport, setIsMobileViewport] = useState(() => window.matchMedia(MOBILE_SIDEBAR_BREAKPOINT).matches);
   const [isMobileSidebarOpen, setIsMobileSidebarOpen] = useState(false);
   const [notificationUnreadCount, setNotificationUnreadCount] = useState(() => getUnreadNotificationCount());
-  const [sidebarProjectId, setSidebarProjectId] = useCurrentProject();
   const notificationRealtimeTokenQuery = useQuery({
     queryKey: ["notifications", "realtime-token", sidebarProjectId || "workspace"],
     queryFn: api.notifications.realtimeToken,
@@ -517,7 +523,6 @@ export function AppShell() {
     staleTime: 9 * 60_000
   });
   const knownServerNotificationIds = useRef(new Set<string>());
-  const serverNotificationFeedInitialized = useRef(false);
 
   const projects = projectsQuery.data || [];
   const hasNoProjects = !projectsQuery.isPending && projects.length === 0;
@@ -527,12 +532,13 @@ export function AppShell() {
   const navCounts = {
     projects: projects.length
   };
-  const visibleServerUnreadNotifications = (serverUnreadNotificationsQuery.data || []).filter((item) => {
-    const preferences = readNotificationPreferences();
-    const preference = item.preference as keyof typeof preferences | undefined;
-    return !preference || preferences[preference] !== false;
-  });
-  const totalNotificationUnreadCount = notificationUnreadCount + visibleServerUnreadNotifications.length;
+  const notificationPreferences = readNotificationPreferences();
+  const visibleServerUnreadCount = Object.entries(serverUnreadNotificationCountQuery.data?.by_preference || {})
+    .reduce((total, [preference, count]) => {
+      if (preference !== "unspecified" && notificationPreferences[preference as keyof typeof notificationPreferences] === false) return total;
+      return total + Number(count || 0);
+    }, 0);
+  const totalNotificationUnreadCount = notificationUnreadCount + visibleServerUnreadCount;
 
   const showAppNotification = useCallback((item: AppNotification) => {
     const preferences = readNotificationPreferences();
@@ -557,15 +563,8 @@ export function AppShell() {
   }, [navigate, session?.user.id]);
 
   useEffect(() => {
-    if (!serverUnreadNotificationsQuery.data) return;
-    const items = serverUnreadNotificationsQuery.data;
-    if (!serverNotificationFeedInitialized.current) {
-      items.forEach((item) => knownServerNotificationIds.current.add(item.id));
-      serverNotificationFeedInitialized.current = true;
-      return;
-    }
-    items.forEach(showAppNotification);
-  }, [serverUnreadNotificationsQuery.data, showAppNotification]);
+    knownServerNotificationIds.current.clear();
+  }, [sidebarProjectId]);
 
   useEffect(() => {
     const token = notificationRealtimeTokenQuery.data?.token;
@@ -579,12 +578,15 @@ export function AppShell() {
       }
       if (!item?.id) return;
       showAppNotification(item);
-      void serverUnreadNotificationsQuery.refetch();
+      void Promise.all([
+        queryClient.resetQueries({ queryKey: ["notifications", "feed", sidebarProjectId || "workspace"], exact: true }),
+        queryClient.invalidateQueries({ queryKey: ["notifications", "unread", sidebarProjectId || "workspace"], exact: true })
+      ]);
     }, { token });
     return () => {
       void subscription.then((activeSubscription) => activeSubscription.unsubscribe()).catch(() => undefined);
     };
-  }, [notificationRealtimeTokenQuery.data?.token, session?.user.id, showAppNotification]);
+  }, [notificationRealtimeTokenQuery.data?.token, queryClient, session?.user.id, showAppNotification, sidebarProjectId]);
 
   useEffect(() => {
     writeWorkspaceTheme(theme);
@@ -702,6 +704,36 @@ export function AppShell() {
       setSidebarProjectId(projects[0].id);
     }
   }, [projects, projectsQuery.isPending, setSidebarProjectId, sidebarProjectId]);
+
+  const navigateToJiraProject = useCallback((nextProjectId: string | number) => {
+    const normalizedProjectId = String(nextProjectId);
+    const isProjectChange = normalizedProjectId !== String(sidebarProjectId);
+
+    if (!isProjectChange) {
+      return;
+    }
+
+    const projectKey = String(
+      projects.find((project) => String(project.id) === normalizedProjectId)?.display_id || ""
+    ).trim();
+    if (!projectKey) {
+      console.warn("Qaira could not switch Jira's native project URL because the selected project has no Jira key.", {
+        projectId: normalizedProjectId
+      });
+      return;
+    }
+
+    void router.navigate({
+      target: NavigationTarget.Module,
+      moduleKey: JIRA_PROJECT_PAGE_MODULE_KEY,
+      projectKey
+    }).catch((navigationError) => {
+      console.warn("Qaira could not switch Jira's native project URL.", {
+        message: navigationError instanceof Error ? navigationError.message : String(navigationError),
+        projectKey
+      });
+    });
+  }, [projects, sidebarProjectId]);
 
   const isWorkspaceWideLibrary = WORKSPACE_LIBRARY_PATHS.has(location.pathname);
 
@@ -858,6 +890,7 @@ export function AppShell() {
               isCollapsed={shouldCollapseSidebar}
               isLoadingProjects={projectsQuery.isPending}
               onProjectChange={setSidebarProjectId}
+              onProjectNavigate={navigateToJiraProject}
               projectId={sidebarProjectId}
               projects={projects}
             />
@@ -981,12 +1014,13 @@ export function AppShell() {
         <div className="sidebar-footer">
           <button
             aria-label="Refresh current screen"
-            className="sidebar-refresh-button ghost-button explorer-icon-button"
+            className={`sidebar-refresh-button ghost-button${shouldCollapseSidebar ? " explorer-icon-button" : ""}`}
             onClick={refreshCurrentScreen}
             title="Refresh current screen"
             type="button"
           >
-            <RefreshIcon />
+            {!shouldCollapseSidebar ? <span className="sidebar-refresh-label">Refresh</span> : null}
+            <RefreshIcon size={20} />
           </button>
 
           {!shouldCollapseSidebar ? (

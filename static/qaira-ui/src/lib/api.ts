@@ -96,6 +96,7 @@ type AiRequirementCreationSuggestion = {
   change_summary: string[];
   quality_score: number;
   rationale: string;
+  gherkin_scenarios?: string[];
 };
 
 type AiRequirementCreationPreviewResponse = {
@@ -555,6 +556,7 @@ type BatchQueueResponse = {
   count?: number;
   skipped?: Array<{ id?: string; code?: string; message?: string }>;
   records?: Array<TestCase & { steps?: TestStep[] }>;
+  requirement_records?: Requirement[];
 };
 
 type DashboardStyledReportPayload = {
@@ -659,8 +661,12 @@ export const api = {
       content: string;
       content_html?: string;
       entity_type?: string;
+      entity_id?: string;
       entity_title?: string;
       field_label?: string;
+      app_type_id?: string;
+      requirement_id?: string;
+      module_id?: string;
       aria_label?: string;
     }) => request<AiRichTextRephraseResponse>("/ai/rich-text-rephrase", {
       method: "POST",
@@ -862,14 +868,71 @@ export const api = {
     list: () => request<User[]>("/users")
   },
   notifications: {
-    list: (query?: { status?: "unread" | "read" | string }) =>
-      request<AppNotification[]>(`/notifications${toQueryString(query)}`),
+    list: (query?: { status?: "unread" | "read" | string; cursor?: string; limit?: number }) =>
+      request<PagedResult<AppNotification> & { unread_count: number }>(`/notifications${toQueryString(query)}`),
+    unreadCount: () =>
+      request<{ count: number; by_preference: Record<string, number> }>("/notifications/unread-count"),
     realtimeToken: () =>
       request<{ token: string; expires_at: number }>("/notifications/realtime-token"),
     markRead: (id: string) =>
-      request<{ updated: boolean }>(`/notifications/${id}/read`, { method: "PUT" }),
-    markAllRead: () =>
-      request<{ updated: boolean }>("/notifications/read-all", { method: "PUT" })
+      request<{ updated: boolean }>(`/notifications/${encodeURIComponent(id)}/read`, { method: "PUT" }),
+    markAllRead: async () => {
+      let count = 0;
+      let remaining = 0;
+      let hasMore = true;
+      let failedCount = 0;
+      let stalledBatches = 0;
+
+      for (let batch = 0; batch < 15 && hasMore; batch += 1) {
+        const result = await request<{ updated: boolean; count: number; remaining: number; has_more: boolean; failed_count: number }>("/notifications/read-all", { method: "PUT" });
+        count += result.count;
+        remaining = result.remaining;
+        hasMore = result.has_more;
+        failedCount = result.failed_count;
+        stalledBatches = result.count === 0 && result.has_more ? stalledBatches + 1 : 0;
+        if (stalledBatches >= 2) break;
+      }
+
+      return { updated: !hasMore, partial: hasMore, count, remaining, failed_count: failedCount };
+    },
+    delete: (id: string) =>
+      request<{ deleted: boolean; id: string }>(`/notifications/${encodeURIComponent(id)}`, { method: "DELETE" }),
+    deleteAll: async () => {
+      let before: string | undefined;
+      let count = 0;
+      let hasMore = true;
+      let remaining = 0;
+      let failedCount = 0;
+      let stalledBatches = 0;
+
+      // Keep each Forge invocation bounded. The backend compacts the sharded
+      // project-property index once per batch, while this loop preserves a
+      // single, predictable user action even at the retention ceiling.
+      for (let batch = 0; batch < 10 && hasMore; batch += 1) {
+        const result = await request<{ deleted: boolean; count: number; has_more: boolean; remaining: number; failed_count: number; before: string }>("/notifications", {
+          method: "DELETE",
+          // Let Forge establish the first cutoff with its own clock, then pin
+          // every continuation to that same snapshot boundary.
+          body: JSON.stringify(before ? { before } : {})
+        });
+        before = result.before;
+        count += result.count;
+        hasMore = result.has_more;
+        remaining = result.remaining;
+        failedCount = result.failed_count;
+        stalledBatches = result.count === 0 && result.has_more ? stalledBatches + 1 : 0;
+        if (stalledBatches >= 2) break;
+      }
+
+      return {
+        deleted: !hasMore,
+        partial: hasMore,
+        count,
+        remaining,
+        failed_count: failedCount,
+        before: before || ""
+      };
+    }
   },
   roles: {
     list: () => request<Role[]>("/roles"),
@@ -922,7 +985,7 @@ export const api = {
       request<JiraIssueCreateMetadata>(`/requirements/create-metadata${toQueryString(query)}`),
     editMetadata: (id: string, query?: { project_id?: string }) =>
       request<JiraIssueCreateMetadata>(`/requirements/${id}/edit-metadata${toQueryString(query)}`),
-    create: (input: { project_id: string; title: string; description?: string; external_references?: string[]; labels?: string[]; sprint?: string; fix_version?: string; release?: string; iteration_id?: string; priority?: number; status?: string; additional_fields?: Record<string, unknown> }) =>
+    create: (input: { project_id: string; title: string; description?: string; gherkin_scenarios?: string[]; external_references?: string[]; labels?: string[]; sprint?: string; fix_version?: string; release?: string; iteration_id?: string; priority?: number; status?: string; additional_fields?: Record<string, unknown> }) =>
       request<{ id: string; status_warning?: { code: string; message: string; requested_status?: string | null; current_status?: string | null; issue_key?: string | null } }>("/requirements", { method: "POST", body: JSON.stringify(input) }),
     get: (id: string, query?: { project_id?: string }) =>
       request<Requirement>(`/requirements/${id}${toQueryString(query)}`),
@@ -969,6 +1032,11 @@ export const api = {
         method: "POST",
         body: JSON.stringify(input)
       }),
+    previewGherkin: (input: { project_id: string; integration_id?: string; model?: string; requirements: Array<{ client_id?: string; title: string; description: string; acceptance_criteria?: string[] }> }) =>
+      request<{ requirements: Array<{ client_id: string; gherkin_scenarios: string[] }>; fallback_used: boolean; fallback_reason?: string | null; validation?: { story_count: number; scenario_count: number; repaired_story_count: number; exact_story_draft_used: boolean } }>("/requirements/ai-gherkin-preview", {
+        method: "POST",
+        body: JSON.stringify(input)
+      }),
     createGenerationJob: (input: { project_id: string; integration_id?: string; model?: string; additional_context?: string; external_links?: string[]; images?: AiDesignImageInput[]; priority?: number; status?: string; max_requirements?: number }) =>
       request<AiRequirementGenerationJobResponse>("/requirements/ai-create-jobs", {
         method: "POST",
@@ -1002,6 +1070,7 @@ export const api = {
           risks: string[];
           open_questions: string[];
           change_summary: string[];
+          gherkin_scenarios?: string[];
         };
         fallback_used: boolean;
         fallback_reason?: string | null;
@@ -1014,7 +1083,7 @@ export const api = {
         method: "POST",
         body: JSON.stringify(input)
       }),
-    update: (id: string, input: Partial<{ project_id: string; title: string; description: string; external_references: string[]; labels: string[]; sprint: string; fix_version: string; release: string; iteration_id: string; priority: number; status: string; additional_fields: Record<string, unknown>; expected_revision: number }>) =>
+    update: (id: string, input: Partial<{ project_id: string; title: string; description: string; gherkin_scenarios: string[]; external_references: string[]; labels: string[]; sprint: string; fix_version: string; release: string; iteration_id: string; priority: number; status: string; additional_fields: Record<string, unknown>; expected_revision: number }>) =>
       request<{ updated: boolean; revision: number }>(`/requirements/${id}`, { method: "PUT", body: JSON.stringify(input) }),
     delete: (id: string) => request<{ deleted: boolean }>(`/requirements/${id}`, { method: "DELETE" })
   },
@@ -1030,7 +1099,14 @@ export const api = {
     update: (id: string, input: Partial<{ name: string; description: string; goal: string; state: "future" | "active" | "closed"; start_date: string; end_date: string; requirement_ids: string[]; jira_sprint_id: string; jira_sprint_name: string }>) =>
       request<{ updated: boolean }>(`/requirement-iterations/${id}`, { method: "PUT", body: JSON.stringify(input) }),
     assignRequirements: (id: string, requirement_ids: string[], append = true) =>
-      request<{ updated: boolean; assigned: number }>(`/requirement-iterations/${id}/requirements`, {
+      request<{
+        updated: boolean;
+        assigned: number;
+        total?: number;
+        assigned_issue_ids?: string[];
+        assigned_issue_keys?: string[];
+        sprint?: { id: string; jira_sprint_id?: string | null; name: string; state?: string | null };
+      }>(`/requirement-iterations/${id}/requirements`, {
         method: "PUT",
         body: JSON.stringify({ requirement_ids, append })
       }),
@@ -1054,6 +1130,8 @@ export const api = {
   issues: {
     list: (query?: { project_id?: string; user_id?: string; status?: string; q?: string; page_size?: number; cursor?: string; projection?: "summary" | "detail" }) =>
       request<Issue[]>(`/feedback${toQueryString(query)}`),
+    listPage: (query?: { project_id?: string; user_id?: string; status?: string; q?: string; page_size?: number; cursor?: string; projection?: "summary" | "detail" }) =>
+      request<PagedResult<Issue>>(`/feedback${toQueryString({ ...query, include_page: true })}`),
     get: (id: string, query?: { project_id?: string }) =>
       request<Issue>(`/feedback/${id}${toQueryString(query)}`),
     createMetadata: (query?: { project_id?: string }) =>
@@ -1077,6 +1155,27 @@ export const api = {
       method: "POST",
       body: JSON.stringify(input)
     }),
+    previewAiTriage: (input: { project_id: string; issue_ids: string[] }) =>
+      request<import("../types").AiBugTriagePreview>("/feedback/ai-triage-preview", {
+        method: "POST",
+        body: JSON.stringify(input)
+      }),
+    export: (input: { project_id: string; issue_ids: string[] }) =>
+      request<{ bugs: Issue[]; exported: number }>("/feedback/export", {
+        method: "POST",
+        body: JSON.stringify(input)
+      }),
+    bulkDelete: (input: { project_id: string; issue_ids: string[] }) =>
+      request<{
+        requested: number;
+        deleted: number;
+        deleted_ids: string[];
+        failed: number;
+        failures: Array<{ issue_id: string; display_id: string; code: string; message: string }>;
+      }>("/feedback/bulk-delete", {
+        method: "DELETE",
+        body: JSON.stringify(input)
+      }),
     update: (id: string, input: Partial<IssuePayload>) =>
       request<{ updated: boolean }>(`/feedback/${id}`, { method: "PUT", body: JSON.stringify(input) }),
     delete: (id: string) => request<{ deleted: boolean }>(`/feedback/${id}`, { method: "DELETE" })
@@ -1654,9 +1753,9 @@ export const api = {
         method: "POST",
         body: JSON.stringify(input)
       }),
-    previewSmartPlan: (input: { project_id: string; app_type_id: string; integration_id?: string; release_scope?: string; additional_context?: string; impacted_requirement_ids?: string[]; test_environment_id?: string; test_configuration_id?: string; test_data_set_id?: string }) =>
+    previewSmartPlan: (input: { project_id: string; app_type_id: string; integration_id?: string; release?: string; sprint?: string; build?: string; scope_description?: string; additional_context?: string; impacted_requirement_ids?: string[]; test_environment_id?: string; test_configuration_id?: string; test_data_set_id?: string }) =>
       request<SmartExecutionPreviewResponse>("/executions/smart-plan-preview", { method: "POST", body: JSON.stringify(input) }),
-    create: (input: { project_id: string; app_type_id?: string; suite_ids?: string[]; test_case_ids?: string[]; test_environment_id?: string; test_configuration_id?: string; test_data_set_id?: string; execution_hooks?: Array<Record<string, unknown>>; parallel_enabled?: boolean; parallel_count?: number; execution_mode?: "manual" | "remote" | "local"; engine_base_url?: string; assigned_to?: string; assigned_to_ids?: string[]; release?: string; sprint?: string; build?: string; name?: string; created_by: string }) =>
+    create: (input: { project_id: string; app_type_id?: string; suite_ids?: string[]; test_case_ids?: string[]; test_environment_id?: string; test_configuration_id?: string; test_data_set_id?: string; execution_hooks?: Array<Record<string, unknown>>; parallel_enabled?: boolean; parallel_count?: number; execution_mode?: "manual" | "remote" | "local"; engine_base_url?: string; assigned_to?: string; assigned_to_ids?: string[]; release?: string; sprint?: string; build?: string; name?: string; scope_source?: "smart-run"; default_suite?: { id: string; name: string }; smart_plan?: Record<string, unknown>; created_by: string }) =>
       request<{ id: string }>("/executions", { method: "POST", body: JSON.stringify(input) }),
     createLocalRun: (input: { project_id: string; app_type_id: string; test_case_ids: string[]; test_environment_id?: string; test_configuration_id?: string; test_data_set_id?: string; execution_hooks?: Array<Record<string, unknown>>; assigned_to?: string; assigned_to_ids?: string[]; release?: string; sprint?: string; build?: string; name?: string; created_by: string; engine_base_url?: string }) =>
       request<ExecutionStartResponse & { id: string; execution_mode: "local"; engine_base_url: string }>("/executions/local-run", { method: "POST", body: JSON.stringify(input) }),

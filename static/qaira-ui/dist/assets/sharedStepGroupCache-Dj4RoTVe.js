@@ -1,1 +1,0 @@
-function u(t,e){const a=t.updated_at?Date.parse(t.updated_at):0,r=e.updated_at?Date.parse(e.updated_at):0;return r!==a?r-a:t.name.localeCompare(e.name)}function o(t,e,a){e&&t.setQueryData(["shared-step-groups",e],(r=[])=>[...r.filter(s=>s.id!==a.id),a].sort(u))}function n(t,e,a){e&&t.setQueryData(["shared-step-groups",e],(r=[])=>r.filter(s=>s.id!==a))}export{n as r,o as u};

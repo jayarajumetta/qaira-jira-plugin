@@ -9,6 +9,7 @@ import { CatalogViewToggle } from "../components/CatalogViewToggle";
 import { DataTable, type DataTableColumn } from "../components/DataTable";
 import { DisplayIdBadge } from "../components/DisplayIdBadge";
 import { InfoTooltip } from "../components/InfoTooltip";
+import { LoadingState } from "../components/LoadingState";
 import { PageHeader } from "../components/PageHeader";
 import { Panel } from "../components/Panel";
 import { RecorderSessionInsights } from "../components/RecorderSessionInsights";
@@ -58,6 +59,10 @@ type RepositoryFieldTab = "locators" | "evidence" | "meaning";
 const REPOSITORY_CONFIG_DRAWER_DEFAULT_WIDTH = 440;
 const REPOSITORY_CONFIG_DRAWER_MIN_WIDTH = 360;
 const REPOSITORY_CONFIG_DRAWER_MAX_WIDTH = 720;
+const AUTOMATION_CASE_DETAIL_STALE_TIME_MS = 30_000;
+
+const automationCaseDetailQueryKey = (projectId: string, testCaseId: string) =>
+  ["test-case-detail", projectId || "unselected", testCaseId] as const;
 
 const clampRepositoryConfigDrawerWidth = (value: number) =>
   Math.min(REPOSITORY_CONFIG_DRAWER_MAX_WIDTH, Math.max(REPOSITORY_CONFIG_DRAWER_MIN_WIDTH, value));
@@ -218,7 +223,7 @@ function isAutomatedCase(testCase: TestCase) {
 }
 
 function isManualCase(testCase: TestCase) {
-  return testCase.automated !== "yes";
+  return testCase.automated === "no";
 }
 
 function normalizeMetadataValue(value: unknown) {
@@ -988,6 +993,7 @@ export function AutomationPage({ initialView = "cases" }: { initialView?: Automa
     priority: "3",
     parameterText: ""
   });
+  const lastAutomationCaseDraftSeedRef = useRef("");
   const [stepDrafts, setStepDrafts] = useState<Record<string, AutomationStepDraft>>({});
   const [stepCodeDrafts, setStepCodeDrafts] = useState<Record<string, string>>({});
   const [isParameterDialogOpen, setIsParameterDialogOpen] = useState(false);
@@ -1153,9 +1159,24 @@ export function AutomationPage({ initialView = "cases" }: { initialView?: Automa
   });
   const testCasesQuery = useQuery({
     queryKey: ["test-cases", "automation-workspace", appTypeId],
-    queryFn: () => api.testCases.list({ app_type_id: appTypeId }),
+    queryFn: () => api.testCases.list({ app_type_id: appTypeId, projection: "summary" }),
     enabled: Boolean(appTypeId && session)
   });
+  const selectedAutomationCaseDetailQuery = useQuery({
+    queryKey: automationCaseDetailQueryKey(projectId, selectedCaseId),
+    queryFn: () => api.testCases.get(selectedCaseId, { project_id: projectId }),
+    enabled: Boolean(projectId && selectedCaseId && session),
+    staleTime: AUTOMATION_CASE_DETAIL_STALE_TIME_MS
+  });
+  const selectedAutomationCaseDetail = selectedAutomationCaseDetailQuery.data?.id === selectedCaseId
+    && selectedAutomationCaseDetailQuery.data.detail_complete !== false
+    ? selectedAutomationCaseDetailQuery.data
+    : null;
+  const isAutomationCaseDetailPending = Boolean(
+    selectedCaseId
+    && !selectedAutomationCaseDetail
+    && (selectedAutomationCaseDetailQuery.isPending || selectedAutomationCaseDetailQuery.isFetching)
+  );
   const learningCacheQuery = useQuery({
     queryKey: ["automation-learning-cache", "automation-workspace", projectId, appTypeId],
     queryFn: async () => {
@@ -1184,7 +1205,7 @@ export function AutomationPage({ initialView = "cases" }: { initialView?: Automa
   const automatedStepsQuery = useQuery({
     queryKey: ["test-steps", "automation-workspace", selectedCaseId],
     queryFn: () => api.testSteps.list({ test_case_id: selectedCaseId }),
-    enabled: Boolean(selectedCaseId && session)
+    enabled: Boolean(selectedAutomationCaseDetail && session)
   });
   const executionResultsQuery = useQuery({
     queryKey: ["execution-results", "automation-workspace", appTypeId],
@@ -1211,10 +1232,21 @@ export function AutomationPage({ initialView = "cases" }: { initialView?: Automa
     [automatedCases]
   );
   const manualCases = useMemo(() => testCases.filter(isManualCase), [testCases]);
+  const unknownAutomationCases = useMemo(
+    () => testCases.filter((testCase) => testCase.automated !== "yes" && testCase.automated !== "no"),
+    [testCases]
+  );
   const activeAutomatedCase = automatedCases.find((testCase) => testCase.id === selectedAutomatedCaseId) || automatedCases[0] || null;
-  const activeCase = automatedCases.find((testCase) => testCase.id === selectedCaseId) || null;
-  const isAutomationCaseWorkspaceOpen = Boolean(activeCase);
-  const activeManualCase = testCases.find((testCase) => testCase.id === selectedManualCaseId) || activeCase || manualCases[0] || automatedCases[0] || null;
+  const selectedCaseSummary = automatedCases.find((testCase) => testCase.id === selectedCaseId) || null;
+  const activeCase = selectedAutomationCaseDetail;
+  const isAutomationCaseDetailReady = Boolean(activeCase);
+  const isAutomationCaseWorkspaceOpen = Boolean(selectedCaseId);
+  const activeManualCase = testCases.find((testCase) => testCase.id === selectedManualCaseId)
+    || activeCase
+    || selectedCaseSummary
+    || manualCases[0]
+    || automatedCases[0]
+    || null;
   const automatedSteps = automatedStepsQuery.data || [];
   const executionResults = executionResultsQuery.data || [];
   const historyByCaseId = useMemo(() => {
@@ -1378,8 +1410,8 @@ export function AutomationPage({ initialView = "cases" }: { initialView?: Automa
   }, [activeCase?.display_id, activeCase?.id, activeCase?.title, automationStepGroups, mergedParameterValues, stepCodeDrafts, stepDrafts]);
 
   const exportAutomationCasePdf = () => {
-    if (!activeCase) {
-      showError(new Error("Select an automation case before exporting."), "Unable to export automation case.");
+    if (!isAutomationCaseDetailReady || !activeCase) {
+      showError(new Error("Wait for the complete automation case details before exporting."), "Unable to export automation case.");
       return;
     }
 
@@ -1389,7 +1421,7 @@ export function AutomationPage({ initialView = "cases" }: { initialView?: Automa
       ["Priority", `P${activeCase.priority || 3}`],
       ["Automation", activeCase.automation_status || "ready"],
       ["Suites", activeCaseSuiteIds.length ? activeCaseSuiteIds.join(", ") : "None"],
-      ["Requirement", activeCase.requirement_id || "Not linked"]
+      ["Story", activeCase.requirement_id || "Not linked"]
     ];
     const testDataRows = inlineTestDataGroups.flatMap((group) =>
       group.rows.map((row) => [group.title, row.token, row.locked ? "Supplied at run time" : row.value || "(empty)"])
@@ -1635,6 +1667,7 @@ export function AutomationPage({ initialView = "cases" }: { initialView?: Automa
       setSelectedAutomatedCaseId("");
       setSelectedCaseId("");
       setSelectedManualCaseId("");
+      setIsParameterDialogOpen(false);
       setRecorderSession(null);
     }
   }, [appTypeId, appTypes, appTypesQuery.isPending, projectId, setAppTypeId]);
@@ -1787,9 +1820,21 @@ export function AutomationPage({ initialView = "cases" }: { initialView?: Automa
   }, [activeScreenName, activeScreenRecord?.id, activeScreenRecord?.updated_at, selectedRepositoryEntry?.id, selectedRepositoryEntry?.updated_at]);
 
   useEffect(() => {
+    if (!selectedCaseId) {
+      if (lastAutomationCaseDraftSeedRef.current !== "__none__") {
+        setTestCaseParameterValues({});
+        setSuiteLinkDraftIds([]);
+        lastAutomationCaseDraftSeedRef.current = "__none__";
+      }
+      return;
+    }
+
     if (!activeCase) {
-      setTestCaseParameterValues({});
-      setSuiteLinkDraftIds([]);
+      return;
+    }
+
+    const nextSeedKey = `case:${projectId}:${activeCase.id}:${activeCase.revision ?? activeCase.updated_at ?? "detail"}`;
+    if (lastAutomationCaseDraftSeedRef.current === nextSeedKey) {
       return;
     }
 
@@ -1803,7 +1848,8 @@ export function AutomationPage({ initialView = "cases" }: { initialView?: Automa
     });
     setTestCaseParameterValues(normalizeAutomationParameterValues(activeCase.parameter_values, "t"));
     setSuiteLinkDraftIds(nextSuiteIds);
-  }, [activeCase?.id]);
+    lastAutomationCaseDraftSeedRef.current = nextSeedKey;
+  }, [activeCase, projectId, selectedCaseId]);
 
   useEffect(() => {
     if (!activeCaseSuiteIds.length) {
@@ -1951,6 +1997,7 @@ export function AutomationPage({ initialView = "cases" }: { initialView?: Automa
   const selectAutomationCase = useCallback((testCaseId: string) => {
     const targetCase = automatedCases.find((testCase) => testCase.id === testCaseId) || null;
 
+    setIsParameterDialogOpen(false);
     setSelectedCaseId(testCaseId);
     setSelectedAutomatedCaseId(testCaseId);
     setSearchParams((prev) => {
@@ -2142,6 +2189,7 @@ export function AutomationPage({ initialView = "cases" }: { initialView?: Automa
   };
 
   const closeAutomationCaseWorkspace = () => {
+    setIsParameterDialogOpen(false);
     setSelectedCaseId("");
     setSearchParams((prev) => {
       const next = new URLSearchParams(prev);
@@ -2284,8 +2332,8 @@ export function AutomationPage({ initialView = "cases" }: { initialView?: Automa
 	        throw new Error("Permission required: automation.ai");
 	      }
 
-	      if (!activeCase) {
-	        throw new Error("Select an automation case first.");
+	      if (!isAutomationCaseDetailReady || !activeCase) {
+	        throw new Error("Wait for the complete automation case details before using AI review.");
 	      }
 
       return api.testCases.queueAutomationGenerator(activeCase.id, {
@@ -2301,12 +2349,19 @@ export function AutomationPage({ initialView = "cases" }: { initialView?: Automa
   });
 
   const updateAutomationCase = useMutation({
-    mutationFn: () => {
-      if (!activeCase) {
-        throw new Error("Select an automation case first.");
+    mutationFn: async () => {
+      if (!isAutomationCaseDetailReady || !activeCase) {
+        throw new Error("Wait for the complete automation case details before saving.");
       }
 
-      return api.testCases.update(activeCase.id, {
+      const caseId = activeCase.id;
+      const selectedSuiteParameterTarget = selectedParameterSuite
+        ? {
+            id: selectedParameterSuite.id,
+            parameterValues: normalizeAutomationParameterValues(suiteParameterValues, "s")
+          }
+        : null;
+      const response = await api.testCases.update(caseId, {
         title: caseDraft.title.trim(),
         description: caseDraft.description.trim(),
         status: caseDraft.status.trim() || "active",
@@ -2317,18 +2372,25 @@ export function AutomationPage({ initialView = "cases" }: { initialView?: Automa
         },
         suite_id: suiteLinkDraftIds[0] || "",
         suite_ids: suiteLinkDraftIds,
-        automated: "yes"
+        automated: "yes",
+        expected_revision: activeCase.revision
       });
-    },
-    onSuccess: async () => {
-      if (selectedParameterSuite) {
-        await api.testSuites.update(selectedParameterSuite.id, {
-          parameter_values: normalizeAutomationParameterValues(suiteParameterValues, "s")
+
+      if (selectedSuiteParameterTarget) {
+        await api.testSuites.update(selectedSuiteParameterTarget.id, {
+          parameter_values: selectedSuiteParameterTarget.parameterValues
         }).catch(() => null);
       }
+
+      return { caseId, response };
+    },
+    onSuccess: async ({ caseId }) => {
       showSuccess("Automation case updated.");
-      void queryClient.invalidateQueries({ queryKey: ["test-cases"] });
-      void queryClient.invalidateQueries({ queryKey: ["test-case-suites"] });
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: automationCaseDetailQueryKey(projectId, caseId), exact: true }),
+        queryClient.invalidateQueries({ queryKey: ["test-cases"] }),
+        queryClient.invalidateQueries({ queryKey: ["test-case-suites"] })
+      ]);
     },
     onError: (error) => showError(error, "Unable to update automation case.")
   });
@@ -3534,6 +3596,7 @@ export function AutomationPage({ initialView = "cases" }: { initialView?: Automa
         meta={[
           { label: "Automation cases", value: automatedCases.length },
           { label: "Manual link candidates", value: manualCases.length },
+          { label: "Type unknown", value: unknownAutomationCases.length },
           { label: "Repository objects", value: learningCache.length }
         ]}
       />
@@ -3625,7 +3688,7 @@ export function AutomationPage({ initialView = "cases" }: { initialView?: Automa
                     const latest = history[0];
                     const passedRuns = history.filter((result) => result.status === "passed").length;
                     const passRate = history.length ? Math.round((passedRuns / history.length) * 100) : 0;
-                    const isActive = activeCase?.id === testCase.id;
+                    const isActive = selectedCaseId === testCase.id;
                     return (
                       <div
                         aria-pressed={isActive}
@@ -3702,7 +3765,7 @@ export function AutomationPage({ initialView = "cases" }: { initialView?: Automa
                     enableColumnResize
                     enableHeaderColumnReorder
                     emptyMessage="No automation cases match the current search."
-                    getRowClassName={(testCase) => (activeCase?.id === testCase.id ? "is-active-row" : "")}
+                    getRowClassName={(testCase) => (selectedCaseId === testCase.id ? "is-active-row" : "")}
                     getRowKey={(testCase) => testCase.id}
                     hideToolbarCopy
                     onRowClick={(testCase) => selectAutomationCase(testCase.id)}
@@ -3720,23 +3783,41 @@ export function AutomationPage({ initialView = "cases" }: { initialView?: Automa
           detailView={(
           <Panel
             title="Automation case workspace"
-            subtitle={activeCase ? "Switch between case details and keyword step editing without losing the selected context." : "Select an automation case."}
-            actions={activeCase ? (
+            subtitle={activeCase
+              ? "Switch between case details and keyword step editing without losing the selected context."
+              : selectedCaseSummary
+                ? `Loading complete details for ${selectedCaseSummary.title}.`
+                : "Select an automation case."}
+            actions={selectedCaseId ? (
               <div className="testops-action-row">
                 <WorkspaceBackButton label="Back to automation case tiles" onClick={closeAutomationCaseWorkspace} />
-	                <button className="primary-button" disabled={!canRunLocalAutomation || runCase.isPending || activeCase.automated !== "yes" || activeCase.automation_status === "incomplete"} onClick={() => runCase.mutate({ testCase: activeCase })} type="button">
-	                  <PlayIcon />
-	                  <span>{runCase.isPending ? "Starting..." : "Run automated"}</span>
-	                </button>
-	                <button className="ghost-button" disabled={!canUseAutomationAi || optimizeAutomationCase.isPending} onClick={() => optimizeAutomationCase.mutate()} type="button">
-                  <SparkIcon />
-                  <span>{optimizeAutomationCase.isPending ? "Queueing..." : "AI review"}</span>
-                </button>
+                {activeCase ? (
+                  <>
+	                  <button className="primary-button" disabled={!isAutomationCaseDetailReady || !canRunLocalAutomation || runCase.isPending || activeCase.automated !== "yes" || activeCase.automation_status === "incomplete"} onClick={() => runCase.mutate({ testCase: activeCase })} type="button">
+	                    <PlayIcon />
+	                    <span>{runCase.isPending ? "Starting..." : "Run automated"}</span>
+	                  </button>
+	                  <button className="ghost-button" disabled={!isAutomationCaseDetailReady || !canUseAutomationAi || optimizeAutomationCase.isPending} onClick={() => optimizeAutomationCase.mutate()} type="button">
+                      <SparkIcon />
+                      <span>{optimizeAutomationCase.isPending ? "Queueing..." : "AI review"}</span>
+                    </button>
+                  </>
+                ) : null}
               </div>
             ) : undefined}
           >
-            {!activeCase ? (
+            {!selectedCaseId ? (
               <div className="empty-state compact">Select a case tile to inspect its automation detail.</div>
+            ) : isAutomationCaseDetailPending ? (
+              <LoadingState
+                description="Retrieving complete metadata before enabling edits, test data, PDF export, and AI actions."
+                label="Loading automation case details"
+              />
+            ) : !activeCase ? (
+              <div className="empty-state compact">
+                <div>Complete automation case details could not be loaded safely.</div>
+                <button className="primary-button" onClick={() => void selectedAutomationCaseDetailQuery.refetch()} type="button">Retry details</button>
+              </div>
             ) : automatedStepsQuery.isLoading ? (
               <TileCardSkeletonGrid />
             ) : (
@@ -3759,7 +3840,7 @@ export function AutomationPage({ initialView = "cases" }: { initialView?: Automa
 	                        <div><span>Priority</span><strong>P{activeCase.priority || 3}</strong></div>
 	                        <div><span>Automation</span><strong>{activeCase.automation_status || "ready"}</strong></div>
 	                        <div><span>Suites</span><strong>{activeCaseSuiteIds.length || "None"}</strong></div>
-	                        <div><span>Requirement</span><strong>{activeCase.requirement_id || "Not linked"}</strong></div>
+	                        <div><span>Story</span><strong>{activeCase.requirement_id || "Not linked"}</strong></div>
 	                        <div><span>Updated</span><strong>{activeCase.updated_at ? formatRunDate.format(new Date(activeCase.updated_at)) : "Not recorded"}</strong></div>
 	                      </div>
 	                    </div>
@@ -3787,7 +3868,7 @@ export function AutomationPage({ initialView = "cases" }: { initialView?: Automa
 	                          <strong>Test data</strong>
 	                          <span>Same scoped values used by the manual test case. @r values are supplied by the run.</span>
 	                        </div>
-	                        <button className="ghost-button compact" onClick={() => setIsParameterDialogOpen(true)} type="button">
+	                        <button className="ghost-button compact" disabled={!isAutomationCaseDetailReady} onClick={() => setIsParameterDialogOpen(true)} type="button">
 	                          <SparkIcon />
 	                          <span>{detectedStepParameters.length ? `Edit ${detectedStepParameters.length}` : "Edit test data"}</span>
 	                        </button>
@@ -3855,10 +3936,10 @@ export function AutomationPage({ initialView = "cases" }: { initialView?: Automa
                       ) : <div className="empty-state compact">No suites exist for this app type yet.</div>}
 	                    </div>
 		                    <div className="testops-action-row">
-		                      <button className="primary-button" disabled={updateAutomationCase.isPending} onClick={() => updateAutomationCase.mutate()} type="button">
+		                      <button className="primary-button" disabled={!isAutomationCaseDetailReady || updateAutomationCase.isPending} onClick={() => updateAutomationCase.mutate()} type="button">
 		                        <span>{updateAutomationCase.isPending ? "Saving..." : "Save automation case"}</span>
 		                      </button>
-                      <button className="ghost-button" onClick={exportAutomationCasePdf} type="button">
+                      <button className="ghost-button" disabled={!isAutomationCaseDetailReady} onClick={exportAutomationCasePdf} type="button">
                         <ExportIcon size={16} />
                         <span>Export PDF</span>
                       </button>
@@ -4759,7 +4840,7 @@ export function AutomationPage({ initialView = "cases" }: { initialView?: Automa
 	                    <span>{repositoryImportPreview?.fileNames.length ? `${repositoryImportPreview.fileNames.length} source item${repositoryImportPreview.fileNames.length === 1 ? "" : "s"} parsed for the selected application scope.` : "Choose input above to preview normalized repository records before saving."}</span>
 	                  </div>
 	                  {repositoryImportPreview?.inputKinds.length ? (
-	                    <div className="repository-import-metrics">
+	                    <div className="repository-import-metrics metric-strip" aria-label="Repository import metrics" role="group">
 	                      {repositoryImportPreview.inputKinds.map((kind) => <StatusBadge key={kind} value={getRepositoryImportKindLabel(kind)} />)}
 	                    </div>
 	                  ) : null}

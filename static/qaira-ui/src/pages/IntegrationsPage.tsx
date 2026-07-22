@@ -1845,7 +1845,7 @@ export function IntegrationsPage({ embedded = false }: { embedded?: boolean } = 
                   <>
                     <div className="empty-state compact integration-helper">
                       {isGoogleDrive
-                        ? "Store a Google access token and Drive folder so QAira can upload a compressed project artifact with requirements and test case exports."
+                        ? "Store a Google access token and Drive folder so QAira can upload a compressed project artifact with story and test case exports."
                         : "Store a GitHub access token and target repository so QAira can sync test-case-linked automation code and manifests asynchronously."}
                     </div>
 

@@ -17,11 +17,18 @@ export function AppErrorState({
   onRetry?: () => void;
   compact?: boolean;
 }) {
+  const technicalMessage = errorMessage(error, fallbackMessage);
   return (
-    <section className={compact ? "empty-state compact" : "permission-empty-state card"} role="alert">
+    <section className={compact ? "empty-state compact app-error-state" : "permission-empty-state card app-error-state"} role="alert">
       <span className="eyebrow">Unable to load</span>
       <h2>{title}</h2>
-      <p>{errorMessage(error, fallbackMessage)}</p>
+      <p>{fallbackMessage}</p>
+      {error && technicalMessage !== fallbackMessage ? (
+        <details>
+          <summary>Technical details</summary>
+          <code>{technicalMessage}</code>
+        </details>
+      ) : null}
       {onRetry ? (
         <button className="primary-button compact" onClick={onRetry} type="button">
           Try again

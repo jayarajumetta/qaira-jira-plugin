@@ -27,8 +27,19 @@ import {
   summarizeTestCaseVersion,
   testCaseVersionPropertyKey
 } from './testCaseVersions.js';
-import { prioritizeSmartRun } from './smartRunPrioritization.js';
+import { buildSmartRunPlan, matchesAnySmartRunDeliveryScope } from './smartRunPrioritization.js';
 import { isRetryableJiraRequest, retryDelayMs, sleep } from './resilience.js';
+import {
+  buildDeterministicGherkinScenarios,
+  normalizeGherkinPreviewRequirements,
+  normalizeGherkinScenarios,
+  normalizeGherkinStoryDrafts
+} from './requirementGherkin.js';
+import {
+  TEST_CASE_SUMMARY_PROP,
+  buildTestCaseSummaryProperty,
+  readTestCaseSummaryProperty
+} from './testCaseSummary.js';
 import {
   buildDashboardGadgetResult,
   normalizeQualityDashboard,
@@ -77,6 +88,10 @@ const MAX_RUN_SCOPE_STEPS = 2500;
 const MAX_RUN_CASE_STEPS = 500;
 const MAX_RUN_REQUIREMENT_SNAPSHOTS = 100;
 const MAX_SYNC_RELATIONSHIP_TARGETS = 100;
+const MAX_SYNC_EXPORT_RECORDS = 100;
+const JIRA_SPRINT_MOVE_BATCH_SIZE = 50;
+const MAX_BULK_BUG_DELETE_ITEMS = 20;
+const MAX_AI_BUG_TRIAGE_ITEMS = 10;
 const APP_VERSION = '3.0.0';
 const REQUEST_CACHE = new AsyncLocalStorage();
 const CACHE_MISS = Symbol('qaira-cache-miss');
@@ -242,6 +257,15 @@ function asArray(value) {
   return [value];
 }
 
+function validatedGherkinScenarios(value) {
+  const supplied = asArray(value).map((scenario) => String(scenario || '').trim()).filter(Boolean);
+  const normalized = normalizeGherkinScenarios(supplied);
+  if (supplied.some((scenario) => scenario.length > 4_000) || supplied.length !== normalized.length) {
+    fail(400, 'INVALID_GHERKIN', 'Each Gherkin scenario must contain Scenario, Given, When, and Then in that order; up to six 4,000-character scenarios are supported.');
+  }
+  return normalized;
+}
+
 function timeoutError(message, code = 'AI_LLM_TIMEOUT') {
   const error = new Error(message);
   error.code = code;
@@ -403,6 +427,15 @@ async function mapInBatches(items, mapper, batchSize = 20) {
   return values;
 }
 
+async function settleInBatches(items, mapper, batchSize = 20) {
+  const values = [];
+  const safeBatchSize = clamp(Number(batchSize) || 20, 1, 50);
+  for (let offset = 0; offset < items.length; offset += safeBatchSize) {
+    values.push(...await Promise.allSettled(items.slice(offset, offset + safeBatchSize).map(mapper)));
+  }
+  return values;
+}
+
 function titleCase(value) {
   return String(value || '')
     .replace(/[_-]+/g, ' ')
@@ -443,7 +476,9 @@ function selectValue(value) {
 }
 
 function numericValue(value, fallback = 0) {
-  const number = Number(value?.value ?? value);
+  const candidate = value?.value ?? value;
+  if (candidate === undefined || candidate === null || candidate === '') return fallback;
+  const number = Number(candidate);
   return Number.isFinite(number) ? number : fallback;
 }
 
@@ -1097,7 +1132,7 @@ async function jiraBugCreateMetadata(project, registry) {
       requirements_source: 'jira-stories',
       bugs_source: 'qaira-created-jira-bugs',
       synced_fields: ['summary', 'description', 'status', 'priority', 'labels', 'assignee', 'sprint', 'fixVersions', 'attachments'],
-      note: 'Qaira treats Stories as Jira-owned requirements and creates Bugs only after collecting Jira create-screen required fields.'
+      note: 'Qaira uses Jira Stories as the source of truth and creates Bugs only after collecting Jira create-screen required fields.'
     }
   };
 }
@@ -1131,7 +1166,7 @@ async function jiraRequirementCreateMetadata(project, registry) {
       requirements_source: 'jira-stories',
       bugs_source: 'qaira-created-jira-bugs',
       synced_fields: ['summary', 'description', 'status', 'priority', 'labels', 'sprint', 'fixVersions', 'attachments'],
-      note: 'Qaira treats Jira Stories as canonical requirements and only creates a Story after collecting required create-screen fields.'
+      note: 'Qaira uses Jira Stories as the source of truth and only creates a Story after collecting required create-screen fields.'
     }
   };
 }
@@ -1665,6 +1700,20 @@ async function getProjectProperty(projectKey, propertyKey, fallback = null) {
   return value === CACHE_MISS ? fallback : value;
 }
 
+async function getProjectPropertyFresh(projectKey, propertyKey, fallback = null) {
+  const cacheKey = `jira:project-property:${projectKey}:${propertyKey}`;
+  try {
+    const result = await jiraAppRequest(route`/rest/api/3/project/${projectKey}/properties/${propertyKey}`);
+    const value = result.value ?? CACHE_MISS;
+    requestCacheSet(cacheKey, value);
+    return value === CACHE_MISS ? fallback : value;
+  } catch (error) {
+    if (error?.statusCode !== 404) throw error;
+    requestCacheSet(cacheKey, CACHE_MISS);
+    return fallback;
+  }
+}
+
 async function putProjectProperty(projectKey, propertyKey, value) {
   assertPropertySize(value, propertyKey);
   await jiraAppRequest(route`/rest/api/3/project/${projectKey}/properties/${propertyKey}`, {
@@ -1693,10 +1742,20 @@ async function deleteProjectProperty(projectKey, propertyKey) {
 }
 
 async function listProjectPropertyKeys(projectKey) {
+  // Jira's PropertyKeys resource returns all keys in one response and exposes
+  // no pagination cursor, so this single call is exhaustive.
   return requestCached(`jira:project-property-keys:${projectKey}`, async () => {
     const result = await jiraAppRequest(route`/rest/api/3/project/${projectKey}/properties`);
     return asArray(result.keys).map((entry) => entry?.key).filter(Boolean);
   });
+}
+
+async function listProjectPropertyKeysFresh(projectKey) {
+  // Same exhaustive, non-paginated PropertyKeys contract as the cached path.
+  const result = await jiraAppRequest(route`/rest/api/3/project/${projectKey}/properties`);
+  const keys = asArray(result.keys).map((entry) => entry?.key).filter(Boolean);
+  requestCacheSet(`jira:project-property-keys:${projectKey}`, keys);
+  return keys;
 }
 
 async function getCollectionIndex(projectKey, name) {
@@ -1933,6 +1992,253 @@ async function upsertCollectionItem(projectKey, name, input, prefix = name) {
 const NOTIFICATION_REALTIME_CHANNEL = 'qaira-notifications';
 const NOTIFICATION_RETENTION_COUNT = 120;
 const NOTIFICATION_PRUNE_THRESHOLD = 140;
+const NOTIFICATION_DELETE_BATCH_SIZE = 25;
+const NOTIFICATION_MARK_READ_BATCH_SIZE = 10;
+const NOTIFICATION_PAGE_SIZE = 25;
+const NOTIFICATION_MAX_PAGE_SIZE = 50;
+const NOTIFICATION_LEGACY_MIGRATION_BATCH_SIZE = 5;
+const NOTIFICATION_GUARD_RETENTION_MS = 24 * 60 * 60_000;
+const NOTIFICATION_CUTOFF_CLOCK_SKEW_MS = 30_000;
+const NOTIFICATION_V2_ITEM_PREFIX = 'qaira.notification.v2.item.';
+const NOTIFICATION_V2_TOMBSTONE_PREFIX = 'qaira.notification.v2.tombstone.';
+const NOTIFICATION_V2_CUTOFF_PREFIX = 'qaira.notification.v2.cutoff.';
+const notificationMutationLocks = new Map();
+
+async function withNotificationMutationLock(projectKey, userId, operation) {
+  const lockKey = `${String(projectKey)}:${String(userId)}`;
+  const previous = notificationMutationLocks.get(lockKey) || Promise.resolve();
+  let release;
+  const current = new Promise((resolve) => { release = resolve; });
+  notificationMutationLocks.set(lockKey, current);
+  await previous;
+  try {
+    return await operation();
+  } finally {
+    release();
+    if (notificationMutationLocks.get(lockKey) === current) notificationMutationLocks.delete(lockKey);
+  }
+}
+
+function decodePropertyToken(value) {
+  try {
+    return Buffer.from(String(value), 'base64url').toString('utf8');
+  } catch {
+    return null;
+  }
+}
+
+function notificationTimestampToken(value) {
+  const parsed = Date.parse(String(value || ''));
+  return String(Number.isFinite(parsed) ? Math.max(0, Math.trunc(parsed)) : Date.now()).padStart(13, '0');
+}
+
+function notificationItemPropertyKey(userId, status, createdAt, preference, notificationId) {
+  const statusToken = String(status) === 'read' ? 'r' : 'u';
+  const preferenceToken = preference ? safePropertyToken(preference) : 'none';
+  return `${NOTIFICATION_V2_ITEM_PREFIX}${safePropertyToken(userId)}.${statusToken}.${notificationTimestampToken(createdAt)}.${preferenceToken}.${safePropertyToken(notificationId)}`;
+}
+
+function parseNotificationItemPropertyKey(propertyKey) {
+  if (!String(propertyKey).startsWith(NOTIFICATION_V2_ITEM_PREFIX)) return null;
+  const tokens = String(propertyKey).slice(NOTIFICATION_V2_ITEM_PREFIX.length).split('.');
+  if (tokens.length !== 5 || !['u', 'r'].includes(tokens[1]) || !/^\d{13}$/.test(tokens[2])) return null;
+  const itemId = decodePropertyToken(tokens[4]);
+  if (!itemId) return null;
+  return {
+    key: String(propertyKey),
+    userToken: tokens[0],
+    status: tokens[1] === 'r' ? 'read' : 'unread',
+    createdTime: Number(tokens[2]),
+    createdToken: tokens[2],
+    preference: tokens[3] === 'none' ? null : decodePropertyToken(tokens[3]),
+    idToken: tokens[4],
+    itemId,
+    sortKey: `${tokens[2]}.${tokens[4]}`
+  };
+}
+
+function notificationTombstonePropertyKey(userId, notificationId, deletedAt = nowIso()) {
+  return `${NOTIFICATION_V2_TOMBSTONE_PREFIX}${safePropertyToken(userId)}.${notificationTimestampToken(deletedAt)}.${safePropertyToken(notificationId)}`;
+}
+
+function notificationCutoffPropertyKey(userId, before) {
+  return `${NOTIFICATION_V2_CUTOFF_PREFIX}${safePropertyToken(userId)}.${notificationTimestampToken(before)}`;
+}
+
+function parseNotificationTombstonePropertyKey(propertyKey) {
+  if (!String(propertyKey).startsWith(NOTIFICATION_V2_TOMBSTONE_PREFIX)) return null;
+  const tokens = String(propertyKey).slice(NOTIFICATION_V2_TOMBSTONE_PREFIX.length).split('.');
+  if (tokens.length !== 3 || !/^\d{13}$/.test(tokens[1])) return null;
+  return { key: String(propertyKey), userToken: tokens[0], deletedTime: Number(tokens[1]), idToken: tokens[2] };
+}
+
+function parseNotificationCutoffPropertyKey(propertyKey) {
+  if (!String(propertyKey).startsWith(NOTIFICATION_V2_CUTOFF_PREFIX)) return null;
+  const tokens = String(propertyKey).slice(NOTIFICATION_V2_CUTOFF_PREFIX.length).split('.');
+  if (tokens.length !== 2 || !/^\d{13}$/.test(tokens[1])) return null;
+  return { key: String(propertyKey), userToken: tokens[0], cutoffTime: Number(tokens[1]) };
+}
+
+function notificationGuardState(propertyKeys, userToken) {
+  const tombstones = asArray(propertyKeys)
+    .map(parseNotificationTombstonePropertyKey)
+    .filter((entry) => entry?.userToken === userToken);
+  const cutoffs = asArray(propertyKeys)
+    .map(parseNotificationCutoffPropertyKey)
+    .filter((entry) => entry?.userToken === userToken)
+    // Ignore corrupt or manually injected future cutoffs. Legitimate cutoffs
+    // are minted from this Forge invocation's clock.
+    .filter((entry) => entry.cutoffTime <= Date.now() + NOTIFICATION_CUTOFF_CLOCK_SKEW_MS);
+  return {
+    deletedIdTokens: new Set(tombstones.map((entry) => entry.idToken)),
+    maxCutoffTime: cutoffs.reduce((latest, entry) => Math.max(latest, entry.cutoffTime), 0),
+    tombstones,
+    cutoffs
+  };
+}
+
+function notificationEntryIsGuarded(entry, guardState) {
+  return guardState.deletedIdTokens.has(entry.idToken) || entry.createdTime <= guardState.maxCutoffTime;
+}
+
+function scopedNotificationEntries(propertyKeys, userId, { includeGuarded = false, status = null } = {}) {
+  const userToken = safePropertyToken(userId);
+  const guardState = notificationGuardState(propertyKeys, userToken);
+  const entries = asArray(propertyKeys)
+    .map(parseNotificationItemPropertyKey)
+    .filter((entry) => entry?.userToken === userToken)
+    .filter((entry) => includeGuarded || !notificationEntryIsGuarded(entry, guardState));
+  const byId = new Map();
+  for (const entry of entries) {
+    const current = byId.get(entry.idToken);
+    if (!current || (current.status === 'unread' && entry.status === 'read')) byId.set(entry.idToken, entry);
+  }
+  return {
+    entries: [...byId.values()]
+      .filter((entry) => !status || entry.status === status)
+      .sort((left, right) => right.sortKey.localeCompare(left.sortKey)),
+    guardState,
+    userToken
+  };
+}
+
+function notificationUnreadSummary(propertyKeys, userId) {
+  const unreadEntries = scopedNotificationEntries(propertyKeys, userId, { status: 'unread' }).entries;
+  const byPreference = {};
+  for (const entry of unreadEntries) {
+    const preference = entry.preference || 'unspecified';
+    byPreference[preference] = Number(byPreference[preference] || 0) + 1;
+  }
+  return { count: unreadEntries.length, by_preference: byPreference };
+}
+
+function notificationEnvelope(project, notification) {
+  return {
+    schema: 'qaira.notification.v2.item',
+    notification: { ...notification, project_id: String(project.id) },
+    updatedAt: notification.updated_at || nowIso()
+  };
+}
+
+function notificationFromEnvelope(value) {
+  const notification = value?.notification || value?.item || value;
+  return notification && typeof notification === 'object' && !Array.isArray(notification) ? notification : null;
+}
+
+async function loadNotificationEntries(project, accountId, entries) {
+  const values = await readPropertiesInBatches(project.key, entries.map((entry) => entry.key), 10);
+  return entries.map((entry, index) => {
+    const notification = notificationFromEnvelope(values[index]);
+    if (!notification || String(notification.id) !== entry.itemId || String(notification.user_id) !== String(accountId)) return null;
+    return {
+      ...notification,
+      project_id: String(project.id),
+      status: entry.status,
+      preference: notification.preference ?? entry.preference,
+      created_at: notification.created_at || new Date(entry.createdTime).toISOString()
+    };
+  }).filter(Boolean);
+}
+
+async function migrateLegacyNotificationBatch(project, propertyKeys) {
+  const legacyKeys = asArray(propertyKeys)
+    .filter((key) => String(key).startsWith(collectionItemPrefix(COLLECTIONS.notifications)))
+    .slice(0, NOTIFICATION_LEGACY_MIGRATION_BATCH_SIZE);
+  if (!legacyKeys.length) return [];
+  const values = await readPropertiesInBatches(project.key, legacyKeys, NOTIFICATION_LEGACY_MIGRATION_BATCH_SIZE);
+  const existingV2Ids = new Set(asArray(propertyKeys)
+    .map(parseNotificationItemPropertyKey)
+    .filter(Boolean)
+    .map((entry) => `${entry.userToken}.${entry.idToken}`));
+  const candidates = legacyKeys.map((legacyKey, index) => {
+    const notification = notificationFromEnvelope(values[index]);
+    if (!notification?.id || !notification?.user_id) return null;
+    const v2Key = notificationItemPropertyKey(
+      notification.user_id,
+      notification.status,
+      notification.created_at,
+      notification.preference,
+      notification.id
+    );
+    return {
+      legacyKey,
+      notification,
+      v2Key,
+      scopedIdToken: `${safePropertyToken(notification.user_id)}.${safePropertyToken(notification.id)}`
+    };
+  }).filter(Boolean);
+  const migrations = await settleInBatches(candidates, async (candidate) => {
+    if (!existingV2Ids.has(candidate.scopedIdToken)) {
+      await putProjectProperty(project.key, candidate.v2Key, notificationEnvelope(project, candidate.notification));
+    }
+    await deleteProjectProperty(project.key, candidate.legacyKey);
+    return parseNotificationItemPropertyKey(candidate.v2Key);
+  }, NOTIFICATION_LEGACY_MIGRATION_BATCH_SIZE);
+  return migrations.filter((result) => result.status === 'fulfilled').map((result) => result.value).filter(Boolean);
+}
+
+async function pruneNotificationKeyspace(projectKey, userId, propertyKeys) {
+  const userToken = safePropertyToken(userId);
+  const rawItemEntries = asArray(propertyKeys)
+    .map(parseNotificationItemPropertyKey)
+    .filter((entry) => entry?.userToken === userToken);
+  const { entries, guardState } = scopedNotificationEntries(propertyKeys, userId, { includeGuarded: true });
+  const staleIdTokens = entries.length > NOTIFICATION_PRUNE_THRESHOLD
+    ? new Set(entries.slice(NOTIFICATION_RETENTION_COUNT).map((entry) => entry.idToken))
+    : new Set();
+  // Remove every state shard for an expired record. Deleting only the preferred
+  // read shard could expose a stale unread twin after a partial mark-read.
+  const staleItemKeys = rawItemEntries
+    .filter((entry) => staleIdTokens.has(entry.idToken))
+    .map((entry) => entry.key);
+  const expiry = Date.now() - NOTIFICATION_GUARD_RETENTION_MS;
+  const invalidFutureCutoffs = asArray(propertyKeys)
+    .map(parseNotificationCutoffPropertyKey)
+    .filter((entry) => entry?.userToken === userToken)
+    .filter((entry) => entry.cutoffTime > Date.now() + NOTIFICATION_CUTOFF_CLOCK_SKEW_MS)
+    .map((entry) => entry.key);
+  // Guards are eligible for cleanup only when their protected item shards are
+  // gone. A transient Jira DELETE failure must never make a record reappear
+  // when the age-based cleanup window elapses.
+  const staleGuardKeys = [
+    ...invalidFutureCutoffs,
+    ...guardState.tombstones
+      .filter((guard) => guard.deletedTime < expiry && !rawItemEntries.some((entry) => entry.idToken === guard.idToken))
+      .map((entry) => entry.key),
+    ...guardState.cutoffs
+      .filter((guard) => guard.cutoffTime < expiry && !rawItemEntries.some((entry) => entry.createdTime <= guard.cutoffTime))
+      .map((entry) => entry.key)
+  ];
+  const targets = [...new Set([...staleItemKeys, ...staleGuardKeys])].slice(0, NOTIFICATION_DELETE_BATCH_SIZE);
+  if (targets.length) await settleInBatches(targets, (key) => deleteProjectProperty(projectKey, key), 10);
+}
+
+async function loadLegacyNotification(project, accountId, notificationId) {
+  const found = await findCollectionItem(COLLECTIONS.notifications, notificationId, project);
+  return found && String(found.item?.user_id) === String(accountId)
+    ? { item: found.item, key: collectionItemKey(COLLECTIONS.notifications, notificationId) }
+    : null;
+}
 
 function mutationNotificationDescriptor(pathname, method, body = {}, result = {}) {
   if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(method)) return null;
@@ -1953,6 +2259,21 @@ function mutationNotificationDescriptor(pathname, method, body = {}, result = {}
   }
   if (pathname === '/feedback/ai-draft-preview') {
     return { type: 'ai_design_ready', preference: 'aiDesign', title: 'AI bug draft ready', message: 'The evidence-grounded bug draft is ready for review.', tone: 'success', target_url: '/issues' };
+  }
+  if (pathname === '/feedback/ai-triage-preview') {
+    // This route is deliberately side-effect free: even an operational
+    // notification would contradict the review-only preview boundary.
+    return null;
+  }
+  if (pathname === '/feedback/bulk-delete') {
+    return {
+      type: 'bug_deleted',
+      preference: 'issueReports',
+      title: 'Bugs deleted',
+      message: `${Number(result?.deleted || 0)} selected Jira Bug${Number(result?.deleted || 0) === 1 ? '' : 's'} deleted${Number(result?.failed || 0) ? `; ${Number(result.failed)} could not be deleted` : ''}.`,
+      tone: 'warning',
+      target_url: '/issues'
+    };
   }
   if (pathname === '/feedback' || /^\/feedback\/[^/]+$/.test(pathname)) {
     return {
@@ -1993,8 +2314,18 @@ function mutationNotificationDescriptor(pathname, method, body = {}, result = {}
       recipient_ids: [body?.assignee_id, body?.assigned_to, body?.owner_id].filter(Boolean).map(String)
     };
   }
+  if (
+    ['/requirements/ai-create-preview', '/requirements/ai-create-jobs', '/requirements/ai-description-rephrase', '/requirements/ai-gherkin-preview'].includes(pathname)
+    || /^\/requirements\/ai-create-jobs\/[^/]+$/.test(pathname)
+    || /^\/requirements\/[^/]+\/(?:ai-)?(?:optimize-preview|impact-preview)$/.test(pathname)
+    || /^\/requirements\/[^/]+\/design-test-cases-preview$/.test(pathname)
+  ) {
+    // Story AI previews and background-draft queueing are review-only. A
+    // requirement-change notification here would falsely imply Jira changed.
+    return null;
+  }
   if (pathname.startsWith('/requirements') || pathname.startsWith('/requirement-iterations')) {
-    return { type: 'requirement_changed', preference: 'requirementChanges', title: method === 'POST' ? 'Requirement created' : method === 'DELETE' ? 'Requirement deleted' : 'Requirement updated', message: `The requirement workspace changed${suffix}.`, tone: 'info', target_url: '/requirements' };
+    return { type: 'requirement_changed', preference: 'requirementChanges', title: method === 'POST' ? 'Story created' : method === 'DELETE' ? 'Story deleted' : 'Story updated', message: `The Story workspace changed${suffix}.`, tone: 'info', target_url: '/requirements' };
   }
   if (pathname.startsWith('/test-cases') || pathname.startsWith('/test-suites') || pathname.startsWith('/suite-test-cases') || pathname.startsWith('/test-steps') || pathname.startsWith('/shared-step-groups') || pathname.startsWith('/test-case-modules')) {
     return { type: 'test_design_changed', preference: 'testCaseChanges', title: 'Test design updated', message: `Test cases, suites, modules, or reusable steps changed${suffix}.`, tone: 'info', target_url: '/test-cases' };
@@ -2018,33 +2349,40 @@ function mutationNotificationDescriptor(pathname, method, body = {}, result = {}
 }
 
 async function createAppNotification(project, userId, descriptor, sourcePath) {
-  const notification = await upsertCollectionItem(project.key, COLLECTIONS.notifications, {
-    user_id: String(userId),
-    type: descriptor.type,
-    preference: descriptor.preference,
-    title: String(descriptor.title || 'Qaira update').slice(0, 160),
-    message: String(descriptor.message || 'A Qaira workspace event completed.').slice(0, 800),
-    tone: descriptor.tone || 'info',
-    target_url: descriptor.target_url || null,
-    source_path: String(sourcePath || '').slice(0, 300),
-    status: 'unread',
-    created_at: nowIso()
-  }, 'notification');
-  const notificationIndexKey = collectionKey(COLLECTIONS.notifications);
-  const index = await getProjectProperty(project.key, notificationIndexKey, {});
-  const itemKeys = Array.isArray(index?.itemKeys) ? index.itemKeys : [];
-  if (itemKeys.length > NOTIFICATION_PRUNE_THRESHOLD) {
-    const retainedKeys = itemKeys.slice(-NOTIFICATION_RETENTION_COUNT);
-    const retainedKeySet = new Set(retainedKeys);
-    const staleKeys = itemKeys.filter((key) => !retainedKeySet.has(key));
-    await mapInBatches(staleKeys, (propertyKey) => deleteProjectProperty(project.key, propertyKey), 10);
-    await putProjectProperty(project.key, notificationIndexKey, {
-      ...index,
-      itemKeys: retainedKeys,
-      count: retainedKeys.length,
-      updatedAt: nowIso()
-    });
-  }
+  const notification = await withNotificationMutationLock(project.key, userId, async () => {
+    const createdAt = nowIso();
+    const notification = {
+      id: id('notification'),
+      project_id: String(project.id),
+      user_id: String(userId),
+      type: descriptor.type,
+      preference: descriptor.preference,
+      title: String(descriptor.title || 'Qaira update').slice(0, 160),
+      message: String(descriptor.message || 'A Qaira workspace event completed.').slice(0, 800),
+      tone: descriptor.tone || 'info',
+      target_url: descriptor.target_url || null,
+      source_path: String(sourcePath || '').slice(0, 300),
+      status: 'unread',
+      created_at: createdAt,
+      updated_at: createdAt,
+      revision: 1
+    };
+    const propertyKey = notificationItemPropertyKey(userId, 'unread', createdAt, descriptor.preference, notification.id);
+    await putProjectProperty(project.key, propertyKey, notificationEnvelope(project, notification));
+    const propertyKeys = await listProjectPropertyKeysFresh(project.key);
+    const propertyEntry = parseNotificationItemPropertyKey(propertyKey);
+    const guardState = notificationGuardState(propertyKeys, safePropertyToken(userId));
+    if (propertyEntry && notificationEntryIsGuarded(propertyEntry, guardState)) {
+      // Delete-all may have established its cutoff in another Forge isolate
+      // after this event was created but before its property became visible.
+      // Keep the guard authoritative and do not emit a realtime ghost.
+      await deleteProjectProperty(project.key, propertyKey);
+      return null;
+    }
+    await pruneNotificationKeyspace(project.key, userId, propertyKeys);
+    return notification;
+  });
+  if (!notification) return null;
   try {
     const { token } = await signRealtimeToken(
       NOTIFICATION_REALTIME_CHANNEL,
@@ -2076,6 +2414,136 @@ async function safelyCreateAppNotification(project, userId, descriptor, sourcePa
   }
 }
 
+async function listAppNotificationPage(project, accountId, query = {}) {
+  let propertyKeys = await listProjectPropertyKeys(project.key);
+  const migratedEntries = query.cursor ? [] : await migrateLegacyNotificationBatch(project, propertyKeys);
+  if (migratedEntries.length) propertyKeys = [...propertyKeys, ...migratedEntries.map((entry) => entry.key)];
+  const requestedStatus = query.status ? String(query.status) : null;
+  const { entries } = scopedNotificationEntries(propertyKeys, accountId, { status: requestedStatus });
+  const limit = clamp(Number(query.limit) || NOTIFICATION_PAGE_SIZE, 1, NOTIFICATION_MAX_PAGE_SIZE);
+  const cursor = optionalString(query.cursor, 512) || null;
+  if (cursor && !/^\d{13}\.[A-Za-z0-9_-]+$/.test(cursor)) {
+    fail(400, 'INVALID_NOTIFICATION_CURSOR', 'Notification cursor is invalid. Refresh the notification list.');
+  }
+  const remainingEntries = cursor ? entries.filter((entry) => entry.sortKey < cursor) : entries;
+  const pageEntries = remainingEntries.slice(0, limit);
+  const items = await loadNotificationEntries(project, accountId, pageEntries);
+  const hasMore = remainingEntries.length > pageEntries.length;
+  return {
+    items,
+    total: entries.length,
+    unread_count: notificationUnreadSummary(propertyKeys, accountId).count,
+    next_cursor: hasMore && pageEntries.length ? pageEntries[pageEntries.length - 1].sortKey : null,
+    is_last: !hasMore
+  };
+}
+
+async function moveNotificationEntriesToRead(project, accountId, entries) {
+  const unreadEntries = asArray(entries).filter((entry) => entry?.status === 'unread');
+  if (!unreadEntries.length) return { count: 0, failedCount: 0, markedIds: [] };
+  const notifications = await loadNotificationEntries(project, accountId, unreadEntries);
+  const notificationById = new Map(notifications.map((item) => [String(item.id), item]));
+  const readAt = nowIso();
+  const writeCandidates = unreadEntries.map((entry) => {
+    const notification = notificationById.get(entry.itemId);
+    if (!notification) return null;
+    const updated = {
+      ...notification,
+      project_id: String(project.id),
+      status: 'read',
+      read_at: readAt,
+      updated_at: readAt,
+      revision: Number(notification.revision || 0) + 1
+    };
+    const readKey = notificationItemPropertyKey(accountId, 'read', updated.created_at, updated.preference, updated.id);
+    return { entry, updated, readKey };
+  }).filter(Boolean);
+  const writeResults = await settleInBatches(writeCandidates, async (candidate) => {
+    await putProjectProperty(project.key, candidate.readKey, notificationEnvelope(project, candidate.updated));
+    return candidate;
+  }, NOTIFICATION_MARK_READ_BATCH_SIZE);
+  const written = writeResults.filter((result) => result.status === 'fulfilled').map((result) => result.value);
+  if (!written.length) return { count: 0, failedCount: writeCandidates.length, markedIds: [] };
+
+  // A delete writes a unique tombstone/cutoff before touching item keys. The
+  // post-write key scan catches a concurrent delete that began after our first
+  // scan and removes the just-written read shard instead of resurrecting it.
+  const postWriteKeys = await listProjectPropertyKeysFresh(project.key);
+  const postWriteGuard = notificationGuardState(postWriteKeys, safePropertyToken(accountId));
+  const cleanupResults = await settleInBatches(written, async (candidate) => {
+    const guarded = notificationEntryIsGuarded(candidate.entry, postWriteGuard);
+    const cleanupKeys = guarded
+      ? [...new Set([candidate.entry.key, candidate.readKey])]
+      : candidate.entry.key === candidate.readKey ? [] : [candidate.entry.key];
+    for (const key of cleanupKeys) await deleteProjectProperty(project.key, key);
+    return { ...candidate, guarded };
+  }, NOTIFICATION_MARK_READ_BATCH_SIZE);
+  const marked = cleanupResults
+    .filter((result) => result.status === 'fulfilled' && !result.value.guarded)
+    .map((result) => result.value.updated.id);
+  return {
+    count: marked.length,
+    failedCount: writeCandidates.length - marked.length,
+    markedIds: marked
+  };
+}
+
+function notificationEntriesForId(propertyKeys, userId, notificationId) {
+  const userToken = safePropertyToken(userId);
+  const idToken = safePropertyToken(notificationId);
+  return asArray(propertyKeys)
+    .map(parseNotificationItemPropertyKey)
+    .filter((entry) => entry?.userToken === userToken && entry.idToken === idToken);
+}
+
+function legacyNotificationEntry(notification, propertyKey) {
+  return {
+    key: propertyKey,
+    userToken: safePropertyToken(notification.user_id),
+    status: notification.status === 'read' ? 'read' : 'unread',
+    createdTime: Number(notificationTimestampToken(notification.created_at)),
+    createdToken: notificationTimestampToken(notification.created_at),
+    preference: notification.preference || null,
+    idToken: safePropertyToken(notification.id),
+    itemId: String(notification.id),
+    sortKey: `${notificationTimestampToken(notification.created_at)}.${safePropertyToken(notification.id)}`
+  };
+}
+
+async function deleteNotificationKeys(projectKey, propertyKeys) {
+  const keys = [...new Set(asArray(propertyKeys).filter(Boolean).map(String))];
+  const results = await settleInBatches(keys, (key) => deleteProjectProperty(projectKey, key), 10);
+  const removedKeys = keys.filter((_key, index) => results[index]?.status === 'fulfilled');
+  const failedKeys = keys.filter((_key, index) => results[index]?.status === 'rejected');
+  return { removedKeys, failedKeys };
+}
+
+function notificationDeleteBatch(propertyKeys, userId, beforeTime) {
+  const userToken = safePropertyToken(userId);
+  const groupsById = new Map();
+  for (const entry of asArray(propertyKeys).map(parseNotificationItemPropertyKey).filter(Boolean)) {
+    if (entry.userToken !== userToken || entry.createdTime > beforeTime) continue;
+    const group = groupsById.get(entry.idToken) || { idToken: entry.idToken, createdTime: entry.createdTime, entries: [] };
+    group.entries.push(entry);
+    group.createdTime = Math.min(group.createdTime, entry.createdTime);
+    groupsById.set(entry.idToken, group);
+  }
+  const groups = [...groupsById.values()].sort((left, right) => left.createdTime - right.createdTime);
+  const selected = [];
+  let propertyCount = 0;
+  for (const group of groups) {
+    const remainingCapacity = NOTIFICATION_DELETE_BATCH_SIZE - propertyCount;
+    if (group.entries.length > remainingCapacity) {
+      if (!selected.length) selected.push({ ...group, entries: group.entries.slice(0, remainingCapacity), complete: false });
+      break;
+    }
+    selected.push({ ...group, complete: true });
+    propertyCount += group.entries.length;
+    if (propertyCount >= NOTIFICATION_DELETE_BATCH_SIZE) break;
+  }
+  return { groups, selected, propertyKeys: selected.flatMap((group) => group.entries.map((entry) => entry.key)) };
+}
+
 async function recordMutationNotifications(payload, result) {
   const { pathname } = parseRequestPath(payload?.path || '/');
   const method = String(payload?.method || 'GET').toUpperCase();
@@ -2092,24 +2560,85 @@ async function recordMutationNotifications(payload, result) {
   }
 }
 
-async function removeCollectionItem(projectKey, name, itemId) {
-  const deletedShard = await deleteProjectProperty(projectKey, collectionItemKey(name, itemId));
-  const legacy = await getProjectProperty(projectKey, collectionKey(name), null);
-  const legacyItems = Array.isArray(legacy) ? legacy : Array.isArray(legacy?.items) ? legacy.items : [];
-  const nextLegacyItems = legacyItems.filter((item) => String(item.id) !== String(itemId));
-  const deletedLegacy = nextLegacyItems.length !== legacyItems.length;
-  if (deletedLegacy) {
-    await putProjectProperty(projectKey, collectionKey(name), {
-      ...(legacy && typeof legacy === 'object' && !Array.isArray(legacy) ? legacy : {}),
-      schema: collectionKey(name),
+async function removeCollectionItems(projectKey, name, itemIds) {
+  const normalizedIds = [...new Set(asArray(itemIds).filter((itemId) => itemId !== undefined && itemId !== null).map(String))];
+  if (!normalizedIds.length) {
+    return { deletedIds: [], deletedCount: 0, removedIds: [], removedCount: 0, failedIds: [], failures: [] };
+  }
+
+  const targetPropertyKeys = new Map(normalizedIds.map((itemId) => [itemId, collectionItemKey(name, itemId)]));
+  const deletionResults = await settleInBatches(
+    normalizedIds,
+    (itemId) => deleteProjectProperty(projectKey, targetPropertyKeys.get(itemId)),
+    10
+  );
+  const removedIds = normalizedIds.filter((_itemId, index) => deletionResults[index]?.status === 'fulfilled');
+  const failedIds = normalizedIds.filter((_itemId, index) => deletionResults[index]?.status === 'rejected');
+  const failures = failedIds.map((itemId) => {
+    const index = normalizedIds.indexOf(itemId);
+    const reason = deletionResults[index]?.status === 'rejected' ? deletionResults[index].reason : null;
+    return { itemId, message: String(reason?.message || reason || 'Jira property deletion failed.').slice(0, 300) };
+  });
+  const removedIdSet = new Set(removedIds);
+  const deletedShardIds = new Set(normalizedIds.filter((_itemId, index) =>
+    deletionResults[index]?.status === 'fulfilled' && deletionResults[index].value === true
+  ));
+
+  // Re-read immediately before compaction instead of trusting invocation-cache
+  // metadata captured before the deletes. Merge from this latest index and only
+  // filter successfully removed (or already-missing) targets, so concurrent
+  // additions and retryable failures remain discoverable.
+  const metadataKey = collectionKey(name);
+  const metadata = await getProjectPropertyFresh(projectKey, metadataKey, null);
+  const legacyItems = Array.isArray(metadata) ? metadata : Array.isArray(metadata?.items) ? metadata.items : [];
+  const deletedLegacyIds = new Set(legacyItems.filter((item) => removedIdSet.has(String(item.id))).map((item) => String(item.id)));
+  const nextLegacyItems = legacyItems.filter((item) => !removedIdSet.has(String(item.id)));
+  const deletedIds = normalizedIds.filter((itemId) =>
+    deletedLegacyIds.has(itemId) || deletedShardIds.has(itemId)
+  );
+  const indexedKeys = Array.isArray(metadata?.itemKeys) ? metadata.itemKeys : [];
+  const removedKeySet = new Set(removedIds.map((itemId) => targetPropertyKeys.get(itemId)));
+  const nextItemKeys = indexedKeys.filter((key) => !removedKeySet.has(key));
+  const nextItemKeySet = new Set(nextItemKeys);
+  const nextCount = nextItemKeys.length + nextLegacyItems.filter((item) =>
+    !nextItemKeySet.has(collectionItemKey(name, item.id))
+  ).length;
+  const indexChanged = nextItemKeys.length !== indexedKeys.length;
+  const legacyChanged = nextLegacyItems.length !== legacyItems.length;
+
+  // Keep the sharded index compact in one metadata write. Leaving deleted item
+  // keys behind makes every subsequent collection read issue needless Jira
+  // property requests and is especially costly for notification bulk cleanup.
+  if (indexChanged || legacyChanged) {
+    await putProjectProperty(projectKey, metadataKey, {
+      ...(metadata && typeof metadata === 'object' && !Array.isArray(metadata) ? metadata : {}),
+      schema: metadataKey,
       storage: 'sharded-project-properties',
       itemKeyPrefix: collectionItemPrefix(name),
-      itemKeys: (Array.isArray(legacy?.itemKeys) ? legacy.itemKeys : []).filter((key) => key !== collectionItemKey(name, itemId)),
+      itemKeys: nextItemKeys,
+      count: nextCount,
       items: nextLegacyItems,
       updatedAt: nowIso()
     });
   }
-  return { deleted: deletedShard || deletedLegacy, id: itemId };
+  return {
+    deletedIds,
+    deletedCount: deletedIds.length,
+    removedIds,
+    removedCount: removedIds.length,
+    failedIds,
+    failures
+  };
+}
+
+async function removeCollectionItem(projectKey, name, itemId) {
+  const result = await removeCollectionItems(projectKey, name, [itemId]);
+  if (result.failedIds.length) {
+    fail(503, 'COLLECTION_DELETE_PARTIAL', `${titleCase(name)} could not be deleted from Jira storage. Retry the operation.`, {
+      failures: result.failures
+    });
+  }
+  return { deleted: result.removedIds.includes(String(itemId)), id: itemId };
 }
 
 async function findCollectionItem(name, itemId, preferredProject = null) {
@@ -2776,6 +3305,9 @@ async function requirementIterationMap(project) {
   const iterations = await getCollection(project.key, COLLECTIONS.requirementIterations, []);
   const map = new Map();
   for (const iteration of iterations) {
+    // Native Jira Sprint membership belongs to Jira's Sprint field and JQL.
+    // Project properties are retained only for legacy Qaira-owned iterations.
+    if (iteration.jira_sprint_id || iteration.source === 'jira') continue;
     for (const requirementId of asArray(iteration.requirement_ids)) map.set(String(requirementId), iteration.id);
   }
   return { iterations, map };
@@ -2786,7 +3318,8 @@ async function syncRequirementIteration(project, requirementId, iterationId) {
   let matched = false;
   const next = iterations.map((iteration) => {
     const currentIds = asArray(iteration.requirement_ids).map(String);
-    const shouldContain = Boolean(iterationId) && String(iteration.id) === String(iterationId);
+    const jiraOwned = Boolean(iteration.jira_sprint_id || iteration.source === 'jira');
+    const shouldContain = !jiraOwned && Boolean(iterationId) && String(iteration.id) === String(iterationId);
     if (shouldContain) matched = true;
     const requirementIds = shouldContain
       ? [...new Set([...currentIds, String(requirementId)])]
@@ -2795,7 +3328,10 @@ async function syncRequirementIteration(project, requirementId, iterationId) {
       ? iteration
       : { ...iteration, requirement_ids: requirementIds, updated_at: nowIso() };
   });
-  if (iterationId && !matched) fail(400, 'ITERATION_NOT_FOUND', `Iteration ${iterationId} is not configured for ${project.key}.`);
+  const referencesNativeSprint = /^jira-sprint-\d+$/.test(String(iterationId || ''));
+  if (iterationId && !matched && !referencesNativeSprint && !iterations.some((iteration) =>
+    String(iteration.id) === String(iterationId) && (iteration.jira_sprint_id || iteration.source === 'jira')
+  )) fail(400, 'ITERATION_NOT_FOUND', `Iteration ${iterationId} is not configured for ${project.key}.`);
   await putCollection(project.key, COLLECTIONS.requirementIterations, next);
 }
 
@@ -2809,6 +3345,116 @@ function bugPriorityName(value) {
   const normalized = String(value || '').trim().toLowerCase();
   return ({ p1: 'Highest', p2: 'High', p3: 'Medium', p4: 'Low', p5: 'Lowest' })[normalized]
     || (normalized ? titleCase(normalized) : 'Medium');
+}
+
+const BUG_TRIAGE_CATEGORIES = [
+  {
+    name: 'Security or privacy',
+    pattern: /security|privacy|credential|password|token|authorization|authentication|permission|xss|csrf|injection|vulnerab|pii|personal data/i,
+    action: 'Confirm exploitability, affected data, access boundaries, and the incident-response owner before changing priority.'
+  },
+  {
+    name: 'Data integrity',
+    pattern: /data loss|corrupt|duplicate (?:record|charge|payment)|incorrect data|missing data|wrong data|not saved|persistence|database|migration/i,
+    action: 'Verify whether data can be recovered, quantify affected records, and identify the earliest safe containment point.'
+  },
+  {
+    name: 'Performance or reliability',
+    pattern: /performance|latency|slow|timeout|timed out|hang|freeze|memory|cpu|crash|outage|unavailable|reliability|intermittent/i,
+    action: 'Validate frequency, duration, affected traffic, resource evidence, and the smallest repeatable load profile.'
+  },
+  {
+    name: 'Environment or infrastructure',
+    pattern: /environment|infrastructure|network|dns|proxy|gateway|certificate|deployment|configuration|service unavailable|browser launch|device unavailable/i,
+    action: 'Compare environments and builds, then confirm the failing dependency before assigning the product team.'
+  },
+  {
+    name: 'Automation or test tooling',
+    pattern: /automation|locator|selector|element not found|stale element|playwright|selenium|appium|test runner|test script|flaky test/i,
+    action: 'Separate product behavior from test-maintenance evidence and rerun the narrowest stable scope.'
+  },
+  {
+    name: 'Accessibility or usability',
+    pattern: /accessibility|screen reader|keyboard|focus|contrast|aria|usability|confusing|cannot navigate|not visible|overlap|layout/i,
+    action: 'Reproduce with the affected assistive technology or interaction path and confirm the user-blocking impact.'
+  },
+  {
+    name: 'Integration or API',
+    pattern: /integration|api|webhook|request|response|status code|payload|contract|third[- ]party|sync|import|export/i,
+    action: 'Capture sanitized request/response evidence, contract version, retry behavior, and the failing system boundary.'
+  },
+  {
+    name: 'Functional behavior',
+    pattern: /wrong|incorrect|fail|broken|cannot|unable|does not|doesn't|regression|unexpected|validation|workflow|checkout|payment|login/i,
+    action: 'Confirm reproducibility, expected behavior, affected workflow, and the earliest build where the behavior changed.'
+  }
+];
+
+function normalizedBugPriority(value) {
+  const candidate = bugPriorityName(value);
+  return ['Highest', 'High', 'Medium', 'Low', 'Lowest'].includes(candidate) ? candidate : 'Medium';
+}
+
+function deterministicBugTriage(bug) {
+  const evidenceText = [
+    bug.title,
+    bug.message,
+    bug.steps_to_reproduce,
+    bug.expected_result,
+    bug.actual_result,
+    bug.root_cause,
+    bug.environment,
+    bug.build,
+    ...asArray(bug.labels)
+  ].filter(Boolean).join(' ');
+  const categoryRule = BUG_TRIAGE_CATEGORIES.find((rule) => rule.pattern.test(evidenceText));
+  const category = categoryRule?.name || 'Needs human classification';
+  const normalizedSeverity = String(bug.severity || '').trim().toLowerCase();
+  const currentPriority = normalizedBugPriority(bug.priority);
+  const criticalSignal = /\b(?:critical|blocker|data loss|security breach|credential leak|production outage|prod(?:uction)? down|cannot checkout|cannot pay|crash loop)\b/i.test(evidenceText);
+  const highSignal = /\b(?:high|major|regression|customer[- ]blocking|business[- ]critical|service unavailable|repeated crash|payment failure)\b/i.test(evidenceText);
+  const lowSignal = /\b(?:cosmetic|minor|typo|wording|spacing|low impact|nice to have)\b/i.test(evidenceText);
+  const recommendedPriority = criticalSignal || normalizedSeverity === 'critical' || currentPriority === 'Highest'
+    ? 'Highest'
+    : highSignal || normalizedSeverity === 'high' || currentPriority === 'High'
+      ? 'High'
+      : lowSignal && !['Highest', 'High'].includes(currentPriority)
+        ? 'Low'
+        : currentPriority === 'Low' || currentPriority === 'Lowest'
+          ? currentPriority
+          : 'Medium';
+  const signals = [
+    `Jira status: ${bug.status || 'Not set'}`,
+    `Current priority: ${currentPriority}`,
+    bug.severity ? `Recorded severity: ${bug.severity}` : null,
+    bug.environment ? `Environment: ${bug.environment}` : null,
+    bug.build ? `Build: ${bug.build}` : null,
+    bug.linked_test_run_id ? 'Linked test-run evidence' : null,
+    asArray(bug.linked_test_case_ids).length ? `${asArray(bug.linked_test_case_ids).length} linked test case(s)` : null,
+    asArray(bug.linked_requirement_ids).length ? `${asArray(bug.linked_requirement_ids).length} linked Story record(s)` : null
+  ].filter(Boolean);
+  const priorityReason = criticalSignal || normalizedSeverity === 'critical'
+    ? 'critical-impact language or severity is present'
+    : highSignal || normalizedSeverity === 'high'
+      ? 'high-impact or customer-blocking evidence is present'
+      : lowSignal
+        ? 'the recorded impact appears cosmetic or minor'
+        : `the available evidence supports the existing ${currentPriority} baseline`;
+
+  return {
+    issue_id: String(bug.id),
+    display_id: bug.jira_bug_key || String(bug.id),
+    title: bug.title || bug.jira_bug_key || String(bug.id),
+    category,
+    current_priority: currentPriority,
+    recommended_priority: recommendedPriority,
+    explanation: `Classified as ${category} from the recorded summary and evidence. ${recommendedPriority} is recommended because ${priorityReason}. A reviewer must confirm reach, reproducibility, and business impact.`,
+    signals,
+    review_actions: [
+      categoryRule?.action || 'Confirm the affected workflow, impact, reproducibility, and owning team before applying a Jira classification.',
+      'Review the recommendation with the Bug owner; this preview does not update Jira.'
+    ]
+  };
 }
 
 function jiraIssueBrowseUrl(issue) {
@@ -2853,9 +3499,13 @@ async function mapRequirement(issue, project, registry, iterationMap = new Map()
     iteration_id: iterationMap.get(String(issue.id)) || null,
     title: issue.fields?.summary || '',
     description: adfText(issue.fields?.description) || null,
+    gherkin_scenarios: normalizeGherkinScenarios(detail.gherkin_scenarios),
     external_references: detail.external_references || [],
+    detail_complete: true,
     labels: issue.fields?.labels || [],
-    sprint: sprint?.name || detail.sprint || null,
+    // Jira's Sprint field is authoritative; the legacy requirement property
+    // can lag a native move and must not reassign a Story in the UI.
+    sprint: sprint?.name || null,
     sprint_id: sprint?.id || null,
     sprint_state: sprint?.state || null,
     sprint_start_date: sprint?.start_date || null,
@@ -2879,6 +3529,16 @@ async function mapRequirement(issue, project, registry, iterationMap = new Map()
     ai_coverage_summary: selectValue(readCustom(issue, registry, 'reqAiCoverageSummary')) || null,
     revision: Number(detail.revision || 1)
   };
+}
+
+function normalizedTestAutomationStatus(value, automatedFallback = null) {
+  const normalized = String(value || '').trim().toLowerCase().replace(/[\s-]+/g, '_');
+  if (['not_automated', 'manual', 'none'].includes(normalized)) return 'not_automated';
+  if (['broken', 'incomplete'].includes(normalized)) return 'incomplete';
+  if (['automated', 'implemented', 'mapped', 'ready'].includes(normalized)) return 'ready';
+  if (automatedFallback === 'yes') return 'ready';
+  if (automatedFallback === 'no') return 'not_automated';
+  return null;
 }
 
 function mapRequirementSummary(issue, project, registry, iterationMap = new Map(), sprintFieldId = null) {
@@ -2906,6 +3566,7 @@ function mapRequirementSummary(issue, project, registry, iterationMap = new Map(
     title: issue.fields?.summary || '',
     description: adfText(issue.fields?.description) || null,
     external_references: [],
+    detail_complete: false,
     labels: issue.fields?.labels || [],
     sprint: sprint?.name || null,
     sprint_id: sprint?.id || null,
@@ -2944,14 +3605,17 @@ async function mapTestCase(issue, project, registry, propertyBundle = null) {
   const authoritativeRequirementIds = linkTypeId(registry, 'tests') ? requirementIds : asArray(spec.requirement_ids || spec.requirement_id).map(String);
   const authoritativeSuiteIds = linkTypeId(registry, 'contains') ? suiteIds : asArray(spec.suite_ids || spec.suite_id).map(String);
   const defects = linkedBugIds(issue);
-  const automationStatus = selectValue(readCustom(issue, registry, 'automationStatus'))
-    || spec.automation_status
-    || (spec.automated === 'yes' ? 'Automated' : 'Not Automated');
+  const automationStatus = normalizedTestAutomationStatus(
+    selectValue(readCustom(issue, registry, 'automationStatus')) || spec.automation_status,
+    spec.automated
+  ) || 'not_automated';
   const reviewStatus = spec.review_status || String(selectValue(readCustom(issue, registry, 'aiReviewState')) || '').toLowerCase().replace(/ /g, '_') || 'not_requested';
   return {
     ...readCustomValues(issue, registry, 'testCase'),
     id: String(issue.id),
     display_id: issue.key,
+    detail_complete: true,
+    summary_complete: true,
     app_type_id: spec.app_type_id || `${project.id}:web`,
     suite_id: authoritativeSuiteIds[0] || null,
     suite_ids: [...new Set(authoritativeSuiteIds)],
@@ -2963,8 +3627,8 @@ async function mapTestCase(issue, project, registry, propertyBundle = null) {
     external_references: spec.external_references || [],
     labels: issue.fields?.labels || spec.labels || [],
     parameter_values: spec.parameter_values || {},
-    automated: /automated|implemented|mapped|ready/i.test(automationStatus) ? 'yes' : 'no',
-    automation_status: /broken|incomplete/i.test(automationStatus) ? 'incomplete' : (/automated|implemented|mapped|ready/i.test(automationStatus) ? 'ready' : 'not_automated'),
+    automated: automationStatus === 'ready' ? 'yes' : 'no',
+    automation_status: automationStatus,
     priority: priorityToNumber(issue.fields?.priority),
     status: selectValue(readCustom(issue, registry, 'testStatus')) || spec.status || issue.fields?.status?.name || 'Draft',
     assignee_id: issue.fields?.assignee?.accountId || null,
@@ -2998,11 +3662,18 @@ function mapTestCaseSummary(issue, project, registry, appTypeId = null) {
   const suiteIds = linkedIssueIdsForTypeKeys(issue, registry, ['testSuite']);
   const embeddedModule = embeddedIssueProperty(issue, MODULE_ASSIGN_PROP);
   const moduleAssignment = embeddedModule === CACHE_MISS ? null : embeddedModule;
-  const automationStatus = selectValue(readCustom(issue, registry, 'automationStatus')) || 'Not Automated';
+  const embeddedSummary = embeddedIssueProperty(issue, TEST_CASE_SUMMARY_PROP);
+  const compactSummary = readTestCaseSummaryProperty(embeddedSummary === CACHE_MISS ? null : embeddedSummary);
+  const automationStatus = normalizedTestAutomationStatus(
+    selectValue(readCustom(issue, registry, 'automationStatus')) || compactSummary?.automation_status,
+    compactSummary?.automated
+  );
   return {
     id: String(issue.id),
     display_id: issue.key,
-    app_type_id: appTypeId || `${project.id}:web`,
+    detail_complete: false,
+    summary_complete: Boolean(compactSummary),
+    app_type_id: compactSummary?.app_type_id || appTypeId || null,
     suite_id: suiteIds[0] || null,
     suite_ids: suiteIds,
     requirement_ids: [...new Set(requirementIds)],
@@ -3010,26 +3681,31 @@ function mapTestCaseSummary(issue, project, registry, appTypeId = null) {
     defect_ids: linkedBugIds(issue),
     title: issue.fields?.summary || '',
     description: adfText(issue.fields?.description) || null,
-    external_references: [],
     labels: issue.fields?.labels || [],
-    parameter_values: {},
-    automated: /automated|implemented|mapped|ready/i.test(automationStatus) ? 'yes' : 'no',
-    automation_status: /broken|incomplete/i.test(automationStatus) ? 'incomplete' : (/automated|implemented|mapped|ready/i.test(automationStatus) ? 'ready' : 'not_automated'),
-    priority: priorityToNumber(issue.fields?.priority),
-    status: selectValue(readCustom(issue, registry, 'testStatus')) || issue.fields?.status?.name || 'Draft',
+    automated: automationStatus === 'ready' ? 'yes' : automationStatus ? 'no' : compactSummary?.automated || null,
+    automation_status: automationStatus,
+    priority: issue.fields?.priority ? priorityToNumber(issue.fields.priority) : null,
+    status: selectValue(readCustom(issue, registry, 'testStatus')) || compactSummary?.status || issue.fields?.status?.name || null,
     assignee_id: issue.fields?.assignee?.accountId || null,
     assignee_name: issue.fields?.assignee?.displayName || null,
     assignee_email: issue.fields?.assignee?.emailAddress || null,
     requirement_id: requirementIds[0] || null,
-    reviewer_id: null,
-    review_status: 'not_requested',
-    review_history: [],
-    ai_quality_score: numericValue(readCustom(issue, registry, 'coverageScore'), null),
-    ai_generation_source: null,
-    ai_generation_review_status: null,
-    ai_generation_job_id: null,
-    ai_generated_at: null,
-    revision: 1,
+    ai_quality_score: numericValue(readCustom(issue, registry, 'coverageScore'), compactSummary?.ai_quality_score ?? null),
+    ...(compactSummary ? {
+      external_references: compactSummary.external_references,
+      external_reference_count: compactSummary.external_reference_count,
+      external_references_truncated: compactSummary.external_references_truncated,
+      reviewer_id: compactSummary.reviewer_id,
+      review_status: compactSummary.review_status,
+      ai_generation_source: compactSummary.ai_generation_source,
+      ai_generation_review_status: compactSummary.ai_generation_review_status,
+      ai_generation_job_id: compactSummary.ai_generation_job_id,
+      ai_generated_at: compactSummary.ai_generated_at,
+      step_count: compactSummary.step_count,
+      step_types: compactSummary.step_types,
+      api_only: compactSummary.api_only,
+      revision: compactSummary.revision
+    } : {}),
     created_by: issue.fields?.creator?.accountId || issue.fields?.reporter?.accountId || null,
     updated_by: issue.fields?.assignee?.accountId || null,
     created_at: issue.fields?.created,
@@ -3200,7 +3876,7 @@ async function deriveBugTraceabilityScope(project, registry, input = {}) {
     await loadScopedIssues(scopedRequirementIds, project, registry, {
       nativeKind: 'requirements',
       fallbackNames: ['Story'],
-      label: 'requirement'
+      label: 'Story'
     });
   }
   if (scopedSuiteIds.length) {
@@ -3412,10 +4088,10 @@ async function listIssueKind(project, registry, typeKey, customKeys = [], max = 
     objectRepositoryItem: [OBJECT_PROP],
     qualityGate: [QUALITY_GATE_PROP]
   }[typeKey] || [];
-  // Module identity is a tiny issue property and is required by suite/run hierarchy views.
-  // Keep the large test specification lazy, but retain this small structural projection.
+  // Keep the large test specification lazy. Test-case lists only hydrate the
+  // small structural assignment and versioned display projection properties.
   const requestedProperties = options.hydrateProperties === false
-    ? [QAIRA_DELETE_PROP, ...(typeKey === 'testCase' ? [MODULE_ASSIGN_PROP] : [])]
+    ? [QAIRA_DELETE_PROP, ...(typeKey === 'testCase' ? [MODULE_ASSIGN_PROP, TEST_CASE_SUMMARY_PROP] : [])]
     : [...properties, QAIRA_DELETE_PROP];
   const result = await searchIssues(jql, commonFields(registry, customKeys), max, requestedProperties, options.cursor);
   return { ...result, issues: result.issues.filter((issue) => !isSoftDeletedIssue(issue)) };
@@ -3430,6 +4106,7 @@ async function listStoredTestCaseRefsPage(project, registry, refs = [], query = 
   const normalizedRefs = [...new Set(asArray(refs).filter(Boolean).map(String))];
   const offset = storedScopeOffset(query.cursor);
   const limit = pageSize(query.page_size || query.limit, DEFAULT_PAGE_SIZE);
+  const hydrateProperties = query.projection === 'detail' || query.detail === 'true';
   const pageRefs = normalizedRefs.slice(offset, offset + limit);
   if (!pageRefs.length) {
     const empty = { items: [], total: normalizedRefs.length, next_cursor: null, is_last: true };
@@ -3441,11 +4118,12 @@ async function listStoredTestCaseRefsPage(project, registry, refs = [], query = 
     `project = ${project.key} AND ${typeClause} AND ${issueReferencesClause(pageRefs)} ORDER BY updated DESC`,
     commonFields(registry, ['testStatus', 'automationStatus', 'coverageScore', 'aiReviewState']),
     pageRefs.length,
-    [QAIRA_DELETE_PROP, MODULE_ASSIGN_PROP]
+    [QAIRA_DELETE_PROP, MODULE_ASSIGN_PROP, hydrateProperties ? TEST_SPEC_PROP : TEST_CASE_SUMMARY_PROP]
   );
-  const items = result.issues
-    .filter((issue) => !isSoftDeletedIssue(issue))
-    .map((issue) => mapTestCaseSummary(issue, project, registry, query.app_type_id));
+  const visibleIssues = result.issues.filter((issue) => !isSoftDeletedIssue(issue));
+  const items = hydrateProperties
+    ? await mapInBatches(visibleIssues, (issue) => mapTestCase(issue, project, registry))
+    : visibleIssues.map((issue) => mapTestCaseSummary(issue, project, registry, query.app_type_id));
   const nextOffset = offset + pageRefs.length;
   const envelope = {
     items,
@@ -3523,16 +4201,20 @@ async function listRequirements(project, registry, query = {}) {
 }
 
 async function listTestCases(project, registry, query = {}) {
+  let moduleScope = null;
   if (query.module_id) {
     const modules = await getCollection(project.key, COLLECTIONS.modules, []);
-    const module = modules.find((candidate) => String(candidate.id) === String(query.module_id));
-    if (!module) fail(404, 'MODULE_NOT_FOUND', 'Module not found.');
-    return listStoredTestCaseRefsPage(project, registry, module.test_case_ids, {
-      ...query,
-      app_type_id: query.app_type_id || module.app_type_id
-    });
+    moduleScope = modules.find((candidate) => String(candidate.id) === String(query.module_id));
+    if (!moduleScope) fail(404, 'MODULE_NOT_FOUND', 'Module not found.');
+    if (asArray(moduleScope.test_case_ids).length) {
+      return listStoredTestCaseRefsPage(project, registry, moduleScope.test_case_ids, {
+        ...query,
+        app_type_id: query.app_type_id || moduleScope.app_type_id
+      });
+    }
   }
   const hydrateProperties = query.projection === 'detail' || query.detail === 'true';
+  const effectiveAppTypeId = query.app_type_id || moduleScope?.app_type_id;
   const linkedScopeId = query.requirement_id || query.suite_id;
   let linkedScopeJql = '';
   if (linkedScopeId) {
@@ -3540,12 +4222,13 @@ async function listTestCases(project, registry, query = {}) {
       ...(query.requirement_id
         ? { nativeKind: 'requirements', fallbackNames: ['Story'] }
         : { typeKeys: ['testSuite'] }),
-      label: query.requirement_id ? 'requirement' : 'test suite'
+      label: query.requirement_id ? 'Story' : 'test suite'
     });
     linkedScopeJql = `issue in linkedIssues(${jqlQuote(linkedScope.key)})`;
   }
   const sourceFilters = [linkedScopeJql];
-  if (query.app_type_id) sourceFilters.push(`qairaTestAppType = ${jqlQuote(query.app_type_id)}`);
+  if (effectiveAppTypeId) sourceFilters.push(`qairaTestAppType = ${jqlQuote(effectiveAppTypeId)}`);
+  if (moduleScope) sourceFilters.push(`qairaTestModuleId = ${jqlQuote(moduleScope.id)}`);
   if (query.unassigned_module === 'true' || query.unassigned_module === true) sourceFilters.push('qairaTestModuleId is EMPTY');
   const result = await listIssueKind(
     project,
@@ -3559,8 +4242,8 @@ async function listTestCases(project, registry, query = {}) {
   const { issues } = result;
   let items = hydrateProperties
     ? await mapInBatches(issues, (issue) => mapTestCase(issue, project, registry))
-    : issues.map((issue) => mapTestCaseSummary(issue, project, registry, query.app_type_id));
-  if (query.app_type_id) items = items.filter((item) => item.app_type_id === query.app_type_id);
+    : issues.map((issue) => mapTestCaseSummary(issue, project, registry, effectiveAppTypeId));
+  if (effectiveAppTypeId) items = items.filter((item) => item.app_type_id === effectiveAppTypeId);
   if (query.suite_id) items = items.filter((item) => item.suite_ids?.includes(query.suite_id));
   if (query.requirement_id) items = items.filter((item) => item.requirement_ids?.includes(query.requirement_id));
   if (query.unassigned_module === 'true' || query.unassigned_module === true) items = items.filter((item) => !item.module_ids?.length);
@@ -3599,6 +4282,14 @@ async function listExecutions(project, registry, query = {}) {
   const sourceFilters = [linkedCasesJql];
   if (query.app_type_id) sourceFilters.push(`qairaRunAppType = ${jqlQuote(query.app_type_id)}`);
   if (query.status) sourceFilters.push(`qairaRunStatus = ${jqlQuote(query.status)}`);
+  const deliveryFilters = [
+    query.release ? `(fixVersion = ${jqlQuote(query.release)} OR qairaRunRelease = ${jqlQuote(query.release)})` : null,
+    query.sprint ? `qairaRunSprint = ${jqlQuote(query.sprint)}` : null,
+    query.build ? `qairaRunBuild = ${jqlQuote(query.build)}` : null
+  ].filter(Boolean);
+  if (deliveryFilters.length) {
+    sourceFilters.push(query.delivery_any ? `(${deliveryFilters.join(' OR ')})` : deliveryFilters.join(' AND '));
+  }
   const result = await listIssueKind(
     project,
     registry,
@@ -3621,6 +4312,17 @@ async function listBugs(project, registry, query = {}) {
   const searchTerm = optionalString(query.q, 120);
   if (searchTerm) filters.push(`text ~ ${jqlQuote(`${searchTerm.replace(/[?*~]/g, ' ').trim()}*`)}`);
   if (query.status) filters.push(`status = ${jqlQuote(query.status)}`);
+  const release = optionalString(query.fix_version ?? query.release, 120);
+  const sprint = optionalString(query.sprint ?? query.sprint_id, 120);
+  const build = optionalString(query.build, 255);
+  const deliveryFilters = [
+    release ? `fixVersion = ${jqlQuote(release)}` : null,
+    sprint ? `sprint = ${jqlQuote(sprint)}` : null,
+    build ? `qairaBugBuild = ${jqlQuote(build)}` : null
+  ].filter(Boolean);
+  if (deliveryFilters.length) {
+    filters.push(query.delivery_any ? `(${deliveryFilters.join(' OR ')})` : deliveryFilters.join(' AND '));
+  }
   const sprintField = await jiraSprintField();
   const fields = commonFields(registry);
   if (sprintField?.id) fields.push(sprintField.id);
@@ -3985,6 +4687,15 @@ async function materializeTestRunInput(project, registry, rawInput = {}) {
     properties: [SUITE_PROP]
   });
   const suiteRecords = await mapInBatches(suiteIssues, (issue) => mapSuite(issue, project, registry), 10);
+  const virtualDefaultSuite = !suiteRecords.length && input.scope_source === 'smart-run'
+    ? {
+      id: optionalString(input.default_suite?.id, 100) || 'smart-default',
+      name: optionalString(input.default_suite?.name, 120) || 'Default',
+      parameter_values: {},
+      revision: 1,
+      virtual: true
+    }
+    : null;
   const caseMembership = new Map();
   for (const suite of suiteRecords) {
     for (const caseRef of asArray(suite.test_case_ids).filter(Boolean)) {
@@ -4031,7 +4742,7 @@ async function materializeTestRunInput(project, registry, rawInput = {}) {
   const scopeAssignments = { suite: suiteAssignments, module: moduleAssignments, case: caseAssignments };
   let totalStepCount = 0;
   for (const [index, { mapped, spec }] of caseRecords.entries()) {
-    const suite = suiteByCaseId.get(String(mapped.id)) || suiteByCaseId.get(String(mapped.display_id)) || null;
+    const suite = suiteByCaseId.get(String(mapped.id)) || suiteByCaseId.get(String(mapped.display_id)) || virtualDefaultSuite;
     const moduleId = asArray(mapped.module_ids)[0];
     const module = (moduleId ? moduleById.get(String(moduleId)) : null)
       || moduleByCaseRef.get(String(mapped.id))
@@ -4144,6 +4855,7 @@ async function materializeTestRunInput(project, registry, rawInput = {}) {
   });
   const scopeFingerprint = createHash('sha256').update(stableJson({
     suites: suiteRecords.map((suite) => [suite.id, suite.revision]),
+    virtual_default_suite: virtualDefaultSuite ? [virtualDefaultSuite.id, virtualDefaultSuite.name] : null,
     cases: caseRecords.map(({ mapped }) => [mapped.id, mapped.revision]),
     steps: stepSnapshots.map((step) => step.snapshot_step_id)
   })).digest('hex');
@@ -4152,13 +4864,14 @@ async function materializeTestRunInput(project, registry, rawInput = {}) {
     suite_ids: suiteRecords.map((suite) => String(suite.id)),
     direct_test_case_ids: caseRecords.filter(({ mapped }) => requestedDirectCaseRefs.some((ref) => [mapped.id, mapped.display_id].map(String).includes(ref))).map(({ mapped }) => String(mapped.id)),
     test_case_ids: caseRecords.map(({ mapped }) => String(mapped.id)),
-    suite_snapshots: suiteRecords.map((suite) => {
+    suite_snapshots: [...suiteRecords, ...asArray(virtualDefaultSuite)].map((suite) => {
       return {
         id: String(suite.id),
         display_id: suite.display_id || null,
         name: suite.name,
         parameter_values: suite.parameter_values || {},
         revision: suite.revision || 1,
+        ...(suite.virtual ? { virtual: true, source: 'smart-run' } : {}),
         ...directScopeAssignmentFields(suiteAssignments, suite.id, userByAccountId)
       };
     }),
@@ -4191,7 +4904,7 @@ async function createArtifact(project, registry, typeKey, input = {}) {
   if (typeKey === 'testCase') {
     await Promise.all([
       loadScopedIssues(asArray(input.requirement_ids || input.requirement_id), project, registry, {
-        nativeKind: 'requirements', fallbackNames: ['Story'], label: 'requirement'
+        nativeKind: 'requirements', fallbackNames: ['Story'], label: 'Story'
       }),
       loadScopedIssues(asArray(input.suite_ids || input.suite_id), project, registry, {
         typeKeys: ['testSuite'], label: 'test suite'
@@ -4337,9 +5050,9 @@ async function createArtifact(project, registry, typeKey, input = {}) {
       group_kind: step.group_kind || null,
       reusable_group_id: step.reusable_group_id || null
     })));
-    await putIssueProperty(issueKeyValue, TEST_SPEC_PROP, {
-      schema: TEST_SPEC_PROP,
+    const testCaseSpec = {
       ...input,
+      schema: TEST_SPEC_PROP,
       id: String(created.id),
       display_id: issueKeyValue,
       project_id: String(project.id),
@@ -4349,9 +5062,10 @@ async function createArtifact(project, registry, typeKey, input = {}) {
       revision: 1,
       created_at: nowIso(),
       updated_at: nowIso()
-    });
+    };
+    await persistTestCaseSpecProperties(issueKeyValue, testCaseSpec);
     await mapInBatches(asArray(input.requirement_ids || input.requirement_id), async (requirementId) => {
-      if (!await createLink(registry, 'tests', issueKeyValue, await issueKey(requirementId))) fail(409, 'LINK_CREATE_FAILED', `Could not link ${issueKeyValue} to requirement ${requirementId}.`);
+      if (!await createLink(registry, 'tests', issueKeyValue, await issueKey(requirementId))) fail(409, 'LINK_CREATE_FAILED', `Could not link ${issueKeyValue} to Story ${requirementId}.`);
     }, 5);
     await mapInBatches(asArray(input.suite_ids || input.suite_id), async (suiteId) => {
       if (!await createLink(registry, 'contains', await issueKey(suiteId), issueKeyValue)) fail(409, 'LINK_CREATE_FAILED', `Could not add ${issueKeyValue} to suite ${suiteId}.`);
@@ -4571,7 +5285,7 @@ async function syncAutomaticDefectTraceability(project, registry, { runId = null
       requirements.push(await loadScopedIssue(requirementId, project, registry, {
         nativeKind: 'requirements',
         fallbackNames: ['Story'],
-        label: 'requirement',
+        label: 'Story',
         fields: ['issuelinks']
       }));
     } catch (error) {
@@ -4617,10 +5331,10 @@ async function syncAutomaticDefectTraceability(project, registry, { runId = null
 async function replaceTestCaseRequirementRelationships(project, registry, testCaseId, requirementIds) {
   const testCase = await loadScopedIssue(testCaseId, project, registry, { typeKeys: ['testCase'], label: 'test case' });
   const normalizedRequirementIds = [...new Set(asArray(requirementIds).filter(Boolean).map(String))];
-  if (normalizedRequirementIds.length > 100) fail(413, 'RELATIONSHIP_LIMIT_EXCEEDED', 'A single test-case update can link at most 100 requirements.');
+  if (normalizedRequirementIds.length > 100) fail(413, 'RELATIONSHIP_LIMIT_EXCEEDED', 'A single test-case update can link at most 100 Stories.');
   const requirements = [];
   for (const requirementId of normalizedRequirementIds) {
-    requirements.push(await loadScopedIssue(requirementId, project, registry, { nativeKind: 'requirements', fallbackNames: ['Story'], label: 'requirement' }));
+    requirements.push(await loadScopedIssue(requirementId, project, registry, { nativeKind: 'requirements', fallbackNames: ['Story'], label: 'Story' }));
   }
   const result = await replaceIssueRelationships(registry, testCase.key, 'tests', requirements.map((requirement) => requirement.id));
   const current = await getTestCaseSpec(testCase.id);
@@ -4928,6 +5642,7 @@ function featuresForRequest(pathname) {
   };
   const requirementAiRoute = pathname === '/requirements/ai-create-preview'
     || pathname === '/requirements/ai-description-rephrase'
+    || pathname === '/requirements/ai-gherkin-preview'
     || pathname === '/requirements/ai-create-jobs'
     || /^\/requirements\/ai-create-jobs\/[^/]+$/.test(pathname)
     || /^\/requirements\/[^/]+\/(?:ai-)?(?:optimize-preview|impact-preview)$/.test(pathname)
@@ -4944,7 +5659,7 @@ function featuresForRequest(pathname) {
     removeFeature('qaira.manual.requirements');
     features.push('qaira.ai.requirement_design');
   }
-  if (pathname === '/feedback/ai-draft-preview') features.push('qaira.ai.bug_triage');
+  if (pathname === '/feedback/ai-draft-preview' || pathname === '/feedback/ai-triage-preview') features.push('qaira.ai.bug_triage');
   if (testAuthoringAiRoute) {
     removeFeature('qaira.manual.test_cases');
     features.push('qaira.ai.test_authoring');
@@ -5011,7 +5726,7 @@ async function resolveAuthorizationProject(pathname, query, body, context) {
   }
   const issueMatch = pathname.match(/^\/(?:requirements|feedback|test-cases|test-suites|test-plans|automation-assets|quality-gates|object-repository-items|executions)\/([^/]+)/);
   const issueRef = body?.execution_id || query?.execution_id || issueMatch?.[1];
-  if (issueRef && !['import', 'export', 'ai-create-preview', 'ai-create-jobs', 'ai-description-rephrase', 'ai-draft-preview', 'create-metadata', 'automation', 'smart-plan-preview', 'local-run'].includes(String(issueRef))) {
+  if (issueRef && !['import', 'export', 'bulk-delete', 'ai-create-preview', 'ai-create-jobs', 'ai-description-rephrase', 'ai-gherkin-preview', 'ai-draft-preview', 'ai-triage-preview', 'create-metadata', 'automation', 'smart-plan-preview', 'local-run'].includes(String(issueRef))) {
     try {
       const issue = await getIssue(issueRef, ['project']);
       const project = await getProject(issue.fields?.project?.id || issue.fields?.project?.key);
@@ -5051,7 +5766,14 @@ function requiresJiraIssueMutationPermission(pathname, method) {
   if (method === 'GET') return false;
   if (PROJECT_PROPERTY_MUTATION_ROOTS.some((root) => pathname === root || pathname.startsWith(`${root}/`))) return false;
   if (/^\/executions\/[^/]+(?:\/cases\/[^/]+)?\/share-report$/.test(pathname)) return false;
-  if (method === 'POST' && ['/analytics/jql', '/analytics/jql-batch', '/analytics/dashboard-design-preview'].includes(pathname)) return false;
+  if (method === 'POST' && (
+    pathname === '/requirements/ai-create-preview'
+    || pathname === '/requirements/ai-description-rephrase'
+    || pathname === '/requirements/ai-gherkin-preview'
+    || /^\/requirements\/[^/]+\/(?:ai-)?(?:optimize-preview|impact-preview)$/.test(pathname)
+    || /^\/requirements\/[^/]+\/design-test-cases-preview$/.test(pathname)
+  )) return false;
+  if (method === 'POST' && ['/analytics/jql', '/analytics/jql-batch', '/analytics/dashboard-design-preview', '/feedback/ai-triage-preview', '/feedback/export'].includes(pathname)) return false;
   return true;
 }
 
@@ -5253,6 +5975,11 @@ const AI_OUTPUT_CONTRACTS = {
     required: 'suggestion.title, description, priority, acceptance_criteria, risks, open_questions, change_summary',
     maxCompletionTokens: 900
   },
+  'requirement-gherkin-preview': {
+    editablePaths: ['requirements.*.gherkin_scenarios'],
+    required: 'requirements[].client_id, gherkin_scenarios[]; each scenario must contain Scenario, Given, When, Then in that order',
+    maxCompletionTokens: 1200
+  },
   'requirement-description-rephrase-preview': {
     editablePaths: ['description'],
     required: 'description',
@@ -5308,10 +6035,15 @@ const AI_OUTPUT_CONTRACTS = {
     required: 'screen_summary, intended_flows, fields[].description, businessMeaning, usageKeywords',
     maxCompletionTokens: 900
   },
+  'locator-improvement-preview': {
+    editablePaths: ['suggestion.locator', 'suggestion.strategy', 'suggestion.reason'],
+    required: 'suggestion.locator, suggestion.strategy, suggestion.reason',
+    maxCompletionTokens: 450
+  },
   'smart-run-scope-preview': {
-    editablePaths: ['execution_name', 'summary', 'cases.*.reason'],
-    required: 'execution_name, summary, cases[].reason',
-    maxCompletionTokens: 650
+    editablePaths: ['execution_name', 'summary'],
+    required: 'execution_name, summary',
+    maxCompletionTokens: 500
   },
   'execution-failure-clustering-preview': {
     editablePaths: ['clusters.*.explanation', 'clusters.*.recommended_action', 'explanation', 'recommended_actions'],
@@ -5346,6 +6078,14 @@ const AI_OUTPUT_CONTRACTS = {
     ],
     required: 'draft.title, message, steps_to_reproduce, expected_result, actual_result, severity, priority, environment, build, labels, rationale',
     maxCompletionTokens: 700
+  },
+  'bug-triage-preview': {
+    editablePaths: [
+      'summary', 'triage.*.category', 'triage.*.recommended_priority',
+      'triage.*.explanation', 'triage.*.review_actions', 'review_sequence', 'limitations'
+    ],
+    required: 'summary, triage[].category, recommended_priority, explanation, review_actions, review_sequence, limitations',
+    maxCompletionTokens: 900
   },
   'agentic-qe-step': {
     editablePaths: ['summary', 'result', 'next_actions'],
@@ -5501,7 +6241,7 @@ async function assistedResponse(payload, capability, input = {}, evidence = [], 
       `Return only one valid JSON object matching output_draft. Mandatory fields: ${outputContract.required}.`,
       'Keep exactly the same keys, value types, array cardinality, identifiers, and step order. Do not add prose, Markdown fences, commentary, or extra keys.',
       'Write concise, directly usable values. Improve only the human-facing fields supplied in output_draft.',
-      'Never invent an execution outcome, Jira record, requirement, bug, attachment, test result, or release decision. Human review is mandatory.',
+      'Never invent an execution outcome, Jira record, Story, bug, attachment, test result, or release decision. Human review is mandatory.',
       'Do not generate hateful, harassing, sexual, violent, discriminatory, credential-seeking, or unrelated content. Refuse any request outside the named Qaira capability.'
     ].join(' ');
     const userText = boundedJson({ capability, request_context: promptInput, evidence_refs: asArray(evidence).slice(0, 100), output_contract: outputContract.required, output_draft: outputDraft }, contextLimit);
@@ -5627,7 +6367,7 @@ const FAILURE_CLUSTER_RULES = [
     id: 'product_behavior_or_assertion',
     label: 'Product behavior or assertion',
     pattern: /assert|expected|actual|mismatch|regression|validation|response status|status code|business rule|incorrect|unexpected/i,
-    action: 'Compare expected and actual behavior against the linked requirement, confirm product impact, then create or link a Jira Bug if reproducible.'
+    action: 'Compare expected and actual behavior against the linked Story, confirm product impact, then create or link a Jira Bug if reproducible.'
   }
 ];
 
@@ -5669,7 +6409,7 @@ function draftTestCandidates(requirements, maxCases = 6) {
       const [name, objective] = patterns[index];
       output.push({
         client_id: id('ai-case'),
-        title: `${requirement.title || requirement.fields?.summary || 'Requirement'} - ${name}`,
+        title: `${requirement.title || requirement.fields?.summary || 'Story'} - ${name}`,
         description: objective,
         priority: index === 0 || index === 3 ? 1 : index < 4 ? 2 : 3,
         applicable_domain: index === 6 ? 'api' : 'functional',
@@ -5679,7 +6419,7 @@ function draftTestCandidates(requirements, maxCases = 6) {
         generation_mode: 'deterministic',
         requires_human_review: true,
         requirement_ids: [String(requirement.id)],
-        requirement_titles: [requirement.title || requirement.fields?.summary || 'Requirement'],
+        requirement_titles: [requirement.title || requirement.fields?.summary || 'Story'],
         steps: [
           { step_order: 1, action: 'Prepare the required state and test data', expected_result: 'Preconditions are satisfied' },
           { step_order: 2, action: `Execute the ${name.toLowerCase()} scenario`, expected_result: objective },
@@ -5693,18 +6433,29 @@ function draftTestCandidates(requirements, maxCases = 6) {
 }
 
 async function requirementRecordsByIds(ids, project = null, registry = null) {
-  const records = [];
-  for (const itemId of asArray(ids).filter(Boolean)) {
-    if (project) {
-      const issue = await loadScopedIssue(itemId, project, registry, {
+  const itemIds = [...new Set(asArray(ids).filter(Boolean).map(String))];
+  if (!itemIds.length) return [];
+  if (project) {
+    const [issues, sprintField, iterationState] = await Promise.all([
+      loadScopedIssues(itemIds, project, registry, {
         nativeKind: 'requirements',
         fallbackNames: ['Story'],
-        label: 'requirement',
-        fields: commonFields(registry, ['reqCoveragePct', 'reqRiskScore', 'reqAiCoverageSummary'])
-      });
-      records.push({ id: String(issue.id), title: issue.fields?.summary || issue.key, issue });
-      continue;
-    }
+        label: 'Story',
+        fields: commonFields(registry, ['reqCoveragePct', 'reqRiskScore', 'reqAiCoverageSummary']),
+        properties: [REQUIREMENT_PROP]
+      }),
+      jiraSprintField(),
+      requirementIterationMap(project)
+    ]);
+    return mapInBatches(
+      issues,
+      (issue) => mapRequirement(issue, project, registry, iterationState.map, sprintField?.id),
+      10
+    );
+  }
+
+  const records = [];
+  for (const itemId of itemIds) {
     try {
       const issue = await getIssue(itemId, commonFields(null));
       records.push({ id: String(issue.id), title: issue.fields?.summary || issue.key, issue });
@@ -5907,10 +6658,41 @@ function sanitizeTestSteps(steps) {
   }));
 }
 
-async function saveTestCaseSpec(testCaseId, spec) {
-  const next = { ...spec, steps: sanitizeTestSteps(spec?.steps), revision: Number(spec?.revision || 1) + 1, updated_at: nowIso() };
+async function persistTestCaseSpecProperties(testCaseId, next, previousSpec = null) {
+  const compactSummary = buildTestCaseSummaryProperty(next);
+  // Validate both payloads before the first Jira mutation. The compact
+  // projection is bounded independently, while the full spec remains the
+  // authoritative source for edit/detail flows.
+  assertPropertySize(next, TEST_SPEC_PROP);
+  assertPropertySize(compactSummary, TEST_CASE_SUMMARY_PROP);
   await putIssueProperty(testCaseId, TEST_SPEC_PROP, next);
+  try {
+    await putIssueProperty(testCaseId, TEST_CASE_SUMMARY_PROP, compactSummary);
+  } catch (error) {
+    try {
+      if (previousSpec) {
+        await putIssueProperty(testCaseId, TEST_SPEC_PROP, previousSpec);
+        await putIssueProperty(testCaseId, TEST_CASE_SUMMARY_PROP, buildTestCaseSummaryProperty(previousSpec));
+      } else {
+        await deleteIssueProperty(testCaseId, TEST_SPEC_PROP);
+        await deleteIssueProperty(testCaseId, TEST_CASE_SUMMARY_PROP);
+      }
+    } catch (rollbackError) {
+      console.error('Qaira test-case summary rollback failed', {
+        testCaseId: String(testCaseId),
+        message: rollbackError instanceof Error ? rollbackError.message : String(rollbackError || 'Unknown rollback error')
+      });
+    }
+    throw error;
+  }
   return next;
+}
+
+async function saveTestCaseSpec(testCaseId, spec) {
+  const current = await getIssueProperty(testCaseId, TEST_SPEC_PROP, null);
+  const previousSpec = current ? structuredClone(current) : null;
+  const next = { ...spec, schema: TEST_SPEC_PROP, steps: sanitizeTestSteps(spec?.steps), revision: Number(spec?.revision || 1) + 1, updated_at: nowIso() };
+  return persistTestCaseSpecProperties(testCaseId, next, previousSpec);
 }
 
 async function captureTestCaseVersion(issue, project, registry, spec, reason = 'content-update') {
@@ -6098,7 +6880,7 @@ async function listTraceabilityRunHistory(project, registry, query = {}) {
       nativeKind: 'requirements',
       fallbackNames: ['Story'],
       fields: commonFields(registry),
-      label: 'requirement'
+      label: 'Story'
     });
     const { map } = await requirementIterationMap(project);
     const requirement = await mapRequirement(requirementIssue, project, registry, map);
@@ -6330,7 +7112,7 @@ async function buildExecutionReportData(project, registry, executionId, testCase
     `Results: ${counts.passed} passed, ${counts.failed} failed, ${counts.blocked} blocked, ${counts.running} running, ${counts.not_run} not run`,
     testCaseIssue ? `Case: ${testCaseIssue.key || testCaseIssue.id}` : null,
     selectedSnapshots.length ? `Case titles: ${selectedSnapshots.slice(0, 6).map((snapshot) => reportText(snapshot.test_case_title || snapshot.title || snapshot.name || snapshot.test_case_display_id || snapshot.display_id || snapshot.id)).join('; ')}` : null,
-    requirementNames.length ? `Impacted requirements: ${requirementNames.slice(0, 8).join('; ')}` : null,
+    requirementNames.length ? `Impacted Stories: ${requirementNames.slice(0, 8).join('; ')}` : null,
     failed.length ? `Failed/blocked cases: ${failed.length}` : null,
     latest ? `Latest result: ${latest.status} at ${reportText(latest.updated_at || latest.created_at)}` : 'Latest result: none recorded',
     latest?.error ? `Latest error: ${String(latest.error).slice(0, 160)}` : null,
@@ -6346,7 +7128,7 @@ async function buildExecutionReportData(project, registry, executionId, testCase
     `<p><b>Scope</b> ${counts.total} case(s) · <b>Results</b> ${counts.passed} passed, ${counts.failed} failed, ${counts.blocked} blocked, ${counts.running} running, ${counts.not_run} not run.</p>`,
     `<p><b>Release</b> ${htmlEscape(reportText(execution.release))} · <b>Sprint</b> ${htmlEscape(reportText(execution.sprint))} · <b>Build</b> ${htmlEscape(reportText(execution.build))}</p>`,
     selectedSnapshots.length ? `<h3>Cases</h3><ul>${selectedSnapshots.slice(0, 20).map((snapshot) => `<li>${htmlEscape(snapshot.test_case_display_id || snapshot.display_id || snapshot.id)}: ${htmlEscape(snapshot.test_case_title || snapshot.title || snapshot.name || '')}</li>`).join('')}</ul>` : '',
-    requirementNames.length ? `<h3>Impacted requirements</h3><ul>${requirementNames.slice(0, 20).map((name) => `<li>${htmlEscape(name)}</li>`).join('')}</ul>` : '',
+    requirementNames.length ? `<h3>Impacted Stories</h3><ul>${requirementNames.slice(0, 20).map((name) => `<li>${htmlEscape(name)}</li>`).join('')}</ul>` : '',
     failed.length ? `<h3>Failed or blocked evidence</h3><ul>${failed.slice(0, 20).map((result) => `<li>${htmlEscape(result.test_case_id)}: ${htmlEscape(result.status)} ${htmlEscape(result.error || '')}</li>`).join('')}</ul>` : '',
     evidenceRefs.length ? `<p><b>Evidence</b> ${htmlEscape(evidenceRefs.slice(0, 20).join(', '))}</p>` : '<p><b>Evidence</b> none recorded.</p>',
     '<p>Qaira report generated from Jira-native run data. Human review is required.</p>'
@@ -7422,8 +8204,43 @@ async function handleProjects(pathname, method, query, body, context) {
   const knowledgeContext = pathname.match(/^\/projects\/([^/]+)\/knowledge\/context-package$/);
   if (knowledgeContext) {
     const project = await getProject(knowledgeContext[1]);
-    const knowledge = await getCollection(project.key, COLLECTIONS.knowledge, []);
-    return { project_id: String(project.id), knowledge, related_context: [], generated_at: nowIso() };
+    if (!project) fail(404, 'PROJECT_NOT_FOUND', 'Project not found.');
+    const registry = await getRegistry(project.key);
+    if (!registry) fail(409, 'QAIRA_NOT_CONFIGURED', `Qaira registry ${REGISTRY_KEY} is missing for ${project.key}.`);
+    const appTypeId = optionalString(query?.app_type_id, 255) || null;
+    const retrievalIntent = optionalString(query?.query, 4000) || optionalString(query?.asset_type, 120) || 'quality engineering project context';
+    const assetType = String(query?.asset_type || '').toLowerCase();
+    const sources = assetType.includes('automation')
+      ? ['test-cases', 'object-repository', 'shared-steps', 'knowledge']
+      : assetType.includes('execution') || assetType.includes('run')
+        ? ['runs', 'test-cases', 'bugs', 'requirements', 'knowledge']
+        : assetType.includes('requirement') || assetType.includes('story')
+          ? ['requirements', 'test-cases', 'modules', 'knowledge']
+          : ['requirements', 'test-cases', 'modules', 'knowledge'];
+    const [allKnowledge, retrieval] = await Promise.all([
+      getCollection(project.key, COLLECTIONS.knowledge, []),
+      retrieveAiModuleContext(project, registry, {
+        intent: retrievalIntent,
+        appTypeId,
+        sources,
+        limit: 10,
+        maxChars: 12000
+      })
+    ]);
+    const knowledge = allKnowledge
+      .filter((item) => item?.is_active !== false)
+      .filter((item) => !appTypeId || !item?.app_type_id || String(item.app_type_id) === String(appTypeId));
+    return {
+      project_id: String(project.id),
+      knowledge,
+      related_context: retrieval.records,
+      retrieval: {
+        source_counts: retrieval.source_counts,
+        unavailable_sources: retrieval.unavailable_sources,
+        bounded: true
+      },
+      generated_at: nowIso()
+    };
   }
   const knowledgeItem = pathname.match(/^\/projects\/([^/]+)\/knowledge\/([^/]+)$/);
   if (knowledgeItem) {
@@ -7465,6 +8282,214 @@ async function handleCollectionCrud(pathname, method, query, body, context, base
   return null;
 }
 
+const AI_MODULE_CONTEXT_SOURCE_LIMIT = 20;
+const AI_MODULE_CONTEXT_MAX_SOURCES = 8;
+
+function aiContextRecord(source, item) {
+  if (!item || typeof item !== 'object') return null;
+  const sourceId = item.display_id || item.jira_bug_key || item.id;
+  if (!sourceId) return null;
+  if (source === 'requirements') {
+    return {
+      source_type: 'requirement',
+      source_id: String(sourceId),
+      title: item.title,
+      description: item.description,
+      status: item.status,
+      priority: item.priority,
+      labels: item.labels,
+      sprint: item.sprint,
+      release: item.release || item.fix_version,
+      test_case_ids: asArray(item.test_case_ids).slice(0, 30),
+      defect_ids: asArray(item.defect_ids).slice(0, 30),
+      coverage_pct: item.coverage_pct,
+      risk_score: item.risk_score
+    };
+  }
+  if (source === 'test-cases') {
+    return {
+      source_type: 'test-case',
+      source_id: String(sourceId),
+      title: item.title,
+      description: item.description,
+      status: item.status,
+      priority: item.priority,
+      labels: item.labels,
+      requirement_ids: asArray(item.requirement_ids).slice(0, 30),
+      module_ids: asArray(item.module_ids).slice(0, 20),
+      automation_status: item.automation_status,
+      ai_quality_score: item.ai_quality_score,
+      step_count: item.step_count
+    };
+  }
+  if (source === 'suites') {
+    return {
+      source_type: 'test-suite',
+      source_id: String(sourceId),
+      title: item.name || item.title,
+      description: item.description,
+      status: item.status,
+      suite_type: item.suite_type,
+      test_case_count: asArray(item.test_case_ids).length
+    };
+  }
+  if (source === 'runs') {
+    return {
+      source_type: 'test-run',
+      source_id: String(sourceId),
+      title: item.name || item.title,
+      status: item.status,
+      release: item.release,
+      sprint: item.sprint,
+      build: item.build,
+      test_case_ids: asArray(item.test_case_ids).slice(0, 30),
+      failed_count: item.failed_count,
+      blocked_count: item.blocked_count
+    };
+  }
+  if (source === 'bugs') {
+    return {
+      source_type: 'bug',
+      source_id: String(sourceId),
+      title: item.title,
+      description: item.message || item.description,
+      status: item.status,
+      priority: item.priority,
+      severity: item.severity,
+      environment: item.environment,
+      build: item.build,
+      linked_test_case_ids: asArray(item.linked_test_case_ids).slice(0, 30),
+      linked_requirement_ids: asArray(item.linked_requirement_ids).slice(0, 30)
+    };
+  }
+  if (source === 'modules') {
+    return {
+      source_type: 'test-module',
+      source_id: String(sourceId),
+      title: item.name || item.title,
+      description: item.description,
+      test_case_count: asArray(item.test_case_ids).length
+    };
+  }
+  if (source === 'shared-steps') {
+    return {
+      source_type: 'shared-step-group',
+      source_id: String(sourceId),
+      title: item.name || item.title,
+      description: item.description,
+      steps: asArray(item.steps).slice(0, 12).map((step, index) => ({
+        step_order: Number(step?.step_order || index + 1),
+        action: step?.action,
+        expected_result: step?.expected_result,
+        step_type: step?.step_type
+      }))
+    };
+  }
+  if (source === 'knowledge') {
+    return {
+      source_type: 'knowledge',
+      source_id: String(sourceId),
+      title: item.title || item.name,
+      description: item.description || item.summary,
+      content: item.content,
+      content_type: item.content_type,
+      labels: item.labels
+    };
+  }
+  if (source === 'data-sets') {
+    return {
+      source_type: 'test-data-schema',
+      source_id: String(sourceId),
+      title: item.name || item.title,
+      description: item.description,
+      mode: item.mode,
+      columns: asArray(item.columns).slice(0, 100),
+      row_count: asArray(item.rows).length
+    };
+  }
+  if (source === 'object-repository') {
+    return {
+      source_type: 'object-repository',
+      source_id: String(sourceId),
+      title: item.locator_intent || item.title,
+      screen: item.page_key,
+      page_url: item.page_url,
+      locator_kind: item.locator_kind,
+      locator: item.locator,
+      confidence: item.confidence,
+      test_case_id: item.test_case_id
+    };
+  }
+  return null;
+}
+
+function aiContextEvidenceRef(record) {
+  const jiraTypes = new Set(['requirement', 'test-case', 'test-suite', 'test-run', 'bug', 'object-repository']);
+  return `${jiraTypes.has(record.source_type) ? 'jira-issue' : record.source_type}:${record.source_id}`;
+}
+
+/**
+ * Retrieve only the Jira/Qaira modules named by a capability, then rank and
+ * compress their safe snapshots. Optional source failures are disclosed to the
+ * model instead of silently replacing authoritative records with user text.
+ */
+async function retrieveAiModuleContext(project, registry, {
+  intent = '',
+  appTypeId = null,
+  sources = [],
+  limit = 8,
+  maxChars = 10000
+} = {}) {
+  const requestedSources = [...new Set(asArray(sources).map(String))]
+    .slice(0, AI_MODULE_CONTEXT_MAX_SOURCES);
+  const sourceLoaders = {
+    requirements: () => listRequirements(project, registry, { page_size: 12, projection: 'detail' }),
+    'test-cases': () => listTestCases(project, registry, { app_type_id: appTypeId || undefined, page_size: 16, projection: 'detail' }),
+    suites: () => listSuites(project, registry, { app_type_id: appTypeId || undefined, page_size: 12 }),
+    runs: () => listExecutions(project, registry, { app_type_id: appTypeId || undefined, page_size: 12 }),
+    bugs: () => listBugs(project, registry, { page_size: 12, projection: 'detail' }),
+    modules: () => getCollection(project.key, COLLECTIONS.modules, []),
+    'shared-steps': () => getCollection(project.key, COLLECTIONS.sharedStepGroups, []),
+    knowledge: () => getCollection(project.key, COLLECTIONS.knowledge, []),
+    'data-sets': () => getCollection(project.key, COLLECTIONS.testDataSets, []),
+    'object-repository': () => listObjectRepository(project, registry, { app_type_id: appTypeId || undefined })
+  };
+  const loadedSources = await Promise.all(requestedSources.map(async (source) => {
+    const loader = sourceLoaders[source];
+    if (!loader) return { source, available: false, records: [] };
+    try {
+      let items = asArray(await loader());
+      if (source === 'knowledge') items = items.filter((item) => item?.is_active !== false);
+      if (appTypeId && ['modules', 'shared-steps', 'knowledge', 'data-sets'].includes(source)) {
+        items = items.filter((item) => !item?.app_type_id || String(item.app_type_id) === String(appTypeId));
+      }
+      const records = items
+        .slice(0, AI_MODULE_CONTEXT_SOURCE_LIMIT)
+        .map((item) => aiContextRecord(source, item))
+        .filter(Boolean);
+      return { source, available: true, records };
+    } catch {
+      return { source, available: false, records: [] };
+    }
+  }));
+  const candidates = loadedSources.flatMap(({ records }) => records);
+  const records = rankContextRecords(
+    candidates,
+    // Retrieval intent is advisory rather than a persisted/API field. Bound it
+    // without rejecting a valid large Story or automation case before ranking.
+    String(intent || '').slice(0, 12000),
+    clamp(Number(limit || 8), 1, 20),
+    clamp(Number(maxChars || 10000), 2000, 18000)
+  );
+  return {
+    records,
+    evidence_refs: [...new Set(records.map(aiContextEvidenceRef))].slice(0, 100),
+    source_counts: Object.fromEntries(loadedSources.map(({ source, records: values }) => [source, values.length])),
+    unavailable_sources: loadedSources.filter(({ available }) => !available).map(({ source }) => source),
+    bounded: true
+  };
+}
+
 function normalizeRequirementCreationAiInput(body = {}) {
   const images = asArray(body?.images).slice(0, 8).map((image, index) => {
     const url = String(image?.url || '');
@@ -7476,6 +8501,8 @@ function normalizeRequirementCreationAiInput(body = {}) {
     };
   });
   return compactAiInputForStorage({
+    project_id: optionalString(body?.project_id, 255),
+    app_type_id: optionalString(body?.app_type_id, 255),
     integration_id: optionalString(body?.integration_id, 255),
     model: optionalString(body?.model, 255),
     title: optionalString(body?.title, 255),
@@ -7488,7 +8515,7 @@ function normalizeRequirementCreationAiInput(body = {}) {
   });
 }
 
-async function buildRequirementCreationPreview(body = {}, options = {}) {
+async function buildRequirementCreationPreview(project, registry, body = {}, options = {}) {
   const safeBody = normalizeRequirementCreationAiInput(body);
   const context = optionalString(safeBody?.additional_context, 20000) || '';
   const meaningfulContextLines = context
@@ -7498,7 +8525,16 @@ async function buildRequirementCreationPreview(body = {}, options = {}) {
     .filter((line, index, list) => list.findIndex((candidate) => candidate.toLowerCase() === line.toLowerCase()) === index);
   const contextLead = meaningfulContextLines[0];
   const suggestedTitle = optionalString(safeBody?.title, 255)
-    || (contextLead ? contextLead.slice(0, 255) : 'New testable requirement');
+    || (contextLead ? contextLead.slice(0, 255) : 'New testable Story');
+  const retrievedContext = project && registry
+    ? await retrieveAiModuleContext(project, registry, {
+        intent: [suggestedTitle, context].filter(Boolean).join('\n'),
+        appTypeId: safeBody.app_type_id,
+        sources: ['requirements', 'modules', 'knowledge'],
+        limit: 8,
+        maxChars: 9000
+      })
+    : { records: [], evidence_refs: [], source_counts: {}, unavailable_sources: [], bounded: true };
   const externalReferences = asArray(safeBody?.external_links)
     .map((value) => optionalString(value, 2000))
     .filter(Boolean)
@@ -7520,7 +8556,7 @@ async function buildRequirementCreationPreview(body = {}, options = {}) {
   }
   const requirementAngles = ['Core user outcome', 'Business rules and validation', 'Access control and exceptions', 'Evidence, metrics, and operations', 'Integration and data contracts', 'Release readiness'];
   const requirements = seedLines.map((seed, index) => {
-    const angle = requirementAngles[index] || `Requirement ${index + 1}`;
+    const angle = requirementAngles[index] || `Story ${index + 1}`;
     const titleBase = index === 0 && suggestedTitle ? suggestedTitle : `${angle}: ${seed}`;
     const title = titleBase.length > 255 ? titleBase.slice(0, 252).trimEnd() + '...' : titleBase;
     const description = [
@@ -7532,7 +8568,7 @@ async function buildRequirementCreationPreview(body = {}, options = {}) {
     const acceptanceCriteria = [
       `Given the relevant role and preconditions, when ${seed.replace(/[.:;]+$/, '')}, then the expected outcome is visible and verifiable in Jira/Qaira.`,
       'Invalid, boundary, duplicate, and unauthorized inputs have explicit system behavior and user feedback.',
-      'The requirement can be traced to tests, execution evidence, defects, impacted release scope, and reporting metrics.'
+      'The Story can be traced to tests, execution evidence, defects, impacted release scope, and reporting metrics.'
     ];
     const risks = [
       'Ambiguous actor, data, or workflow boundaries may create missed test coverage.',
@@ -7553,7 +8589,7 @@ async function buildRequirementCreationPreview(body = {}, options = {}) {
       risks,
       open_questions: openQuestions,
       change_summary: [
-        `Drafted ${angle.toLowerCase()} requirement`,
+        `Drafted Story for ${angle.toLowerCase()}`,
         'Added review-gated acceptance criteria',
         'Added negative and traceability considerations',
         ...(imageCount ? [`Included ${imageCount} reference photo${imageCount === 1 ? '' : 's'} in the review context`] : [])
@@ -7576,15 +8612,24 @@ async function buildRequirementCreationPreview(body = {}, options = {}) {
     ],
     risks: ['Ambiguous scope can create coverage gaps.', 'Non-functional and access-control behavior may be missed.'],
     open_questions: ['Which roles may perform this action?', 'What is the expected behavior on partial failure or retry?'],
-    change_summary: ['Created a structured requirement draft', 'Added negative and boundary behavior'],
+    change_summary: ['Created a structured Story draft', 'Added negative and boundary behavior'],
     quality_score: context ? 0.78 : 0.62,
-    rationale: 'Fallback single requirement draft.'
+    rationale: 'Fallback single Story draft.'
   };
   return assistedResponse(
     { requirement: null, generated: requirements.length, requirements, suggestion },
     'requirement-creation-preview',
-    safeBody,
+    {
+      ...safeBody,
+      authoritative_project_context: retrievedContext.records,
+      context_retrieval: {
+        source_counts: retrievedContext.source_counts,
+        unavailable_sources: retrievedContext.unavailable_sources,
+        bounded: true
+      }
+    },
     [
+      ...retrievedContext.evidence_refs,
       ...externalReferences.map((url) => `external-reference:${url}`),
       ...(imageCount ? [`compressed-reference-images:${imageCount}`] : [])
     ],
@@ -7623,6 +8668,16 @@ async function buildTestCaseDesignPreview(project, registry, body = {}, options 
   const records = await requirementRecordsByIds(safeBody.requirement_ids || [], project, registry);
   const maxCases = clamp(Number(safeBody.max_cases_per_requirement || 4), 1, 8);
   const cases = draftTestCandidates(records, maxCases);
+  const retrievedContext = await retrieveAiModuleContext(project, registry, {
+    intent: [
+      ...records.flatMap((record) => [record.title, record.description]),
+      safeBody.additional_context
+    ].filter(Boolean).join('\n'),
+    appTypeId: safeBody.app_type_id,
+    sources: ['test-cases', 'modules', 'shared-steps', 'knowledge'],
+    limit: 10,
+    maxChars: 11000
+  });
   const externalReferences = asArray(safeBody.external_links)
     .map((value) => optionalString(value, 2000))
     .filter(Boolean)
@@ -7630,6 +8685,7 @@ async function buildTestCaseDesignPreview(project, registry, body = {}, options 
   const imageCount = asArray(safeBody.images).length;
   const evidence = [
     ...records.map(({ id: requirementId }) => `jira-issue:${requirementId}`),
+    ...retrievedContext.evidence_refs,
     ...externalReferences.map((url) => `external-reference:${url}`),
     ...(imageCount ? [`compressed-reference-images:${imageCount}`] : [])
   ];
@@ -7641,7 +8697,16 @@ async function buildTestCaseDesignPreview(project, registry, body = {}, options 
       app_type: { id: safeBody.app_type_id, name: titleCase(String(safeBody.app_type_id || 'Web').split(':').pop()) }
     },
     'multi-requirement-test-design-preview',
-    safeBody,
+    {
+      ...safeBody,
+      authoritative_requirements: records.map((record) => aiContextRecord('requirements', record)).filter(Boolean),
+      related_module_context: retrievedContext.records,
+      context_retrieval: {
+        source_counts: retrievedContext.source_counts,
+        unavailable_sources: retrievedContext.unavailable_sources,
+        bounded: true
+      }
+    },
     evidence,
     records.length ? 0.78 : 0.58,
     options
@@ -7665,7 +8730,7 @@ async function importRequirementRows(project, registry, rows = [], context = {})
       const iteration = iterationToken ? resolveImportedReference(iterations, iterationToken) : null;
       const created = await handleRequirements('/requirements', 'POST', {}, {
         project_id: project.id,
-        title: row.title || row.summary || `Imported requirement ${rowIndex + 1}`,
+        title: row.title || row.summary || `Imported Story ${rowIndex + 1}`,
         description: row.description || '',
         external_references: row.external_references || [],
         labels: row.labels || [],
@@ -7684,7 +8749,7 @@ async function importRequirementRows(project, registry, rows = [], context = {})
           row: displayRow,
           title: row?.title || row?.summary || null,
           code: created.status_warning.code || 'STATUS_TRANSITION_UNAVAILABLE',
-          message: `${created.status_warning.message} Requirement was imported and kept in Jira's current workflow status.`,
+          message: `${created.status_warning.message} The Story was imported and kept in Jira's current workflow status.`,
           requested_status: created.status_warning.requested_status || row.status || null,
           current_status: created.status_warning.current_status || null,
           issue_key: created.status_warning.issue_key || created.id
@@ -7725,8 +8790,8 @@ async function handleRequirements(pathname, method, query, body, context) {
   const registry = await getRegistry(project.key);
   if (!registry) throw new Error(`Qaira registry ${REGISTRY_KEY} is missing for ${project.key}. Run the Qaira setup script for this project.`);
   const scopedRequirementMatch = pathname.match(/^\/requirements\/([^/]+)/);
-  if (scopedRequirementMatch && !['import', 'export', 'create-metadata', 'ai-create-preview', 'ai-create-jobs', 'ai-description-rephrase'].includes(scopedRequirementMatch[1])) {
-    await loadScopedIssue(scopedRequirementMatch[1], project, registry, { nativeKind: 'requirements', fallbackNames: ['Story'], label: 'requirement' });
+  if (scopedRequirementMatch && !['import', 'export', 'create-metadata', 'ai-create-preview', 'ai-create-jobs', 'ai-description-rephrase', 'ai-gherkin-preview'].includes(scopedRequirementMatch[1])) {
+    await loadScopedIssue(scopedRequirementMatch[1], project, registry, { nativeKind: 'requirements', fallbackNames: ['Story'], label: 'Story' });
   }
 
   if (pathname === '/requirements' && method === 'GET') return listRequirements(project, registry, query);
@@ -7740,14 +8805,20 @@ async function handleRequirements(pathname, method, query, body, context) {
       || optionalString(adfText(body?.description_adf), 20000)
       || '';
     if (!plainDescription.trim()) {
-      fail(400, 'DESCRIPTION_REQUIRED', 'Requirement description text is required before AI can rephrase it.');
+      fail(400, 'DESCRIPTION_REQUIRED', 'Story description text is required before AI can rephrase it.');
     }
-    const requirement = body?.requirement && typeof body.requirement === 'object' ? body.requirement : {};
-    const title = optionalString(requirement.title, 255) || 'Requirement';
+    const submittedRequirement = body?.requirement && typeof body.requirement === 'object' ? body.requirement : {};
+    const authoritativeRequirement = submittedRequirement.id
+      ? (await requirementRecordsByIds([submittedRequirement.id], project, registry))[0] || null
+      : null;
+    const requirement = authoritativeRequirement
+      ? { ...submittedRequirement, ...authoritativeRequirement }
+      : submittedRequirement;
+    const title = optionalString(requirement.title, 255) || 'Story';
     const status = optionalString(requirement.status, 100) || null;
     const priority = requirement.priority == null ? null : clamp(Number(requirement.priority || 3), 1, 5);
     const contextLines = [
-      `Requirement: ${title}`,
+      `Story: ${title}`,
       status ? `Current status: ${status}` : null,
       priority ? `Priority: P${priority}` : null,
       requirement.sprint ? `Sprint: ${optionalString(requirement.sprint, 120)}` : null,
@@ -7805,7 +8876,7 @@ async function handleRequirements(pathname, method, query, body, context) {
   }
   if (pathname === '/requirements' && method === 'POST') {
     const requirementType = nativeIssueTypeIds(registry, 'requirements', ['Story'])[0];
-    const title = requiredString(body?.title, 'Requirement title', 255);
+    const title = requiredString(body?.title, 'Story title', 255);
     const iteration = await requirementIterationById(project, body?.iteration_id);
     const requestedSprint = body?.sprint || iteration?.jira_sprint_id || iteration?.jira_sprint_name || null;
     const requestedVersion = body?.fix_version ?? body?.release ?? null;
@@ -7839,6 +8910,7 @@ async function handleRequirements(pathname, method, query, body, context) {
         schema: REQUIREMENT_PROP,
         revision: 1,
         external_references: asArray(body?.external_references).map(String),
+        gherkin_scenarios: validatedGherkinScenarios(body?.gherkin_scenarios),
         sprint: delivery.sprintFallback,
         imported_status: body?.status ? optionalString(body.status, 120) : null,
         created_by: actor.accountId,
@@ -7862,14 +8934,14 @@ async function handleRequirements(pathname, method, query, body, context) {
   }
   if (pathname === '/requirements/import' && method === 'POST') {
     const rows = compactImportRows(body?.rows || []);
-    if (!rows.length) fail(400, 'IMPORT_ROWS_REQUIRED', 'Import requires at least one requirement row.');
+    if (!rows.length) fail(400, 'IMPORT_ROWS_REQUIRED', 'Import requires at least one Story row.');
     const actor = await currentActor(context, project, 'requirements-import-queue');
     const txn = await createWorkspaceTransaction(project, {
       category: 'bulk_import',
       action: 'import',
       status: 'queued',
-      title: `Importing ${rows.length} requirements`,
-      description: 'Requirement import is queued for a Forge async worker.',
+      title: `Importing ${rows.length} ${rows.length === 1 ? 'Story' : 'Stories'}`,
+      description: 'Story import is queued for a Forge async worker.',
       created_by: actor.accountId,
       metadata: { resource: 'requirements', total: rows.length, count: 0, failed: 0, queued: true }
     });
@@ -7895,7 +8967,7 @@ async function handleRequirements(pathname, method, query, body, context) {
         append_event: {
           phase: 'queued',
           level: 'info',
-          message: `Queued ${rows.length} requirement row(s) across ${importJob.chunk_count || 1} import chunk(s).`,
+          message: `Queued ${rows.length} ${rows.length === 1 ? 'Story' : 'Stories'} across ${importJob.chunk_count || 1} import ${Number(importJob.chunk_count || 1) === 1 ? 'chunk' : 'chunks'}.`,
           details: { import_job_id: importJob.id, async_event_job_id: queued.jobId, chunks: importJob.chunk_count || 1 }
         }
       });
@@ -7904,7 +8976,7 @@ async function handleRequirements(pathname, method, query, body, context) {
       await updateImportJob(project, importJob, { status: 'failed', completed_at: nowIso(), last_error: String(error?.message || error).slice(0, 1000) });
       await updateWorkspaceTransaction(project, txn.id, {
         status: 'failed',
-        title: 'Requirement import failed to queue',
+        title: 'Story import failed to queue',
         description: String(error?.message || error).slice(0, 1000),
         metadata: { resource: 'requirements', total: rows.length, count: 0, failed: rows.length, errors: [{ code: error?.code || 'QUEUE_FAILED', message: String(error?.message || error) }] },
         rebuild_events: true,
@@ -7915,35 +8987,69 @@ async function handleRequirements(pathname, method, query, body, context) {
   }
   if (pathname === '/requirements/export' && method === 'POST') {
     const requestedIds = [...new Set(asArray(body?.requirement_ids).filter(Boolean).map(String))];
-    const exportableIds = [];
+    if (!requestedIds.length) {
+      fail(400, 'REQUIREMENT_SELECTION_REQUIRED', 'Select at least one Story to export.');
+    }
+    if (requestedIds.length > MAX_SYNC_EXPORT_RECORDS) {
+      fail(413, 'EXPORT_SCOPE_TOO_LARGE', `A synchronous export can include at most ${MAX_SYNC_EXPORT_RECORDS} Stories. Export a smaller selection.`);
+    }
+
+    // Export is an explicit detail operation. Hydrate selected Jira Stories in
+    // bounded JQL pages with their small Qaira requirement property instead of
+    // issuing one Jira request per row or trusting compact catalog summaries.
+    const requirementTypeClause = issueTypeClause(nativeIssueTypeIds(registry, 'requirements', ['Story']));
+    const sprintField = await jiraSprintField();
+    const exportFields = commonFields(registry, ['reqCoveragePct', 'reqRiskScore', 'reqAiCoverageSummary']);
+    if (sprintField?.id) exportFields.push(sprintField.id);
+    const exportPages = [];
+    for (let offset = 0; offset < requestedIds.length; offset += MAX_PAGE_SIZE) {
+      const pageIds = requestedIds.slice(offset, offset + MAX_PAGE_SIZE);
+      exportPages.push(searchIssues(
+        `project = ${project.key} AND ${requirementTypeClause} AND ${issueReferencesClause(pageIds)} ORDER BY updated DESC`,
+        exportFields,
+        pageIds.length,
+        [QAIRA_DELETE_PROP, REQUIREMENT_PROP]
+      ));
+    }
+    const exportIssues = (await Promise.all(exportPages))
+      .flatMap((result) => result.issues)
+      .filter((issue) => !isSoftDeletedIssue(issue));
+    const issueByReference = new Map(exportIssues.flatMap((issue) => [
+      [String(issue.id), issue],
+      [String(issue.key), issue]
+    ]));
+    const exportableIssues = [];
     const skipped = [];
     for (const requirementId of requestedIds) {
-      try {
-        const issue = await loadScopedIssue(requirementId, project, registry, { nativeKind: 'requirements', fallbackNames: ['Story'], label: 'requirement' });
-        exportableIds.push(String(issue.id));
-      } catch (error) {
-        if (isAuthenticationRequiredError(error)) throw error;
-        const statusCode = Number(error?.statusCode || error?.status || error?.response?.status || 0);
-        if (statusCode === 404 || ['ISSUE_NOT_FOUND', 'WRONG_ISSUE_TYPE', 'CROSS_PROJECT_ACCESS', 'JIRA_REQUEST_FAILED'].includes(String(error?.code || ''))) {
-          skipped.push({
-            id: requirementId,
-            code: error?.code || (statusCode === 404 ? 'ISSUE_NOT_FOUND' : 'REQUIREMENT_SKIPPED'),
-            message: String(error?.message || error).slice(0, 500)
-          });
-          continue;
-        }
-        throw error;
+      const issue = issueByReference.get(requirementId);
+      if (!issue) {
+        skipped.push({
+          id: requirementId,
+          code: 'REQUIREMENT_SKIPPED',
+          message: 'The Jira Story is deleted, inaccessible, outside this project, or no longer configured for Qaira.'
+        });
+        continue;
       }
+      exportableIssues.push(issue);
     }
-    const uniqueExportableIds = [...new Set(exportableIds)];
-    if (requestedIds.length && !uniqueExportableIds.length) {
-      fail(404, 'NO_EXPORTABLE_REQUIREMENTS', 'None of the selected requirement records are visible Jira Story requirements for this project.', { skipped });
+    const uniqueExportableIssues = [...new Map(exportableIssues.map((issue) => [String(issue.id), issue])).values()];
+    if (!uniqueExportableIssues.length) {
+      fail(404, 'NO_EXPORTABLE_REQUIREMENTS', 'None of the selected Stories are visible Jira Story records for this project.', { skipped });
     }
+    const { map: iterationMap } = await requirementIterationMap(project);
+    const requirementRecords = await mapInBatches(
+      uniqueExportableIssues,
+      (issue) => mapRequirement(issue, project, registry, iterationMap, sprintField?.id),
+      10
+    );
+    const uniqueExportableIds = requirementRecords.map((requirement) => requirement.id);
     const txn = await createWorkspaceTransaction(project, {
       category: 'bulk_export',
       action: 'export',
       status: skipped.length ? 'completed_with_errors' : 'completed',
-      title: `Exported ${requestedIds.length ? uniqueExportableIds.length : 'all'} requirements`,
+      title: requestedIds.length
+        ? `Exported ${uniqueExportableIds.length} ${uniqueExportableIds.length === 1 ? 'Story' : 'Stories'}`
+        : 'Exported all Stories',
       metadata: {
         resource: 'requirements',
         count: uniqueExportableIds.length || requestedIds.length,
@@ -7960,7 +9066,8 @@ async function handleRequirements(pathname, method, query, body, context) {
       queued: false,
       status: skipped.length ? 'completed_with_errors' : 'completed',
       count: uniqueExportableIds.length || requestedIds.length,
-      skipped
+      skipped,
+      requirement_records: requirementRecords
     };
   }
   if (pathname === '/requirements/ai-create-jobs' && method === 'GET') {
@@ -7976,7 +9083,7 @@ async function handleRequirements(pathname, method, query, body, context) {
   if (aiRequirementJobMatch && method === 'GET') {
     const found = await findCollectionItem(COLLECTIONS.generationJobs, aiRequirementJobMatch[1], project);
     if (!found || String(found.item.job_type || '') !== 'ai-requirement-generation') {
-      fail(404, 'AI_REQUIREMENT_JOB_NOT_FOUND', 'AI requirement generation job was not found.');
+      fail(404, 'AI_REQUIREMENT_JOB_NOT_FOUND', 'AI Story generation job was not found.');
     }
     return maybeRequeueStaleAiGenerationJob(project, found.item);
   }
@@ -8018,106 +9125,65 @@ async function handleRequirements(pathname, method, query, body, context) {
     }
   }
   if (pathname === '/requirements/ai-create-preview' && method === 'POST') {
-    const context = optionalString(body?.additional_context, 20000) || '';
-    const meaningfulContextLines = context
-      .split(/\r?\n/)
-      .map((line) => line.replace(/^[-*#\s]+/, '').trim())
-      .filter((line) => line && !/^(qaira smart context pack|requirements?|ai knowledge|file context|attached file context)\s*:?$/i.test(line))
-      .filter((line, index, list) => list.findIndex((candidate) => candidate.toLowerCase() === line.toLowerCase()) === index);
-    const contextLead = meaningfulContextLines[0];
-    const suggestedTitle = optionalString(body?.title, 255)
-      || (contextLead ? contextLead.slice(0, 255) : 'New testable requirement');
-    const externalReferences = asArray(body?.external_links)
-      .map((value) => optionalString(value, 2000))
-      .filter(Boolean)
-      .slice(0, 20);
-    const imageCount = asArray(body?.images).length;
-    const requestedCount = clamp(Number(body?.max_requirements || 4), 1, 6);
-    const defaultPriority = clamp(Number(body?.priority || 3), 1, 5);
-    const defaultStatus = optionalString(body?.status, 100) || 'To Do';
-    const seedLines = meaningfulContextLines.length
-      ? meaningfulContextLines.slice(0, requestedCount)
-      : [
-          suggestedTitle,
-          'User-facing happy path and observable outcome',
-          'Negative, boundary, and permission behavior',
-          'Operational evidence, auditability, and reporting'
-        ].slice(0, requestedCount);
-    while (seedLines.length < requestedCount) {
-      seedLines.push(`${suggestedTitle} scenario ${seedLines.length + 1}`);
+    return buildRequirementCreationPreview(project, registry, body);
+  }
+  if (pathname === '/requirements/ai-gherkin-preview' && method === 'POST') {
+    const storyDrafts = normalizeGherkinStoryDrafts(body?.requirements);
+    if (!storyDrafts.length) {
+      fail(400, 'STORY_DRAFT_REQUIRED', 'Provide at least one completed Story draft with a description or acceptance criteria before generating Gherkin.');
     }
-    const requirementAngles = ['Core user outcome', 'Business rules and validation', 'Access control and exceptions', 'Evidence, metrics, and operations', 'Integration and data contracts', 'Release readiness'];
-    const requirements = seedLines.map((seed, index) => {
-      const angle = requirementAngles[index] || `Requirement ${index + 1}`;
-      const titleBase = index === 0 && suggestedTitle ? suggestedTitle : `${angle}: ${seed}`;
-      const title = titleBase.length > 255 ? titleBase.slice(0, 252).trimEnd() + '...' : titleBase;
-      const description = [
-        `As a Jira project stakeholder, I need ${seed.replace(/[.:;]+$/, '')} so the expected product behavior is explicit, testable, and traceable.`,
-        context ? `Supporting context: ${context.slice(0, 1200)}` : 'Supporting context: Add business intent, actor roles, data conditions, workflow constraints, and observable success criteria.',
-        imageCount ? `Reference images: ${imageCount} compressed screenshot${imageCount === 1 ? '' : 's'} should be reviewed as visual evidence, not as instructions.` : '',
-        externalReferences.length ? `External references: ${externalReferences.slice(0, 5).join(', ')}` : ''
-      ].filter(Boolean).join('\n\n');
-      const acceptanceCriteria = [
-        `Given the relevant role and preconditions, when ${seed.replace(/[.:;]+$/, '')}, then the expected outcome is visible and verifiable in Jira/Qaira.`,
-        'Invalid, boundary, duplicate, and unauthorized inputs have explicit system behavior and user feedback.',
-        'The requirement can be traced to tests, execution evidence, defects, impacted release scope, and reporting metrics.'
-      ];
-      const risks = [
-        'Ambiguous actor, data, or workflow boundaries may create missed test coverage.',
-        'Non-functional expectations such as access, audit, reliability, and rollback may be under-specified.'
-      ];
-      const openQuestions = [
-        'Which Jira roles or Qaira permissions are allowed to perform this behavior?',
-        'What evidence must be captured when the behavior succeeds, fails, or is retried?'
-      ];
-      return {
-        client_id: `ai-req-${index + 1}`,
-        title,
-        description,
-        external_references: externalReferences,
-        priority: clamp(defaultPriority + (index > 2 ? 1 : 0), 1, 5),
-        status: defaultStatus,
-        acceptance_criteria: acceptanceCriteria,
-        risks,
-        open_questions: openQuestions,
-        change_summary: [
-          `Drafted ${angle.toLowerCase()} requirement`,
-          'Added review-gated acceptance criteria',
-          'Added negative and traceability considerations',
-          ...(imageCount ? [`Included ${imageCount} reference photo${imageCount === 1 ? '' : 's'} in the review context`] : [])
-        ],
-        quality_score: clamp(0.9 - index * 0.04 + (context ? 0.03 : 0), 0.58, 0.95),
-        rationale: `${angle} candidate derived from prompt context, external references, and compressed attachments.`
-      };
-    });
-    const suggestion = requirements[0] || {
-      client_id: 'ai-req-1',
-      title: suggestedTitle,
-      description: context || 'Describe the user outcome, business rules, constraints, and observable success criteria.',
-      external_references: externalReferences,
-      priority: defaultPriority,
-      status: defaultStatus,
-      acceptance_criteria: [
-        'The primary user outcome is observable and verifiable.',
-        'Invalid, boundary, and unauthorized inputs have explicit behavior.',
-        'Accessibility, reliability, audit, and rollback expectations are documented.'
-      ],
-      risks: ['Ambiguous scope can create coverage gaps.', 'Non-functional and access-control behavior may be missed.'],
-      open_questions: ['Which roles may perform this action?', 'What is the expected behavior on partial failure or retry?'],
-      change_summary: ['Created a structured requirement draft', 'Added negative and boundary behavior'],
-      quality_score: context ? 0.78 : 0.62,
-      rationale: 'Fallback single requirement draft.'
-    };
-    return assistedResponse(
-      { requirement: null, generated: requirements.length, requirements, suggestion },
-      'requirement-creation-preview',
-      body,
-      [
-        ...externalReferences.map((url) => `external-reference:${url}`),
-        ...(imageCount ? [`compressed-reference-images:${imageCount}`] : [])
-      ],
-      context ? 0.72 : 0.58
+    const deterministicRequirements = storyDrafts.map((story) => ({
+      client_id: story.client_id,
+      gherkin_scenarios: buildDeterministicGherkinScenarios(story)
+    }));
+    const assisted = await assistedResponse(
+      { requirements: deterministicRequirements },
+      'requirement-gherkin-preview',
+      {
+        integration_id: optionalString(body?.integration_id, 255) || undefined,
+        model: optionalString(body?.model, 255) || undefined,
+        story_drafts: storyDrafts,
+        authoring_contract: {
+          dialect: 'Gherkin',
+          sequence: ['Feature', 'Scenario', 'Given', 'When', 'Then'],
+          rules: [
+            'Use the exact completed Story draft as the only product-behavior source.',
+            'Create one independently executable scenario per acceptance criterion.',
+            'Do not invent UI controls, data, roles, outcomes, or integrations absent from the Story.',
+            'Use And only after a Given, When, or Then clause and keep observable outcomes in Then.'
+          ]
+        }
+      },
+      storyDrafts.map((item) => `story-draft:${item.client_id}`),
+      0.76
     );
+    const normalized = normalizeGherkinPreviewRequirements(assisted.requirements, deterministicRequirements);
+    const validationFallbackUsed = normalized.repaired_count > 0;
+    const fallbackUsed = assisted.fallback_used || validationFallbackUsed;
+    const fallbackReason = assisted.fallback_reason || (validationFallbackUsed
+      ? 'Forge LLM Gherkin output failed structural validation; Qaira retained the complete deterministic scenarios.'
+      : null);
+    const generationMode = validationFallbackUsed ? 'llm-with-deterministic-validation-fallback' : assisted.generation_mode;
+    return {
+      ...assisted,
+      requirements: normalized.requirements,
+      fallback_used: fallbackUsed,
+      fallback_reason: fallbackReason,
+      generation_mode: generationMode,
+      provenance: {
+        ...assisted.provenance,
+        generation_mode: generationMode,
+        fallback_used: fallbackUsed,
+        fallback_reason: fallbackReason,
+        structural_validation_applied: true
+      },
+      validation: {
+        story_count: storyDrafts.length,
+        scenario_count: normalized.requirements.reduce((count, item) => count + item.gherkin_scenarios.length, 0),
+        repaired_story_count: normalized.repaired_count,
+        exact_story_draft_used: true
+      }
+    };
   }
   const impactMatch = pathname.match(/^\/requirements\/([^/]+)\/ai-impact-preview$/);
   if (impactMatch && method === 'POST') {
@@ -8162,28 +9228,34 @@ async function handleRequirements(pathname, method, query, body, context) {
       },
       explanation: tests.length
         ? 'Impact is derived from live Jira issue links and Qaira issue properties; no change has been applied.'
-        : 'No linked test case was found, so this requirement change currently has an explicit coverage gap.',
+        : 'No linked test case was found, so this Story change currently has an explicit coverage gap.',
       recommended_actions: [
-        ...(tests.length ? ['Review linked test intent and expected results against the proposed requirement change.'] : ['Create and review tests for the changed acceptance criteria.']),
+        ...(tests.length ? ['Review linked test intent and expected results against the proposed Story change.'] : ['Create and review tests for the changed acceptance criteria.']),
         ...(affectedRuns.length ? ['Reassess active or release-scoped runs that include the affected tests.'] : []),
         ...(affectedAutomation.length ? ['Review automation assets and object references before the next automated run.'] : []),
         'Confirm the impact with a human reviewer before updating Jira records.'
       ],
       preview_only: true
-    }, 'requirement-change-impact-preview', { requirement_id: requirement.id, proposed_change: body?.proposed_change || body }, evidence, tests.length ? 0.82 : 0.58);
+    }, 'requirement-change-impact-preview', {
+      requirement_id: requirement.id,
+      proposed_change: body?.proposed_change || body,
+      authoritative_impact: {
+        requirement: { title: requirement.title, priority: requirement.priority, risk_score: requirement.risk_score },
+        linked_test_cases: tests.map(({ id: testCaseId, display_id, title, status, automation_status }) => ({ id: testCaseId, display_id, title, status, automation_status })),
+        affected_suites: affectedSuites.map(({ id: suiteId, display_id, name }) => ({ id: suiteId, display_id, name })),
+        affected_runs: affectedRuns.map(({ id: runId, display_id, name, status, release, build }) => ({ id: runId, display_id, name, status, release, build })),
+        automation_asset_count: affectedAutomation.length
+      }
+    }, evidence, tests.length ? 0.82 : 0.58);
   }
 
   const previewMatch = pathname.match(/^\/requirements\/([^/]+)\/design-test-cases-preview$/);
   if (previewMatch && method === 'POST') {
-    const records = await requirementRecordsByIds([previewMatch[1]], project, registry);
-    const cases = draftTestCandidates(records, body?.max_cases || 6);
-    return assistedResponse(
-      { generated: cases.length, cases, requirements: records.map(({ id: requirementId, title }) => ({ id: requirementId, title })), app_type: { id: body?.app_type_id || `${project.id}:web`, name: titleCase(String(body?.app_type_id || 'Web').split(':').pop()) } },
-      'requirement-test-design-preview',
-      body,
-      records.map(({ id: requirementId }) => `jira-issue:${requirementId}`),
-      0.78
-    );
+    return buildTestCaseDesignPreview(project, registry, {
+      ...body,
+      requirement_ids: [previewMatch[1]],
+      max_cases_per_requirement: body?.max_cases || 6
+    });
   }
   const acceptMatch = pathname.match(/^\/requirements\/([^/]+)\/design-test-cases-accept$/);
   if (acceptMatch && method === 'POST') {
@@ -8195,7 +9267,7 @@ async function handleRequirements(pathname, method, query, body, context) {
   if (optimizeMatch && method === 'POST') {
     const records = await requirementRecordsByIds([optimizeMatch[1]], project, registry);
     const requirement = records[0];
-    if (!requirement) fail(404, 'REQUIREMENT_NOT_FOUND', 'Requirement not found.');
+    if (!requirement) fail(404, 'REQUIREMENT_NOT_FOUND', 'Story not found.');
     const requirementContext = {
       id: requirement.id,
       display_id: requirement.display_id || requirement.key || null,
@@ -8211,6 +9283,19 @@ async function handleRequirements(pathname, method, query, body, context) {
       coverage_percent: (requirement.coverage_percent ?? requirement.coverage) || null,
       risk_score: requirement.risk_score ?? null
     };
+    const [linkedTestCases, retrievedContext] = await Promise.all([
+      listTestCases(project, registry, {
+        requirement_id: requirement.id,
+        page_size: 12,
+        projection: 'detail'
+      }),
+      retrieveAiModuleContext(project, registry, {
+        intent: [requirement.title, requirement.description, body?.additional_context].filter(Boolean).join('\n'),
+        sources: ['requirements', 'modules', 'knowledge'],
+        limit: 8,
+        maxChars: 9000
+      })
+    ]);
     const optimizeInput = {
       integration_id: optionalString(body?.integration_id, 255) || undefined,
       model: optionalString(body?.model, 255) || undefined,
@@ -8225,7 +9310,21 @@ async function handleRequirements(pathname, method, query, body, context) {
       requirement_id: requirement.id,
       selected_requirement_id: requirement.id,
       single_requirement_only: true,
-      requirement: requirementContext
+      requirement: requirementContext,
+      linked_test_cases: linkedTestCases.map((testCase) => aiContextRecord('test-cases', testCase)).filter(Boolean),
+      linked_bugs: asArray(requirement.defects).slice(0, 20).map((bug) => ({
+        id: bug.id,
+        title: bug.title,
+        status: bug.status,
+        priority: bug.priority,
+        severity: bug.severity
+      })),
+      related_project_context: retrievedContext.records,
+      context_retrieval: {
+        source_counts: retrievedContext.source_counts,
+        unavailable_sources: retrievedContext.unavailable_sources,
+        bounded: true
+      }
     };
     return assistedResponse({
       requirement: requirementContext,
@@ -8244,14 +9343,42 @@ async function handleRequirements(pathname, method, query, body, context) {
         open_questions: ['Which roles may perform this action?', 'What is the expected behavior on partial failure or retry?'],
         change_summary: ['Structured acceptance criteria', 'Added negative and boundary behavior', 'Added access-control and reliability questions']
       }
-    }, 'requirement-quality-review-preview', optimizeInput, [`jira-issue:${requirement.id}`], 0.74);
+    }, 'requirement-quality-review-preview', optimizeInput, [
+      `jira-issue:${requirement.display_id || requirement.id}`,
+      ...linkedTestCases.map((testCase) => `jira-issue:${testCase.display_id || testCase.id}`),
+      ...asArray(requirement.defects).map((bug) => `jira-issue:${bug.display_id || bug.id}`),
+      ...retrievedContext.evidence_refs
+    ], 0.74);
   }
   const generateMatch = pathname.match(/^\/requirements\/([^/]+)\/generate-test-cases$/);
   if (generateMatch && method === 'POST') {
-    const records = await requirementRecordsByIds([generateMatch[1]], project, registry);
-    const cases = draftTestCandidates(records, body?.max_cases || 3);
-    const created = await createTestCasesFromCandidates(project, registry, cases, body?.app_type_id, body?.status || 'Draft');
-    return assistedResponse({ generated: created.length, created }, 'requirement-test-draft-creation', body, [`jira-issue:${generateMatch[1]}`], 0.76);
+    // Keep this legacy one-click action compatible, but perform the grounded AI
+    // design before writing Jira records. Running an LLM after creation could
+    // return titles that no longer matched the issues already persisted.
+    const design = await buildTestCaseDesignPreview(project, registry, {
+      ...body,
+      requirement_ids: [generateMatch[1]],
+      max_cases_per_requirement: body?.max_cases || 3
+    });
+    const created = await createTestCasesFromCandidates(
+      project,
+      registry,
+      asArray(design.cases),
+      body?.app_type_id,
+      body?.status || 'Draft'
+    );
+    return {
+      generated: created.length,
+      created,
+      integration: design.integration,
+      provenance: design.provenance,
+      generation_mode: design.generation_mode,
+      fallback_used: design.fallback_used,
+      fallback_reason: design.fallback_reason,
+      request_id: design.request_id,
+      input_fingerprint: design.input_fingerprint,
+      confidence: design.confidence
+    };
   }
   const itemMatch = pathname.match(/^\/requirements\/([^/]+)$/);
   if (itemMatch && method === 'GET') {
@@ -8263,13 +9390,13 @@ async function handleRequirements(pathname, method, query, body, context) {
     return mapRequirement(issue, project, registry, map, sprintField?.id, { hydrateRelatedItems: true });
   }
   if (itemMatch && method === 'PUT') {
-    await loadScopedIssue(itemMatch[1], project, registry, { nativeKind: 'requirements', fallbackNames: ['Story'], label: 'requirement' });
+    await loadScopedIssue(itemMatch[1], project, registry, { nativeKind: 'requirements', fallbackNames: ['Story'], label: 'Story' });
     const current = await getIssueProperty(itemMatch[1], REQUIREMENT_PROP, {});
     if (body?.expected_revision !== undefined && Number(body.expected_revision) !== Number(current.revision || 1)) {
-      fail(409, 'REVISION_CONFLICT', `Requirement ${itemMatch[1]} changed after it was loaded. Refresh and retry.`);
+      fail(409, 'REVISION_CONFLICT', `Story ${itemMatch[1]} changed after it was loaded. Refresh and retry.`);
     }
     const fields = {};
-    if (body?.title !== undefined) fields.summary = requiredString(body.title, 'Requirement title', 255);
+    if (body?.title !== undefined) fields.summary = requiredString(body.title, 'Story title', 255);
     if (body?.description !== undefined) fields.description = adf(body.description);
     if (body?.priority !== undefined) fields.priority = { name: numberToPriority(body.priority) };
     if (body?.labels !== undefined) fields.labels = asArray(body.labels).map(String);
@@ -8298,6 +9425,7 @@ async function handleRequirements(pathname, method, query, body, context) {
     await putIssueProperty(itemMatch[1], REQUIREMENT_PROP, {
       ...current,
       ...(body?.external_references !== undefined ? { external_references: asArray(body.external_references).map(String) } : {}),
+      ...(body?.gherkin_scenarios !== undefined ? { gherkin_scenarios: validatedGherkinScenarios(body.gherkin_scenarios) } : {}),
       ...(requestedSprint !== undefined ? { sprint: delivery.sprintFallback } : {}),
       revision,
       updated_by: actor.accountId,
@@ -8306,7 +9434,7 @@ async function handleRequirements(pathname, method, query, body, context) {
     return { updated: true, revision };
   }
   if (itemMatch && method === 'DELETE') {
-    await loadScopedIssue(itemMatch[1], project, registry, { nativeKind: 'requirements', fallbackNames: ['Story'], label: 'requirement' });
+    await loadScopedIssue(itemMatch[1], project, registry, { nativeKind: 'requirements', fallbackNames: ['Story'], label: 'Story' });
     return deleteIssue(itemMatch[1]);
   }
   return null;
@@ -8316,35 +9444,42 @@ async function handleRequirementIterations(pathname, method, query, body, contex
   const project = await resolveProject({ query, body, context });
   const registry = await getRegistry(project.key);
   const validateRequirementIds = async (requirementIds = []) => {
-    const normalized = [...new Set(asArray(requirementIds).filter(Boolean).map(String))];
-    await loadScopedIssues(normalized, project, registry, {
+    const requested = [...new Set(asArray(requirementIds).filter(Boolean).map(String))];
+    const loaded = await loadScopedIssues(requested, project, registry, {
       nativeKind: 'requirements',
       fallbackNames: ['Story'],
-      label: 'requirement',
+      label: 'Story',
       fields: ['summary']
     });
-    return normalized;
+    const issues = [...new Map(loaded.map((issue) => [String(issue.id || issue.key), issue])).values()];
+    const ids = issues.map((issue) => String(issue.id || issue.key)).filter(Boolean);
+    const jiraReferences = issues.map((issue) => String(issue.key || issue.id)).filter(Boolean);
+    const aliases = [...new Set([
+      ...requested,
+      ...issues.flatMap((issue) => [String(issue.id || ''), String(issue.key || '')])
+    ].filter(Boolean))];
+    return { aliases, ids, issues, jiraReferences, requested };
   };
   const moveRequirementsToJiraSprint = async (sprintId, requirementIds = []) => {
     const normalized = [...new Set(asArray(requirementIds).filter(Boolean).map(String))];
-    for (let index = 0; index < normalized.length; index += 50) {
+    for (let index = 0; index < normalized.length; index += JIRA_SPRINT_MOVE_BATCH_SIZE) {
       await jiraMutationRequest(route`/rest/agile/1.0/sprint/${String(sprintId)}/issue`, {
         method: 'POST',
-        body: JSON.stringify({ issues: normalized.slice(index, index + 50) })
+        body: JSON.stringify({ issues: normalized.slice(index, index + JIRA_SPRINT_MOVE_BATCH_SIZE) })
       }, 'sprint-issue-assignment');
     }
   };
   const moveRequirementsToJiraBacklog = async (requirementIds = []) => {
     const normalized = [...new Set(asArray(requirementIds).filter(Boolean).map(String))];
-    for (let index = 0; index < normalized.length; index += 50) {
+    for (let index = 0; index < normalized.length; index += JIRA_SPRINT_MOVE_BATCH_SIZE) {
       await jiraMutationRequest(route`/rest/agile/1.0/backlog/issue`, {
         method: 'POST',
-        body: JSON.stringify({ issues: normalized.slice(index, index + 50) })
+        body: JSON.stringify({ issues: normalized.slice(index, index + JIRA_SPRINT_MOVE_BATCH_SIZE) })
       }, 'sprint-issue-removal');
     }
   };
-  const assertRequirementsInJiraSprint = async (sprintId, requirementIds = []) => {
-    const normalized = [...new Set(asArray(requirementIds).filter(Boolean).map(String))];
+  const assertRequirementsInJiraSprint = async (sprintId, validatedRequirements) => {
+    const normalized = validatedRequirements.ids;
     if (!normalized.length) return normalized;
     const result = await searchIssues(
       `project = ${project.key} AND ${issueTypeClause(nativeIssueTypeIds(registry, 'requirements', ['Story']))} AND sprint = ${jqlQuote(sprintId)} AND ${issueReferencesClause(normalized)}`,
@@ -8352,7 +9487,9 @@ async function handleRequirementIterations(pathname, method, query, body, contex
       normalized.length
     );
     const matched = new Set(result.issues.flatMap((issue) => [String(issue.id), String(issue.key)]));
-    const outsideSprint = normalized.filter((reference) => !matched.has(reference));
+    const outsideSprint = validatedRequirements.issues
+      .filter((issue) => !matched.has(String(issue.id)) && !matched.has(String(issue.key)))
+      .map((issue) => String(issue.key || issue.id));
     if (outsideSprint.length) {
       fail(409, 'SPRINT_MEMBERSHIP_CHANGED', 'One or more Stories are no longer assigned to this Jira Sprint. Refresh the Sprint before removing Stories.', {
         issueRefs: outsideSprint
@@ -8389,14 +9526,20 @@ async function handleRequirementIterations(pathname, method, query, body, contex
     if (String(iteration.state || iteration.status || '').toLowerCase() === 'closed') {
       fail(409, 'SPRINT_CLOSED', 'Stories cannot be moved into a completed Jira Sprint.');
     }
-    const incoming = await validateRequirementIds(requirementIds);
+    const validated = await validateRequirementIds(requirementIds);
+    const incoming = validated.ids;
     if (iteration.jira_sprint_id && incoming.length) {
-      await moveRequirementsToJiraSprint(iteration.jira_sprint_id, incoming);
+      await moveRequirementsToJiraSprint(iteration.jira_sprint_id, validated.jiraReferences);
     }
-    const incomingSet = new Set(incoming);
+    const incomingSet = new Set(validated.aliases);
     const iterations = await getCollection(project.key, COLLECTIONS.requirementIterations, []);
-    const currentTargetIds = asArray(iteration.requirement_ids).map(String);
-    const nextTargetIds = append ? [...new Set([...currentTargetIds, ...incoming])] : incoming;
+    const currentTargetIds = asArray(iteration.requirement_ids).map(String).filter((idValue) => !incomingSet.has(idValue));
+    // Jira-native Sprint membership is intentionally not replicated into a
+    // project property. Jira's Sprint field/JQL is authoritative and avoids a
+    // growing property payload as projects scale.
+    const nextTargetIds = iteration.jira_sprint_id
+      ? []
+      : append ? [...new Set([...currentTargetIds, ...incoming])] : incoming;
     let savedTarget = { ...iteration, requirement_ids: nextTargetIds, updated_at: nowIso() };
     for (const candidate of iterations) {
       const isTarget = String(candidate.id) === String(iteration.id);
@@ -8416,7 +9559,19 @@ async function handleRequirementIterations(pathname, method, query, body, contex
     if (!iterations.some((candidate) => String(candidate.id) === String(iteration.id))) {
       savedTarget = await upsertCollectionItem(project.key, COLLECTIONS.requirementIterations, savedTarget, 'sprint');
     }
-    return { iteration: savedTarget, requirement_ids: nextTargetIds, assigned: incoming.length };
+    return {
+      iteration: savedTarget,
+      requirement_ids: nextTargetIds,
+      assigned: incoming.length,
+      assigned_issue_ids: incoming,
+      assigned_issue_keys: validated.jiraReferences,
+      sprint: {
+        id: iteration.id,
+        jira_sprint_id: iteration.jira_sprint_id || null,
+        name: iteration.jira_sprint_name || iteration.name,
+        state: iteration.state || iteration.status || null
+      }
+    };
   };
   const base = '/requirement-iterations';
   if (pathname === base && method === 'GET') {
@@ -8429,7 +9584,6 @@ async function handleRequirementIterations(pathname, method, query, body, contex
       const local = items.find((item) => String(item.jira_sprint_id || '') === String(sprint.id))
         || items.find((item) => String(item.jira_sprint_name || item.name || '').trim().toLowerCase() === String(sprint.name || '').trim().toLowerCase());
       if (local) matchedLocalIds.add(String(local.id));
-      const requirementIds = asArray(local?.requirement_ids).map(String);
       return {
         ...(local || {}),
         id: local?.id || `jira-sprint-${sprint.id}`,
@@ -8447,8 +9601,9 @@ async function handleRequirementIterations(pathname, method, query, body, contex
         start_date: sprint.start_date || null,
         end_date: sprint.end_date || null,
         complete_date: sprint.complete_date || null,
-        requirement_ids: requirementIds,
-        requirement_count: requirementIds.length
+        // Child membership is loaded from Jira JQL only when the Sprint is
+        // expanded; legacy property ids are neither authoritative nor returned.
+        requirement_ids: []
       };
     });
     const legacyItems = items
@@ -8568,20 +9723,27 @@ async function handleRequirementIterations(pathname, method, query, body, contex
     const incoming = asArray(body?.requirement_ids);
     if (method === 'PUT') {
       const assigned = await assignRequirements(targetIteration, incoming, { append: body?.append !== false });
-      return { updated: true, assigned: assigned.assigned, total: assigned.requirement_ids.length };
+      return {
+        updated: true,
+        assigned: assigned.assigned,
+        ...(targetIteration.jira_sprint_id ? {} : { total: assigned.requirement_ids.length }),
+        assigned_issue_ids: assigned.assigned_issue_ids,
+        assigned_issue_keys: assigned.assigned_issue_keys,
+        sprint: assigned.sprint
+      };
     }
     if (method === 'DELETE') {
-      const normalized = await validateRequirementIds(incoming);
-      if (targetIteration.jira_sprint_id && normalized.length) {
-        await assertRequirementsInJiraSprint(targetIteration.jira_sprint_id, normalized);
-        await moveRequirementsToJiraBacklog(normalized);
+      const validated = await validateRequirementIds(incoming);
+      if (targetIteration.jira_sprint_id && validated.ids.length) {
+        await assertRequirementsInJiraSprint(targetIteration.jira_sprint_id, validated);
+        await moveRequirementsToJiraBacklog(validated.jiraReferences);
       }
       if (found) {
-        const removeSet = new Set(normalized);
+        const removeSet = new Set(validated.aliases);
         const requirementIds = asArray(found.item.requirement_ids).map(String).filter((item) => !removeSet.has(item));
         await upsertCollectionItem(found.project.key, COLLECTIONS.requirementIterations, { ...found.item, requirement_ids: requirementIds, updated_at: nowIso() }, 'iteration');
       }
-      return { updated: true, removed: normalized.length };
+      return { updated: true, removed: validated.ids.length };
     }
     return null;
   }
@@ -8591,7 +9753,9 @@ async function handleRequirementIterations(pathname, method, query, body, contex
     const nativeIteration = found ? null : await nativeSprintIteration(itemMatch[1]);
     if (!found && !nativeIteration) fail(404, 'SPRINT_NOT_FOUND', 'Sprint not found.');
     const currentIteration = found?.item || nativeIteration;
-    if (method === 'GET') return { ...currentIteration, requirement_count: asArray(currentIteration.requirement_ids).length };
+    if (method === 'GET') return currentIteration.jira_sprint_id
+      ? { ...currentIteration, requirement_ids: [] }
+      : { ...currentIteration, requirement_count: asArray(currentIteration.requirement_ids).length };
     if (method === 'PUT') {
       const nextName = body?.name === undefined
         ? currentIteration.name
@@ -8647,7 +9811,7 @@ async function handleRequirementIterations(pathname, method, query, body, contex
         complete_date: authoritativeSprint?.completeDate || currentIteration.complete_date || null,
         jira_sprint_name: authoritativeSprint?.name || currentIteration.jira_sprint_name || nextName,
         source: currentIteration.jira_sprint_id ? 'jira' : currentIteration.source || 'qaira',
-        requirement_ids: asArray(currentIteration.requirement_ids).map(String),
+        requirement_ids: currentIteration.jira_sprint_id ? [] : asArray(currentIteration.requirement_ids).map(String),
         updated_at: nowIso()
       };
       let saved = await upsertCollectionItem(project.key, COLLECTIONS.requirementIterations, payload, 'iteration');
@@ -8658,7 +9822,14 @@ async function handleRequirementIterations(pathname, method, query, body, contex
     }
     if (method === 'DELETE') {
       if (currentIteration.jira_sprint_id) {
-        fail(409, 'JIRA_SPRINT_OWNED', 'This Sprint is owned by Jira. Delete it from the Jira backlog, or update it from Qaira.');
+        await jiraMutationRequest(route`/rest/agile/1.0/sprint/${String(currentIteration.jira_sprint_id)}`, {
+          method: 'DELETE'
+        }, 'sprint-delete');
+        requestCacheDelete(`jira:sprints:${project.key}`);
+        if (found) {
+          await removeCollectionItem(found.project.key, COLLECTIONS.requirementIterations, itemMatch[1]);
+        }
+        return { deleted: true };
       }
       return removeCollectionItem(found.project.key, COLLECTIONS.requirementIterations, itemMatch[1]);
     }
@@ -8675,6 +9846,209 @@ async function handleIssues(pathname, method, query, body, context) {
   if (bugEditMetadataMatch && method === 'GET') {
     await loadScopedIssue(bugEditMetadataMatch[1], project, registry, { nativeKind: 'defects', fallbackNames: ['Bug'], label: 'defect' });
     return jiraIssueEditMetadata(project, registry, bugEditMetadataMatch[1], 'bug');
+  }
+  if (pathname === '/feedback/export' && method === 'POST') {
+    const issueIds = [...new Set(asArray(body?.issue_ids).filter(Boolean).map(String))];
+    if (!issueIds.length) fail(400, 'BUG_SELECTION_REQUIRED', 'Select at least one Bug to export.');
+    if (issueIds.length > MAX_SYNC_EXPORT_RECORDS) {
+      fail(413, 'BUG_EXPORT_SCOPE_TOO_LARGE', `A single Forge request can export at most ${MAX_SYNC_EXPORT_RECORDS} Bugs. Split the selection into smaller batches.`);
+    }
+    const scopedIssues = await loadScopedIssues(issueIds, project, registry, {
+      nativeKind: 'defects',
+      fallbackNames: ['Bug'],
+      label: 'defect',
+      fields: commonFields(registry),
+      properties: [DEFECT_PROP],
+      maxItems: MAX_SYNC_EXPORT_RECORDS
+    });
+    return {
+      bugs: await mapInBatches(scopedIssues, (issue) => mapBug(issue, registry), 10),
+      exported: scopedIssues.length
+    };
+  }
+  if (pathname === '/feedback/bulk-delete' && method === 'DELETE') {
+    const issueIds = [...new Set(asArray(body?.issue_ids).filter(Boolean).map(String))];
+    if (!issueIds.length) fail(400, 'BUG_SELECTION_REQUIRED', 'Select at least one Bug to delete.');
+    if (issueIds.length > MAX_BULK_BUG_DELETE_ITEMS) {
+      fail(413, 'BUG_DELETE_SCOPE_TOO_LARGE', `A single Forge request can delete at most ${MAX_BULK_BUG_DELETE_ITEMS} Bugs. Split the selection into smaller batches.`);
+    }
+    const scopedBugs = await loadScopedIssues(issueIds, project, registry, {
+      nativeKind: 'defects',
+      fallbackNames: ['Bug'],
+      label: 'defect',
+      fields: commonFields(registry),
+      maxItems: MAX_BULK_BUG_DELETE_ITEMS
+    });
+    const deletionResults = await settleInBatches(scopedBugs, (issue) => deleteIssue(issue.key || issue.id), 5);
+    const deletedIds = [];
+    const failures = [];
+    deletionResults.forEach((result, index) => {
+      const requestedId = issueIds[index];
+      const issue = scopedBugs[index];
+      if (result.status === 'fulfilled' && result.value?.deleted !== false) {
+        deletedIds.push(requestedId);
+        return;
+      }
+      const reason = result.status === 'rejected' ? result.reason : new Error('Jira did not confirm deletion.');
+      failures.push({
+        issue_id: requestedId,
+        display_id: issue?.key || requestedId,
+        code: optionalString(reason?.code, 120) || 'BUG_DELETE_FAILED',
+        message: optionalString(reason?.message || reason, 500) || 'Unable to delete this Bug.'
+      });
+    });
+    return {
+      requested: issueIds.length,
+      deleted: deletedIds.length,
+      deleted_ids: deletedIds,
+      failed: failures.length,
+      failures
+    };
+  }
+  if (pathname === '/feedback/ai-triage-preview' && method === 'POST') {
+    const issueIds = [...new Set(asArray(body?.issue_ids).filter(Boolean).map(String))];
+    if (!issueIds.length) fail(400, 'BUG_SELECTION_REQUIRED', 'Select at least one Bug for AI triage.');
+    if (issueIds.length > MAX_AI_BUG_TRIAGE_ITEMS) {
+      fail(413, 'AI_BUG_TRIAGE_SCOPE_TOO_LARGE', `AI triage accepts at most ${MAX_AI_BUG_TRIAGE_ITEMS} Bugs per preview to keep Jira reads and model usage bounded.`);
+    }
+    const scopedIssues = await loadScopedIssues(issueIds, project, registry, {
+      nativeKind: 'defects',
+      fallbackNames: ['Bug'],
+      label: 'defect',
+      fields: commonFields(registry),
+      properties: [DEFECT_PROP],
+      maxItems: MAX_AI_BUG_TRIAGE_ITEMS
+    });
+    const bugs = await mapInBatches(scopedIssues, (issue) => mapBug(issue, registry), 5);
+    const linkedTestCaseIds = [...new Set(bugs.flatMap((bug) => asArray(bug.linked_test_case_ids).map(String)))].slice(0, 25);
+    const linkedRequirementIds = [...new Set(bugs.flatMap((bug) => asArray(bug.linked_requirement_ids).map(String)))].slice(0, 25);
+    const linkedRunIds = [...new Set(bugs.map((bug) => bug.linked_test_run_id).filter(Boolean).map(String))].slice(0, 10);
+    const [linkedTestCases, linkedRequirements, linkedRunIssues, retrievedContext] = await Promise.all([
+      listStoredTestCaseRefsPage(project, registry, linkedTestCaseIds, { page_size: 25, projection: 'detail' }),
+      requirementRecordsByIds(linkedRequirementIds, project, registry),
+      loadScopedIssues(linkedRunIds, project, registry, {
+        typeKeys: ['testRun'],
+        label: 'test run',
+        fields: commonFields(registry, customKeysForType('testRun')),
+        maxItems: 10
+      }),
+      retrieveAiModuleContext(project, registry, {
+        intent: bugs.flatMap((bug) => [bug.title, bug.message, bug.actual_result, bug.expected_result]).filter(Boolean).join('\n'),
+        sources: ['bugs', 'requirements', 'test-cases', 'runs', 'knowledge'],
+        limit: 10,
+        maxChars: 11000
+      })
+    ]);
+    const linkedRuns = await mapInBatches(linkedRunIssues, (issue) => mapExecution(issue, project, registry, { hydrateScope: false }), 5);
+    const deterministicTriage = bugs.map(deterministicBugTriage);
+    const priorityChanges = deterministicTriage.filter((item) => item.current_priority !== item.recommended_priority).length;
+    const priorityChangeSummary = priorityChanges === 1
+      ? '1 priority recommendation differs from the current Jira value'
+      : `${priorityChanges} priority recommendations differ from the current Jira values`;
+    const evidence = [
+      ...deterministicTriage.map((item) => `jira-issue:${item.display_id}`),
+      ...linkedTestCases.map((item) => `jira-issue:${item.display_id || item.id}`),
+      ...linkedRequirements.map((item) => `jira-issue:${item.display_id || item.id}`),
+      ...linkedRuns.map((item) => `jira-issue:${item.display_id || item.id}`),
+      ...retrievedContext.evidence_refs
+    ];
+    const fallbackPayload = {
+      scope: {
+        project_id: String(project.id),
+        project_key: project.key,
+        issue_count: deterministicTriage.length,
+        maximum_issue_count: MAX_AI_BUG_TRIAGE_ITEMS
+      },
+      summary: `${deterministicTriage.length} selected Bug${deterministicTriage.length === 1 ? '' : 's'} reviewed; ${priorityChangeSummary}.`,
+      triage: deterministicTriage,
+      review_sequence: [
+        'Confirm customer reach, reproducibility, data or security exposure, and release impact.',
+        'Compare the recommended priority with the current Jira priority and ownership context.',
+        'Apply any accepted category or priority manually in the Bug form so a person owns the decision.'
+      ],
+      limitations: [
+        'This preview uses only the selected project-scoped Jira Bug fields and Qaira traceability evidence.',
+        'Missing logs, attachments, customer impact, or production telemetry can change the correct category and priority.',
+        'No Jira field is updated by this preview.'
+      ],
+      preview_only: true,
+      decision_requires_human_approval: true
+    };
+    const assisted = await assistedResponse(
+      fallbackPayload,
+      'bug-triage-preview',
+      {
+        project_id: String(project.id),
+        issue_count: bugs.length,
+        bugs: bugs.map((bug) => ({
+          issue_id: bug.id,
+          display_id: bug.jira_bug_key,
+          title: bug.title,
+          description: bug.message,
+          steps_to_reproduce: bug.steps_to_reproduce,
+          expected_result: bug.expected_result,
+          actual_result: bug.actual_result,
+          status: bug.status,
+          severity: bug.severity,
+          priority: bug.priority,
+          environment: bug.environment,
+          build: bug.build,
+          labels: bug.labels,
+          linked_test_run_id: bug.linked_test_run_id,
+          linked_test_case_count: asArray(bug.linked_test_case_ids).length,
+          linked_story_count: asArray(bug.linked_requirement_ids).length
+        })),
+        linked_context: {
+          test_cases: linkedTestCases.map((item) => aiContextRecord('test-cases', item)).filter(Boolean),
+          requirements: linkedRequirements.map((item) => aiContextRecord('requirements', item)).filter(Boolean),
+          runs: linkedRuns.map((item) => aiContextRecord('runs', item)).filter(Boolean)
+        },
+        related_project_context: retrievedContext.records,
+        context_retrieval: {
+          source_counts: retrievedContext.source_counts,
+          unavailable_sources: retrievedContext.unavailable_sources,
+          bounded: true
+        }
+      },
+      evidence,
+      deterministicTriage.length ? 0.76 : 0.35,
+      { contextLimit: 20_000, maxCompletionTokens: 900 }
+    );
+    const allowedCategories = new Set([...BUG_TRIAGE_CATEGORIES.map((rule) => rule.name), 'Needs human classification']);
+    const allowedPriorities = new Set(['Highest', 'High', 'Medium', 'Low', 'Lowest']);
+    const normalizedTriage = deterministicTriage.map((fallback, index) => {
+      const candidate = asArray(assisted.triage)[index] || {};
+      const category = optionalString(candidate.category, 120);
+      const recommendedPriority = optionalString(candidate.recommended_priority, 40);
+      const reviewActions = asArray(candidate.review_actions)
+        .map((value) => optionalString(value, 500))
+        .filter(Boolean)
+        .slice(0, 3);
+      return {
+        ...fallback,
+        category: allowedCategories.has(category) ? category : fallback.category,
+        recommended_priority: allowedPriorities.has(recommendedPriority) ? recommendedPriority : fallback.recommended_priority,
+        explanation: optionalString(candidate.explanation, 2000) || fallback.explanation,
+        review_actions: reviewActions.length ? reviewActions : fallback.review_actions
+      };
+    });
+    const normalizedReviewSequence = asArray(assisted.review_sequence)
+      .map((value) => optionalString(value, 500))
+      .filter(Boolean)
+      .slice(0, 5);
+    const normalizedLimitations = [...new Set([
+      ...fallbackPayload.limitations,
+      ...asArray(assisted.limitations).map((value) => optionalString(value, 500)).filter(Boolean)
+    ])].slice(0, 6);
+    return {
+      ...assisted,
+      summary: optionalString(assisted.summary, 1000) || fallbackPayload.summary,
+      triage: normalizedTriage,
+      review_sequence: normalizedReviewSequence.length ? normalizedReviewSequence : fallbackPayload.review_sequence,
+      limitations: normalizedLimitations,
+      preview_only: true,
+      decision_requires_human_approval: true
+    };
   }
   if (pathname === '/feedback/ai-draft-preview' && method === 'POST') {
     const intent = requiredString(body?.intent, 'Bug intent', 4000);
@@ -8723,7 +10097,7 @@ async function handleIssues(pathname, method, query, body, context) {
       const issue = await loadScopedIssue(requirementId, project, registry, {
         nativeKind: 'requirements',
         fallbackNames: ['Story'],
-        label: 'requirement',
+        label: 'Story',
         fields: commonFields(registry, customKeysForType('requirement'))
       });
       const mapped = await mapRequirement(issue, project, registry);
@@ -8796,7 +10170,7 @@ async function handleIssues(pathname, method, query, body, context) {
       [
         requestedRunId ? 'selected-test-run' : null,
         requestedCaseIds.length ? `${requestedCaseIds.length}-test-case(s)` : null,
-        requestedRequirementIds.length ? `${requestedRequirementIds.length}-requirement(s)` : null,
+        requestedRequirementIds.length ? `${requestedRequirementIds.length} ${requestedRequirementIds.length === 1 ? 'Story' : 'Stories'}` : null,
         evidence ? 'user-evidence' : null,
         referencePhotos.length ? `${referencePhotos.length}-reference-photo(s)` : null,
         relatedContext.length ? `${relatedContext.length}-rag-record(s)` : null
@@ -9029,7 +10403,7 @@ async function handleManagedIssueArtifacts(pathname, method, query, body, contex
     };
     const metrics = summary.metrics || {};
     const checks = [
-      { key: 'requirement_coverage', label: 'Requirement coverage', actual: Number(metrics.requirementCoverage || 0), operator: '>=', threshold: thresholds.minimum_requirement_coverage_pct, unit: '%' },
+      { key: 'requirement_coverage', label: 'Story coverage', actual: Number(metrics.requirementCoverage || 0), operator: '>=', threshold: thresholds.minimum_requirement_coverage_pct, unit: '%' },
       { key: 'automation_coverage', label: 'Effective automation coverage', actual: Number(metrics.automationHealth || 0), operator: '>=', threshold: thresholds.minimum_automation_coverage_pct, unit: '%' },
       { key: 'release_confidence', label: 'Release confidence index', actual: Number(metrics.releaseConfidenceIndex || 0), operator: '>=', threshold: thresholds.minimum_release_confidence_index, unit: '' },
       { key: 'locator_stability', label: 'Locator stability', actual: Number(metrics.locatorStability || 0), operator: '>=', threshold: thresholds.minimum_locator_stability_pct, unit: '%' },
@@ -9056,7 +10430,13 @@ async function handleManagedIssueArtifacts(pathname, method, query, body, contex
       preview_only: true,
       decision_requires_human_approval: true,
       evaluated_at: nowIso()
-    }, 'quality-gate-assessment-preview', { quality_gate_id: gate.id, scope: assessmentScope, thresholds }, evidence, checks.length ? (failedChecks.length ? 0.8 : 0.86) : 0.4);
+    }, 'quality-gate-assessment-preview', {
+      quality_gate_id: gate.id,
+      scope: assessmentScope,
+      thresholds,
+      authoritative_metrics: metrics,
+      evaluated_checks: checks.map(({ key, label, actual, operator, threshold, unit, passed }) => ({ key, label, actual, operator, threshold, unit, passed }))
+    }, evidence, checks.length ? (failedChecks.length ? 0.8 : 0.86) : 0.4);
   }
 
   const itemId = decodeURIComponent(pathname.slice(definition.basePath.length + 1));
@@ -9148,9 +10528,16 @@ async function handleTestCases(pathname, method, query, body, context) {
   if (pathname === '/test-cases' && method === 'GET') return listTestCases(project, registry, query);
   if (pathname === '/test-cases' && method === 'POST') return { id: String((await createArtifact(project, registry, 'testCase', body)).id) };
   if (pathname === '/test-cases/ai-authoring-preview' && method === 'POST') {
-    const requirement = (await requirementRecordsByIds([body?.requirement_id], project, registry))[0] || { id: body?.requirement_id, title: 'Requirement' };
+    const requirement = (await requirementRecordsByIds([body?.requirement_id], project, registry))[0] || { id: body?.requirement_id, title: 'Story' };
     const existing = body?.test_case || {};
     const steps = existing.steps?.length ? existing.steps : draftTestCandidates([requirement], 1)[0]?.steps || [];
+    const retrievedContext = await retrieveAiModuleContext(project, registry, {
+      intent: [requirement.title, requirement.description, existing.title, existing.description, body?.additional_context].filter(Boolean).join('\n'),
+      appTypeId: body?.app_type_id,
+      sources: ['test-cases', 'modules', 'shared-steps', 'knowledge'],
+      limit: 10,
+      maxChars: 11000
+    });
     const externalReferences = asArray(body?.external_links)
       .map((value) => String(value || '').trim())
       .filter((value) => /^https?:\/\//i.test(value))
@@ -9161,25 +10548,65 @@ async function handleTestCases(pathname, method, query, body, context) {
       .map((image, index) => `reference-image:${String(image?.name || `image-${index + 1}`).slice(0, 120)}`);
     const evidenceReferences = [
       ...(requirement.id ? [`jira-issue:${requirement.id}`] : []),
+      ...retrievedContext.evidence_refs,
       ...externalReferences,
       ...imageReferences
     ];
     const supplementalContextCount = externalReferences.length + imageReferences.length + (body?.additional_context ? 1 : 0);
     return assistedResponse(
-      { requirement: { id: requirement.id, title: requirement.title }, app_type: { id: body?.app_type_id, name: titleCase(String(body?.app_type_id || 'Web').split(':').pop()) }, case: { summary: supplementalContextCount ? `Deterministic Jira-native authoring suggestion grounded by ${supplementalContextCount} supplemental context source${supplementalContextCount === 1 ? '' : 's'}` : 'Deterministic Jira-native authoring suggestion', title: existing.title || `${requirement.title} - Primary validation`, description: existing.description || 'Drafted from Jira requirement context.', parameter_values: existing.parameter_values || {}, steps, step_count: steps.length, parameter_count: Object.keys(existing.parameter_values || {}).length } },
+      { requirement: { id: requirement.id, title: requirement.title }, app_type: { id: body?.app_type_id, name: titleCase(String(body?.app_type_id || 'Web').split(':').pop()) }, case: { summary: supplementalContextCount ? `Deterministic Jira-native authoring suggestion grounded by ${supplementalContextCount} supplemental context source${supplementalContextCount === 1 ? '' : 's'}` : 'Deterministic Jira-native authoring suggestion', title: existing.title || `${requirement.title} - Primary validation`, description: existing.description || 'Drafted from Jira Story context.', parameter_values: existing.parameter_values || {}, steps, step_count: steps.length, parameter_count: Object.keys(existing.parameter_values || {}).length } },
       'test-case-authoring-preview',
-      body,
+      {
+        ...body,
+        authoritative_requirement: aiContextRecord('requirements', requirement),
+        related_module_context: retrievedContext.records,
+        context_retrieval: {
+          source_counts: retrievedContext.source_counts,
+          unavailable_sources: retrievedContext.unavailable_sources,
+          bounded: true
+        }
+      },
       evidenceReferences,
       0.76
     );
   }
   if (pathname === '/test-cases/ai-step-rephrase' && method === 'POST') {
     const step = body?.step || {};
+    const requirement = body?.requirement_id
+      ? (await requirementRecordsByIds([body.requirement_id], project, registry))[0] || null
+      : null;
+    const retrievedContext = await retrieveAiModuleContext(project, registry, {
+      intent: [
+        requirement?.title,
+        requirement?.description,
+        body?.test_case?.title,
+        body?.test_case?.description,
+        step.action,
+        step.expected_result,
+        body?.additional_context
+      ].filter(Boolean).join('\n'),
+      appTypeId: body?.app_type_id,
+      sources: ['shared-steps', 'modules', 'knowledge'],
+      limit: 6,
+      maxChars: 7000
+    });
     return assistedResponse(
       { step: { step_order: step.step_order || 1, step_type: step.step_type || 'web', action: String(step.action || 'Perform the action').replace(/^(click|enter|verify)\b/i, (word) => word[0].toUpperCase() + word.slice(1).toLowerCase()), expected_result: step.expected_result || 'The expected behavior is visible and verifiable.' } },
       'test-step-rephrase-preview',
-      body,
-      [],
+      {
+        ...body,
+        authoritative_requirement: requirement ? aiContextRecord('requirements', requirement) : null,
+        related_module_context: retrievedContext.records,
+        context_retrieval: {
+          source_counts: retrievedContext.source_counts,
+          unavailable_sources: retrievedContext.unavailable_sources,
+          bounded: true
+        }
+      },
+      [
+        ...(requirement ? [`jira-issue:${requirement.display_id || requirement.id}`] : []),
+        ...retrievedContext.evidence_refs
+      ],
       0.7
     );
   }
@@ -9213,9 +10640,9 @@ async function handleTestCases(pathname, method, query, body, context) {
     const inputPayload = normalizeTestCaseGenerationAiInput({ ...body, project_id: String(project.id) });
     if (!inputPayload.app_type_id) fail(400, 'APP_TYPE_REQUIRED', 'Select an app type before scheduling AI test case generation.');
     await requireAppType(project, inputPayload.app_type_id);
-    if (!inputPayload.requirement_ids?.length) fail(400, 'REQUIREMENTS_REQUIRED', 'Select at least one requirement before scheduling AI test case generation.');
+    if (!inputPayload.requirement_ids?.length) fail(400, 'REQUIREMENTS_REQUIRED', 'Select at least one Story before scheduling AI test case generation.');
     for (const requirementId of inputPayload.requirement_ids) {
-      await loadScopedIssue(requirementId, project, registry, { nativeKind: 'requirements', fallbackNames: ['Story'], label: 'requirement' });
+      await loadScopedIssue(requirementId, project, registry, { nativeKind: 'requirements', fallbackNames: ['Story'], label: 'Story' });
     }
     let job = await upsertCollectionItem(project.key, COLLECTIONS.generationJobs, {
       project_id: String(project.id),
@@ -9294,7 +10721,7 @@ async function handleTestCases(pathname, method, query, body, context) {
             if (definition.name) sharedGroupIdMap.set(String(definition.name).toLowerCase(), saved.id);
           }
 
-          const resolvedRequirementIds = importReferenceTokens(row.requirements || row.requirement || body?.requirement_id)
+          const resolvedRequirementIds = importReferenceTokens(row.stories || row.story || row.requirements || row.requirement || body?.requirement_id)
             .map((token) => resolveImportedReference(requirements, token))
             .filter(Boolean)
             .map((item) => item.id);
@@ -9447,11 +10874,37 @@ async function handleTestCases(pathname, method, query, body, context) {
       const kind = label.startsWith('data-testid') ? 'testId' : label.startsWith('aria-label') ? 'role' : 'css';
       return { name: value, tag: 'element', role: kind === 'role' ? 'interactive' : '', locator: kind === 'testId' ? `[data-testid="${value}"]` : kind === 'role' ? `[aria-label="${value}"]` : `#${value}`, locatorKind: kind, dom: label, fallbackLocators: [], description: null, businessMeaning: body?.business_meaning || null, usageKeywords: [] };
     });
+    const domExcerpt = String(source)
+      .replace(/<script\b[\s\S]*?<\/script>/gi, '<script>[script content omitted]</script>')
+      .replace(/<style\b[\s\S]*?<\/style>/gi, '<style>[style content omitted]</style>')
+      .slice(0, 12000);
+    const retrievedContext = await retrieveAiModuleContext(project, registry, {
+      intent: [body?.screen_name, body?.business_meaning, ...fields.map((field) => field.name)].filter(Boolean).join('\n'),
+      appTypeId: body?.app_type_id,
+      sources: ['object-repository', 'knowledge'],
+      limit: 6,
+      maxChars: 7000
+    });
     return assistedResponse(
       { screen_summary: body?.screen_name || 'Imported screen', intended_flows: [], fields, entries: fields, ai_used: false },
       'dom-field-extraction',
-      { screen_name: body?.screen_name, source_length: String(source).length },
-      [],
+      {
+        screen_name: body?.screen_name,
+        business_meaning: optionalString(body?.business_meaning, 2000) || null,
+        source_length: String(source).length,
+        dom_evidence_excerpt: domExcerpt,
+        detected_fields: fields.map(({ name, tag, role, locator, locatorKind }) => ({ name, tag, role, locator, locatorKind })),
+        related_module_context: retrievedContext.records,
+        context_retrieval: {
+          source_counts: retrievedContext.source_counts,
+          unavailable_sources: retrievedContext.unavailable_sources,
+          bounded: true
+        }
+      },
+      [
+        `dom-evidence:${String(source).length}-characters`,
+        ...retrievedContext.evidence_refs
+      ],
       0.84
     );
   }
@@ -9478,17 +10931,93 @@ async function handleTestCases(pathname, method, query, body, context) {
   if (cacheImprove && method === 'POST') {
     await loadScopedIssue(cacheImprove[1], project, registry, { typeKeys: ['objectRepositoryItem'], label: 'object repository item' });
     const entry = await mapObjectRepositoryIssue(await getIssue(cacheImprove[1], commonFields(registry, ['pageName', 'primaryLocatorStrategy', 'primaryLocatorValue', 'locatorStabilityScore'])), project, registry);
-    const suggestedStrategy = entry.locator_intent ? 'role' : entry.locator_kind || 'css';
+    let linkedTestCase = null;
+    let linkedTestCaseSpec = null;
+    if (entry.test_case_id) {
+      const testCaseIssue = await loadScopedIssue(entry.test_case_id, project, registry, {
+        typeKeys: ['testCase'],
+        label: 'test case',
+        fields: commonFields(registry, customKeysForType('testCase'))
+      });
+      [linkedTestCase, linkedTestCaseSpec] = await Promise.all([
+        mapTestCase(testCaseIssue, project, registry),
+        getTestCaseSpec(testCaseIssue.id)
+      ]);
+    }
+    const retrievedContext = await retrieveAiModuleContext(project, registry, {
+      intent: [
+        entry.page_key,
+        entry.locator_intent,
+        entry.locator,
+        linkedTestCase?.title,
+        linkedTestCase?.description,
+        ...asArray(linkedTestCaseSpec?.steps).flatMap((step) => [step.action, step.expected_result])
+      ].filter(Boolean).join('\n'),
+      appTypeId: entry.app_type_id,
+      sources: ['object-repository', 'test-cases', 'knowledge'],
+      limit: 8,
+      maxChars: 9000
+    });
+    // The deterministic fallback must keep a syntactically coherent locator.
+    // Changing only the strategy (for example CSS -> role) while retaining the
+    // old locator value would produce an invalid suggestion. The model may
+    // propose both fields together when the retrieved evidence supports it.
+    const suggestedStrategy = entry.locator_kind || 'css';
     const suggestion = {
       locator: entry.locator,
       strategy: suggestedStrategy,
-      confidence: Math.max(Number(entry.confidence || 0), suggestedStrategy === 'role' ? 0.9 : 0.72),
-      reason: suggestedStrategy === 'role'
-        ? 'Prefer an accessible role/name locator when the visible intent is verified by a human.'
+      confidence: clamp(Number(entry.confidence || 0.72), 0, 1),
+      reason: entry.locator_intent
+        ? 'The current locator is retained until the accessible intent and any replacement strategy/value pair are verified by a human.'
         : 'No accessible-name evidence was available, so keep the current locator pending review.'
     };
-    const provenance = aiProvenance('locator-improvement-preview', { id: entry.id, locator: entry.locator, locator_kind: entry.locator_kind, locator_intent: entry.locator_intent }, [`jira-issue:${entry.display_id}`], suggestion.confidence);
-    return { applied: false, entry, suggestion, provenance, ...provenance };
+    const assisted = await assistedResponse(
+      { applied: false, entry, suggestion },
+      'locator-improvement-preview',
+      {
+        authoritative_entry: aiContextRecord('object-repository', entry),
+        linked_test_case: linkedTestCase ? {
+          ...aiContextRecord('test-cases', linkedTestCase),
+          steps: asArray(linkedTestCaseSpec?.steps).slice(0, 100).map((step) => ({
+            step_order: step.step_order,
+            step_type: step.step_type,
+            action: step.action,
+            expected_result: step.expected_result
+          }))
+        } : null,
+        related_module_context: retrievedContext.records,
+        context_retrieval: {
+          source_counts: retrievedContext.source_counts,
+          unavailable_sources: retrievedContext.unavailable_sources,
+          bounded: true
+        },
+        improvement_contract: [
+          'Preserve the current locator unless the supplied object repository or linked test evidence supports a concrete replacement.',
+          'Prefer stable accessible roles, names, test IDs, or stable attributes over DOM position and generated classes.',
+          'Do not claim that a locator was executed or validated; this is a review-only proposal.'
+        ]
+      },
+      [
+        `jira-issue:${entry.display_id}`,
+        ...(linkedTestCase ? [`jira-issue:${linkedTestCase.display_id || linkedTestCase.id}`] : []),
+        ...asArray(linkedTestCaseSpec?.steps).map((step) => `test-step:${step.id}`),
+        ...retrievedContext.evidence_refs
+      ],
+      suggestion.confidence,
+      { contextLimit: 16_000, maxCompletionTokens: 450 }
+    );
+    const candidate = assisted.suggestion || suggestion;
+    return {
+      ...assisted,
+      applied: false,
+      entry,
+      suggestion: {
+        locator: String(candidate.locator || suggestion.locator || '').trim().slice(0, 4000),
+        strategy: String(candidate.strategy || suggestion.strategy || 'css').trim().slice(0, 80),
+        confidence: suggestion.confidence,
+        reason: String(candidate.reason || suggestion.reason || '').trim().slice(0, 2000)
+      }
+    };
   }
   const cacheUsage = pathname.match(/^\/test-cases\/automation\/learning-cache\/([^/]+)\/usage$/);
   if (cacheUsage && method === 'GET') {
@@ -9601,7 +11130,7 @@ async function handleTestCases(pathname, method, query, body, context) {
       ...(affectedRuns.some((run) => ['queued', 'running'].includes(String(run.status).toLowerCase())) ? ['Included in an active or queued test run.'] : []),
       ...(testCase.automation_status === 'incomplete' ? ['Automation is incomplete or broken.'] : []),
       ...(lowConfidenceObjects.length ? [`${lowConfidenceObjects.length} linked object locator(s) have confidence below 75%.`] : []),
-      ...(!affectedRequirements.length ? ['No live requirement link was found.'] : [])
+      ...(!affectedRequirements.length ? ['No live Story link was found.'] : [])
     ];
     const evidence = [
       `jira-issue:${testCase.display_id}`,
@@ -9631,15 +11160,40 @@ async function handleTestCases(pathname, method, query, body, context) {
         'Apply changes only after human review.'
       ],
       preview_only: true
-    }, 'test-case-change-impact-preview', { test_case_id: testCase.id, proposed_change: body?.proposed_change || body }, evidence, evidence.length > 1 ? 0.82 : 0.58);
+    }, 'test-case-change-impact-preview', {
+      test_case_id: testCase.id,
+      proposed_change: body?.proposed_change || body,
+      authoritative_impact: {
+        test_case: {
+          title: testCase.title,
+          description: testCase.description,
+          status: testCase.status,
+          priority: testCase.priority,
+          automation_status: testCase.automation_status,
+          steps: asArray(spec.steps).slice(0, 100).map((step) => ({
+            step_order: step.step_order,
+            action: step.action,
+            expected_result: step.expected_result,
+            step_type: step.step_type
+          }))
+        },
+        requirements: affectedRequirements.map(({ id: requirementId, display_id, title, status }) => ({ id: requirementId, display_id, title, status })),
+        suites: affectedSuites.map(({ id: suiteId, display_id, name }) => ({ id: suiteId, display_id, name })),
+        runs: affectedRuns.map(({ id: runId, display_id, name, status, release, build }) => ({ id: runId, display_id, name, status, release, build })),
+        automation_assets: affectedAutomation.map(({ id: assetId, display_id, title, automation_status }) => ({ id: assetId, display_id, title, automation_status })),
+        object_repository_items: objects.map(({ id: objectId, display_id, locator_intent, locator_kind, confidence }) => ({ id: objectId, display_id, locator_intent, locator_kind, confidence }))
+      }
+    }, evidence, evidence.length > 1 ? 0.82 : 0.58);
   }
 
   const acceptGenerated = pathname.match(/^\/test-cases\/([^/]+)\/accept-generated$/);
   if (acceptGenerated && method === 'POST') {
     const spec = await getTestCaseSpec(acceptGenerated[1]);
-    spec.ai_generation_review_status = 'accepted';
-    spec.review_status = 'accepted';
-    await saveTestCaseSpec(acceptGenerated[1], spec);
+    await saveTestCaseSpec(acceptGenerated[1], {
+      ...spec,
+      ai_generation_review_status: 'accepted',
+      review_status: 'accepted'
+    });
     addCustomFields({}, registry, {});
     return { accepted: true };
   }
@@ -9649,6 +11203,20 @@ async function handleTestCases(pathname, method, query, body, context) {
   if (buildMatch && method === 'POST') {
     const testCase = await mapTestCase(await getIssue(buildMatch[1], commonFields(registry, ['testStatus', 'automationStatus', 'coverageScore', 'aiReviewState'])), project, registry);
     const steps = (await getTestCaseSpec(buildMatch[1])).steps || [];
+    const [requirements, objects, retrievedContext, environmentRecord, configurationRecord, dataSetRecord] = await Promise.all([
+      requirementRecordsByIds(testCase.requirement_ids, project, registry),
+      listObjectRepository(project, registry, { app_type_id: testCase.app_type_id, test_case_id: testCase.id }),
+      retrieveAiModuleContext(project, registry, {
+        intent: [testCase.title, testCase.description, ...steps.flatMap((step) => [step.action, step.expected_result]), body?.additional_context].filter(Boolean).join('\n'),
+        appTypeId: testCase.app_type_id,
+        sources: ['object-repository', 'shared-steps', 'knowledge'],
+        limit: 8,
+        maxChars: 9000
+      }),
+      body?.test_environment_id ? findCollectionItem(COLLECTIONS.testEnvironments, body.test_environment_id, project) : null,
+      body?.test_configuration_id ? findCollectionItem(COLLECTIONS.testConfigurations, body.test_configuration_id, project) : null,
+      body?.test_data_set_id ? findCollectionItem(COLLECTIONS.testDataSets, body.test_data_set_id, project) : null
+    ]);
     const framework = body?.framework || 'Playwright';
     const artifact = body?.preview === true ? null : await createArtifact(project, registry, 'automationAsset', {
       ...body,
@@ -9662,8 +11230,47 @@ async function handleTestCases(pathname, method, query, body, context) {
     return assistedResponse(
       { test_case_id: testCase.id, title: testCase.title, automated: testCase.automated, automation_status: artifact ? 'proposed' : 'preview', generated_step_count: steps.length, created_step_count: 0, updated_step_count: 0, learned_locator_count: 0, cache_hits: 0, summary: `${artifact ? 'Created a draft automation asset for' : 'Previewed'} a ${framework} skeleton from Jira-native test steps. No executable code was claimed without human review or an external runner.`, transaction_id: id('automation'), artifact_id: artifact ? String(artifact.id) : null, artifact_display_id: artifact?.key || null, api_test_case: null },
       'automation-asset-draft',
-      body,
-      [`jira-issue:${testCase.display_id || testCase.id}`, ...steps.map((step) => `test-step:${step.id}`)],
+      {
+        ...body,
+        authoritative_test_case: {
+          ...aiContextRecord('test-cases', testCase),
+          steps: asArray(steps).slice(0, 100).map((step) => ({
+            id: step.id,
+            step_order: step.step_order,
+            step_type: step.step_type,
+            action: step.action,
+            expected_result: step.expected_result,
+            automation_code: step.automation_code || null,
+            api_request: step.api_request || null
+          }))
+        },
+        linked_requirements: requirements.map((requirement) => aiContextRecord('requirements', requirement)).filter(Boolean),
+        object_repository_items: objects.map((item) => aiContextRecord('object-repository', item)).filter(Boolean),
+        selected_execution_context: {
+          environment: environmentRecord?.item ? {
+            id: environmentRecord.item.id,
+            name: environmentRecord.item.name,
+            description: environmentRecord.item.description,
+            base_url: environmentRecord.item.base_url,
+            environment_type: environmentRecord.item.environment_type
+          } : null,
+          configuration: configurationRecord?.item ? redactAgenticValue(configurationRecord.item) : null,
+          data_set_schema: dataSetRecord?.item ? aiContextRecord('data-sets', dataSetRecord.item) : null
+        },
+        related_module_context: retrievedContext.records,
+        context_retrieval: {
+          source_counts: retrievedContext.source_counts,
+          unavailable_sources: retrievedContext.unavailable_sources,
+          bounded: true
+        }
+      },
+      [
+        `jira-issue:${testCase.display_id || testCase.id}`,
+        ...steps.map((step) => `test-step:${step.id}`),
+        ...requirements.map((requirement) => `jira-issue:${requirement.display_id || requirement.id}`),
+        ...objects.map((item) => `jira-issue:${item.display_id || item.id}`),
+        ...retrievedContext.evidence_refs
+      ],
       0.68
     );
   }
@@ -9686,9 +11293,11 @@ async function handleTestCases(pathname, method, query, body, context) {
     const spec = await getTestCaseSpec(reviewMatch[1]);
     const reviewActor = await currentActor(context, project, 'test-case-review');
     const review = { id: id('review'), status: body?.review_status, comment: body?.comment || null, user_id: reviewActor.accountId, created_at: nowIso() };
-    spec.review_status = body?.review_status;
-    spec.review_history = [...asArray(spec.review_history), review];
-    await saveTestCaseSpec(reviewMatch[1], spec);
+    await saveTestCaseSpec(reviewMatch[1], {
+      ...spec,
+      review_status: body?.review_status,
+      review_history: [...asArray(spec.review_history), review]
+    });
     return { updated: true, review };
   }
   const versionRestoreMatch = pathname.match(/^\/test-cases\/([^/]+)\/versions\/(\d+)\/restore$/);
@@ -9711,7 +11320,7 @@ async function handleTestCases(pathname, method, query, body, context) {
       mapInBatches(requirementIds, (requirementId) => loadScopedIssue(requirementId, project, registry, {
         nativeKind: 'requirements',
         fallbackNames: ['Story'],
-        label: 'requirement'
+        label: 'Story'
       }), 10),
       mapInBatches(suiteIds, (suiteId) => loadScopedIssue(suiteId, project, registry, {
         typeKeys: ['testSuite'],
@@ -9963,8 +11572,9 @@ async function handleModules(pathname, method, query, body, context) {
     const found = await findCollectionItem(COLLECTIONS.modules, caseList[1], project);
     if (!found) throw new Error('Module not found');
     if (method === 'GET') {
-      return listStoredTestCaseRefsPage(found.project, registry, found.item.test_case_ids, {
+      return listTestCases(found.project, registry, {
         ...query,
+        module_id: found.item.id,
         app_type_id: query.app_type_id || found.item.app_type_id,
         projection: query.projection || 'summary',
         page_size: query.page_size || DEFAULT_PAGE_SIZE,
@@ -10233,6 +11843,259 @@ async function handleSteps(pathname, method, query, body, context) {
   return null;
 }
 
+function smartRunScopeFromInput(body = {}) {
+  return {
+    release: optionalString(body.release ?? body.release_scope, 120) || '',
+    sprint: optionalString(body.sprint, 120) || '',
+    build: optionalString(body.build, 255) || '',
+    scopeDescription: optionalString(body.scope_description, 4_000) || '',
+    additionalContext: optionalString(body.additional_context, 4_000) || ''
+  };
+}
+
+function smartRunRequirementJql(scope) {
+  const clauses = [];
+  if (scope.release) clauses.push(`fixVersion = ${jqlQuote(scope.release)}`);
+  if (scope.sprint) clauses.push(`sprint = ${jqlQuote(scope.sprint)}`);
+  return clauses.join(' OR ');
+}
+
+async function smartRunBugRecordsByIds(project, registry, issueRefs) {
+  const references = [...new Set(asArray(issueRefs).filter(Boolean).map(String))].slice(0, MAX_SYNC_RELATIONSHIP_TARGETS);
+  if (!references.length) return [];
+  const sprintField = await jiraSprintField();
+  const fields = commonFields(registry);
+  if (sprintField?.id) fields.push(sprintField.id);
+  const issues = await loadScopedIssues(references, project, registry, {
+    nativeKind: 'defects',
+    fallbackNames: ['Bug'],
+    label: 'Bug',
+    fields,
+    properties: [DEFECT_PROP]
+  });
+  return mapInBatches(issues, (issue) => mapBug(issue, registry, sprintField?.id), 10);
+}
+
+function uniqueSmartRunRecords(records) {
+  return [...new Map(asArray(records)
+    .filter(Boolean)
+    .map((item) => [String(item.id || item.display_id || item.jira_bug_key), item]))
+    .values()];
+}
+
+async function loadSmartRunEvidence(project, registry, body = {}) {
+  const scope = smartRunScopeFromInput(body);
+  const appTypeId = String(body.app_type_id);
+  const impactedRequirementIds = [...new Set(asArray(body.impacted_requirement_ids).filter(Boolean).map(String))]
+    .slice(0, MAX_SYNC_RELATIONSHIP_TARGETS);
+  const requirementJql = smartRunRequirementJql(scope);
+  const shouldQueryDeliveryRequirements = Boolean(requirementJql);
+  const shouldQueryDeliveryBugs = Boolean(scope.release || scope.sprint || scope.build);
+  const narrativeIntent = [scope.scopeDescription, scope.additionalContext].filter(Boolean).join(' ');
+
+  const [deliveryRequirementPage, explicitRequirements, deliveryBugPage, executionPage, suitePage, modules, knowledge, caseInventoryPage] = await Promise.all([
+    shouldQueryDeliveryRequirements
+      ? listRequirements(project, registry, {
+        page_size: MAX_PAGE_SIZE,
+        projection: 'summary',
+        include_page: true,
+        jql: `${requirementJql} ORDER BY updated DESC`
+      })
+      : { items: [], total: 0, next_cursor: null, is_last: true },
+    impactedRequirementIds.length
+      ? requirementRecordsByIds(impactedRequirementIds, project, registry)
+      : [],
+    shouldQueryDeliveryBugs
+      ? listBugs(project, registry, {
+        page_size: MAX_PAGE_SIZE,
+        projection: 'detail',
+        include_page: true,
+        release: scope.release || undefined,
+        sprint: scope.sprint || undefined,
+        build: scope.build || undefined,
+        delivery_any: true
+      })
+      : { items: [], total: 0, next_cursor: null, is_last: true },
+    listExecutions(project, registry, {
+      app_type_id: appTypeId,
+      page_size: MAX_PAGE_SIZE,
+      include_page: true,
+      release: scope.release || undefined,
+      sprint: scope.sprint || undefined,
+      build: scope.build || undefined,
+      delivery_any: true
+    }),
+    listSuites(project, registry, { app_type_id: appTypeId, page_size: MAX_PAGE_SIZE, include_page: true }),
+    getCollection(project.key, COLLECTIONS.modules, []),
+    getCollection(project.key, COLLECTIONS.knowledge, []),
+    listTestCases(project, registry, { app_type_id: appTypeId, page_size: 1, projection: 'summary', include_page: true })
+  ]);
+
+  const initialRequirements = uniqueSmartRunRecords([
+    ...asArray(deliveryRequirementPage.items),
+    ...explicitRequirements
+  ]);
+  const allRuns = asArray(executionPage.items);
+  const hasDeliveryScope = Boolean(scope.release || scope.sprint || scope.build);
+  const scopedRuns = hasDeliveryScope
+    ? allRuns.filter((execution) => matchesAnySmartRunDeliveryScope(execution, scope))
+    : [];
+  const resultGroups = await mapInBatches(scopedRuns, async (execution) => ({
+    execution,
+    results: (await readExecutionResults(execution.id)).map((result) => ({ ...result, execution_id: String(execution.id) }))
+  }), 5);
+  const executionResults = resultGroups.flatMap((group) => group.results);
+
+  const initialBugs = asArray(deliveryBugPage.items);
+  const linkedRequirementRefs = initialBugs.flatMap((bug) => asArray(bug.linked_requirement_ids));
+  const knownRequirementAliases = new Set(initialRequirements.flatMap((requirement) => [requirement.id, requirement.display_id].filter(Boolean).map(String)));
+  const missingRequirementRefs = [...new Set(linkedRequirementRefs.map(String))].filter((reference) => !knownRequirementAliases.has(reference));
+  const linkedRequirements = missingRequirementRefs.length
+    ? await requirementRecordsByIds(missingRequirementRefs.slice(0, MAX_SYNC_RELATIONSHIP_TARGETS), project, registry)
+    : [];
+  let requirements = uniqueSmartRunRecords([...initialRequirements, ...linkedRequirements]);
+
+  const linkedBugRefs = [
+    ...requirements.flatMap((requirement) => asArray(requirement.defect_ids)),
+    ...executionResults.flatMap((result) => asArray(result.defects))
+  ];
+  const knownBugAliases = new Set(initialBugs.flatMap((bug) => [bug.id, bug.jira_bug_key].filter(Boolean).map(String)));
+  const missingBugRefs = [...new Set(linkedBugRefs.map(String))].filter((reference) => !knownBugAliases.has(reference));
+  const linkedBugs = missingBugRefs.length
+    ? await smartRunBugRecordsByIds(project, registry, missingBugRefs)
+    : [];
+  let bugs = uniqueSmartRunRecords([...initialBugs, ...linkedBugs]);
+
+  const failedCaseIds = executionResults
+    .filter((result) => String(result.status || '').toLowerCase() === 'failed')
+    .map((result) => String(result.test_case_id));
+  const blockedCaseIds = executionResults
+    .filter((result) => String(result.status || '').toLowerCase() === 'blocked')
+    .map((result) => String(result.test_case_id));
+  const bugCaseIds = bugs.flatMap((bug) => asArray(bug.linked_test_case_ids).map(String));
+  const requirementCaseIds = requirements.flatMap((requirement) => asArray(requirement.test_case_ids).map(String));
+  const strongCandidateRefs = [...new Set([
+    ...failedCaseIds,
+    ...blockedCaseIds,
+    ...bugCaseIds,
+    ...requirementCaseIds
+  ])];
+  const boundedCandidateRefs = strongCandidateRefs.slice(0, MAX_RUN_SCOPE_CASES);
+  let graphCases = boundedCandidateRefs.length
+    ? await listStoredTestCaseRefsPage(project, registry, boundedCandidateRefs, {
+      app_type_id: appTypeId,
+      page_size: MAX_RUN_SCOPE_CASES,
+      projection: 'summary'
+    })
+    : [];
+  const knownRequirementRefsAfterCaseLoad = new Set(requirements
+    .flatMap((requirement) => [requirement.id, requirement.display_id])
+    .filter(Boolean)
+    .map(String));
+  const caseLinkedRequirementRefs = [...new Set(asArray(graphCases)
+    .flatMap((testCase) => asArray(testCase.requirement_ids))
+    .map(String))]
+    .filter((reference) => !knownRequirementRefsAfterCaseLoad.has(reference))
+    .slice(0, MAX_SYNC_RELATIONSHIP_TARGETS);
+  if (caseLinkedRequirementRefs.length) {
+    const derivedRequirements = (await requirementRecordsByIds(caseLinkedRequirementRefs, project, registry))
+      .map((requirement) => ({ ...requirement, _smart_run_scope_source: 'linked-test-case' }));
+    requirements = uniqueSmartRunRecords([...requirements, ...derivedRequirements]);
+  }
+
+  const knownBugRefsAfterRequirementLoad = new Set(bugs
+    .flatMap((bug) => [bug.id, bug.jira_bug_key])
+    .filter(Boolean)
+    .map(String));
+  const closureBugRefs = [...new Set([
+    ...requirements.flatMap((requirement) => asArray(requirement.defect_ids)),
+    ...asArray(graphCases).flatMap((testCase) => asArray(testCase.defect_ids))
+  ].map(String))]
+    .filter((reference) => !knownBugRefsAfterRequirementLoad.has(reference))
+    .slice(0, MAX_SYNC_RELATIONSHIP_TARGETS);
+  if (closureBugRefs.length) {
+    bugs = uniqueSmartRunRecords([
+      ...bugs,
+      ...await smartRunBugRecordsByIds(project, registry, closureBugRefs)
+    ]);
+  }
+
+  const knownCaseRefs = new Set(asArray(graphCases)
+    .flatMap((testCase) => [testCase.id, testCase.display_id])
+    .filter(Boolean)
+    .map(String));
+  const closureCaseRefs = [...new Set([
+    ...requirements.flatMap((requirement) => asArray(requirement.test_case_ids)),
+    ...bugs.flatMap((bug) => asArray(bug.linked_test_case_ids))
+  ].map(String))].filter((reference) => !knownCaseRefs.has(reference));
+  const remainingCaseCapacity = Math.max(0, MAX_RUN_SCOPE_CASES - asArray(graphCases).length);
+  const boundedClosureCaseRefs = closureCaseRefs.slice(0, remainingCaseCapacity);
+  if (boundedClosureCaseRefs.length) {
+    graphCases = uniqueSmartRunRecords([
+      ...asArray(graphCases),
+      ...await listStoredTestCaseRefsPage(project, registry, boundedClosureCaseRefs, {
+        app_type_id: appTypeId,
+        page_size: remainingCaseCapacity,
+        projection: 'summary'
+      })
+    ]).slice(0, MAX_RUN_SCOPE_CASES);
+  }
+  const narrativeCasePage = narrativeIntent
+    ? await listTestCases(project, registry, {
+      app_type_id: appTypeId,
+      page_size: MAX_PAGE_SIZE,
+      projection: 'summary',
+      include_page: true
+    })
+    : { items: [], total: Number(caseInventoryPage.total || 0), next_cursor: null, is_last: true };
+  const tests = uniqueSmartRunRecords([
+    ...asArray(graphCases).filter((testCase) => String(testCase.app_type_id || appTypeId) === appTypeId),
+    ...asArray(narrativeCasePage.items)
+  ]).slice(0, MAX_RUN_SCOPE_CASES);
+
+  const scopedModules = asArray(modules).filter((module) => !module.app_type_id || String(module.app_type_id) === appTypeId);
+  const contextRecords = [
+    ...requirements.map((item) => ({ source_type: 'requirement', source_id: item.display_id || item.id, title: item.title, content: item.description, status: item.status, priority: item.priority, release: item.release, sprint: item.sprint })),
+    ...bugs.map((item) => ({ source_type: 'bug', source_id: item.jira_bug_key || item.id, title: item.title, content: [item.message, item.actual_result, item.expected_result].filter(Boolean).join('\n'), status: item.status, priority: item.priority, release: item.release, sprint: item.sprint, build: item.build })),
+    ...scopedRuns.map((item) => ({ source_type: 'test-run', source_id: item.display_id || item.id, title: item.name, content: `${item.status || ''} ${item.release || ''} ${item.sprint || ''} ${item.build || ''}`, status: item.status })),
+    ...tests.map((item) => ({ source_type: 'test-case', source_id: item.display_id || item.id, title: item.title, content: item.description, priority: item.priority, automation_status: item.automation_status })),
+    ...scopedModules.map((item) => ({ source_type: 'module', source_id: item.id, title: item.name, content: item.description || '', labels: item.labels || [] })),
+    ...asArray(knowledge).map((item) => ({ source_type: 'knowledge', source_id: item.id, title: item.title || item.name, content: item.content || item.description || item.summary, labels: item.labels || [] }))
+  ];
+  const intent = [scope.release, scope.sprint, scope.build, scope.scopeDescription, scope.additionalContext].filter(Boolean).join(' ');
+  const rankedContext = rankContextRecords(contextRecords, intent || `Smart test run for ${project.key}`, 16, 12_000);
+  const scanTruncated = strongCandidateRefs.length > boundedCandidateRefs.length
+    || closureCaseRefs.length > boundedClosureCaseRefs.length
+    || deliveryRequirementPage.is_last === false
+    || deliveryBugPage.is_last === false
+    || (hasDeliveryScope && executionPage.is_last === false)
+    || suitePage.is_last === false
+    || narrativeCasePage.is_last === false;
+
+  return {
+    scope,
+    impactedRequirementIds,
+    requirements,
+    bugs,
+    executions: allRuns,
+    executionResults,
+    suites: asArray(suitePage.items),
+    modules: scopedModules,
+    tests,
+    rankedContext,
+    sourceCaseCount: Math.max(Number(caseInventoryPage.total || 0), tests.length),
+    scanTruncated,
+    queryStrategy: [
+      shouldQueryDeliveryRequirements ? 'Jira Stories filtered by exact Fix Version or Sprint JQL, then unioned as delivery evidence' : null,
+      shouldQueryDeliveryBugs ? 'Jira Bugs filtered by delivery scope, then expanded through Story, Test Case, and Test Run links' : null,
+      scope.release || scope.sprint || scope.build ? 'Qaira Test Runs matched on exact Release, Sprint, and Build snapshot fields' : null,
+      scopedRuns.length ? 'Persisted execution results read from each matching run; failed and blocked cases promoted first' : null,
+      impactedRequirementIds.length ? 'Explicitly selected Stories expanded through Jira test links' : null,
+      narrativeIntent ? 'Project knowledge, modules, and Test Case text retrieved and ranked against the change context' : null
+    ].filter(Boolean)
+  };
+}
+
 async function handleExecutions(pathname, method, query, body, context) {
   const project = await resolveProject({ query, body, context });
   const registry = await getRegistry(project.key);
@@ -10240,26 +12103,88 @@ async function handleExecutions(pathname, method, query, body, context) {
   if (pathname === '/executions/history' && method === 'GET') return listTraceabilityRunHistory(project, registry, query);
   if (pathname === '/executions/smart-plan-preview' && method === 'POST') {
     await requireAppType(project, body?.app_type_id);
-    const [tests, requirements, suites] = await Promise.all([
-      listTestCases(project, registry, { app_type_id: body?.app_type_id, page_size: MAX_PAGE_SIZE }),
-      listRequirements(project, registry, { page_size: MAX_PAGE_SIZE }),
-      listSuites(project, registry, { app_type_id: body?.app_type_id, limit: MAX_PAGE_SIZE })
-    ]);
-    const selected = prioritizeSmartRun({
-      tests,
-      requirements,
-      suites,
-      impactedRequirementIds: body?.impacted_requirement_ids,
-      releaseScope: body?.release_scope,
-      additionalContext: body?.additional_context,
-      limit: 20
+    const evidence = await loadSmartRunEvidence(project, registry, body);
+    const plan = buildSmartRunPlan({
+      tests: evidence.tests,
+      requirements: evidence.requirements,
+      suites: evidence.suites,
+      bugs: evidence.bugs,
+      executions: evidence.executions,
+      executionResults: evidence.executionResults,
+      modules: evidence.modules,
+      impactedRequirementIds: evidence.impactedRequirementIds,
+      releaseScope: evidence.scope.release,
+      sprintScope: evidence.scope.sprint,
+      buildScope: evidence.scope.build,
+      scopeDescription: evidence.scope.scopeDescription,
+      additionalContext: evidence.scope.additionalContext,
+      limit: MAX_RUN_SCOPE_CASES,
+      scanTruncated: evidence.scanTruncated
     });
+    const scopeLabel = [evidence.scope.release, evidence.scope.sprint, evidence.scope.build]
+      .filter(Boolean)
+      .join(' · ') || project.key;
+    const evidenceRefs = [...new Set([
+      ...plan.cases.flatMap((item) => [
+        `test-case:${item.test_case_id}`,
+        ...asArray(item.evidence?.requirement_ids).map((id) => `requirement:${id}`),
+        ...asArray(item.evidence?.bug_ids).map((id) => `bug:${id}`),
+        ...asArray(item.evidence?.run_ids).map((id) => `test-run:${id}`),
+        ...asArray(item.evidence?.result_ids).map((id) => `execution-result:${id}`)
+      ]),
+      ...evidence.rankedContext.map((item) => `${item.source_type}:${item.source_id}`)
+    ])];
+    const deterministicSummary = plan.cases.length
+      ? `Selected ${plan.cases.length} test case${plan.cases.length === 1 ? '' : 's'} from ${plan.evidenceSummary.failed_case_count} failed, ${plan.evidenceSummary.blocked_case_count} blocked, ${plan.evidenceSummary.scoped_bug_count} Bug, and ${plan.evidenceSummary.scoped_requirement_count} Story scope signals.`
+      : 'No Test Case is connected to the selected delivery scope through failed results, Bugs, Stories, or relevant project context.';
     return assistedResponse(
-      { app_type: { id: body?.app_type_id, name: titleCase(String(body?.app_type_id || 'Web').split(':').pop()) }, default_suite: { id: 'smart-suite', name: 'Qaira Smart Release Scope' }, source_case_count: tests.length, matched_case_count: selected.length, execution_name: `Smart run - ${body?.release_scope || project.key}`, summary: selected.length ? `Prioritized ${selected.length} scope-matched tests from Jira-native traceability, criticality, review, coverage, automation, and context signals.` : 'No project-scoped test case matched the selected requirements, release, or context.', cases: selected },
+      {
+        app_type: { id: body?.app_type_id, name: titleCase(String(body?.app_type_id || 'Web').split(':').pop()) },
+        default_suite: { id: 'smart-default', name: 'Default' },
+        delivery_scope: {
+          release: evidence.scope.release || null,
+          sprint: evidence.scope.sprint || null,
+          build: evidence.scope.build || null
+        },
+        source_case_count: evidence.sourceCaseCount,
+        matched_case_count: plan.cases.length,
+        evidence_summary: plan.evidenceSummary,
+        query_strategy: evidence.queryStrategy,
+        retrieved_context_count: evidence.rankedContext.length,
+        execution_name: `Smart run - ${scopeLabel}`,
+        summary: deterministicSummary,
+        cases: plan.cases
+      },
       'smart-run-scope-preview',
-      body,
-      selected.flatMap((item) => [`test-case:${item.test_case_id}`, ...item.requirement_titles.map((title) => `requirement-title:${title}`)]),
-      selected.length ? Math.min(0.9, 0.64 + selected.filter((item) => item.risk_score >= 65).length / Math.max(selected.length, 1) * 0.18) : 0.4
+      {
+        project_id: project.id,
+        app_type_id: body.app_type_id,
+        delivery_scope: {
+          release: evidence.scope.release || null,
+          sprint: evidence.scope.sprint || null,
+          build: evidence.scope.build || null
+        },
+        scope_description: evidence.scope.scopeDescription || null,
+        additional_context: evidence.scope.additionalContext || null,
+        impacted_requirement_ids: evidence.impactedRequirementIds,
+        query_strategy: evidence.queryStrategy,
+        evidence_summary: plan.evidenceSummary,
+        candidate_evidence: plan.cases.map((item) => ({
+          test_case_id: item.test_case_id,
+          title: item.title,
+          risk_score: item.risk_score,
+          reason: item.reason,
+          failure_count: item.failure_count,
+          blocked_count: item.blocked_count,
+          bug_count: item.bug_count,
+          requirement_titles: item.requirement_titles,
+          module_names: item.module_names
+        })),
+        retrieved_project_context: evidence.rankedContext
+      },
+      evidenceRefs,
+      plan.cases.length ? Math.min(0.94, 0.7 + plan.cases.filter((item) => item.risk_score >= 65).length / Math.max(plan.cases.length, 1) * 0.18) : 0.4,
+      { contextLimit: 24_000, maxCompletionTokens: 500 }
     );
   }
   if ((pathname === '/executions' || pathname === '/executions/local-run') && method === 'POST') {
@@ -10466,6 +12391,29 @@ async function handleExecutions(pathname, method, query, body, context) {
       }))
       .sort((left, right) => right.count - left.count || left.label.localeCompare(right.label));
     const evidence = [...new Set(failures.flatMap(resultEvidenceRefs))];
+    const caseSnapshotById = new Map(asArray(execution.case_snapshots).flatMap((snapshot) => [
+      snapshot?.id,
+      snapshot?.test_case_id,
+      snapshot?.display_id,
+      snapshot?.test_case_display_id
+    ].filter(Boolean).map((value) => [String(value), snapshot])));
+    const failureContext = failures.slice(0, 50).map((result) => {
+      const snapshot = caseSnapshotById.get(String(result.test_case_id || ''));
+      return {
+        execution_result_id: result.id,
+        test_case_id: result.test_case_id || null,
+        test_case_title: snapshot?.title || snapshot?.name || null,
+        status: result.status,
+        error: result.error || result.message ? String(result.error || result.message).slice(0, 3000) : null,
+        expected_result: result.expected_result ? String(result.expected_result).slice(0, 2000) : null,
+        actual_result: result.actual_result ? String(result.actual_result).slice(0, 2000) : null,
+        logs_excerpt: String(typeof result.logs === 'string' ? result.logs : stableJson(result.logs || '')).slice(0, 3000),
+        duration_ms: result.duration_ms ?? null,
+        environment: result.environment || execution.test_environment || null,
+        build: result.build || execution.build || null,
+        attachment_count: asArray(result.attachment_ids || result.attachments).length
+      };
+    });
     return assistedResponse({
       execution: { id: execution.id, display_id: execution.display_id, name: execution.name, status: execution.status, release: execution.release, build: execution.build },
       total_results: results.length,
@@ -10479,7 +12427,25 @@ async function handleExecutions(pathname, method, query, body, context) {
         ? ['Review the largest cluster first.', 'Confirm each root cause with linked evidence.', 'Create or link Jira Bugs only for reproducible product behavior.', 'Rerun the smallest affected scope after remediation.']
         : ['Complete execution and attach evidence before requesting failure clustering.'],
       preview_only: true
-    }, 'execution-failure-clustering-preview', { execution_id: execution.id, requested_scope: body?.scope || 'failed-and-blocked' }, evidence, failures.length ? (clusters.some((cluster) => cluster.id === 'unclassified') ? 0.62 : 0.79) : 0.4);
+    }, 'execution-failure-clustering-preview', {
+      execution: {
+        id: execution.id,
+        display_id: execution.display_id,
+        name: execution.name,
+        status: execution.status,
+        release: execution.release,
+        sprint: execution.sprint,
+        build: execution.build,
+        environment: execution.test_environment
+      },
+      requested_scope: body?.scope || 'failed-and-blocked',
+      failure_evidence: failureContext,
+      deterministic_cluster_membership: clusters.map((cluster) => ({
+        id: cluster.id,
+        label: cluster.label,
+        result_ids: cluster.members.map((member) => member.execution_result_id)
+      }))
+    }, evidence, failures.length ? (clusters.some((cluster) => cluster.id === 'unclassified') ? 0.62 : 0.79) : 0.4);
   }
   const scopeAssignmentMatch = pathname.match(/^\/executions\/([^/]+)\/(suites|modules|cases)\/([^/]+)\/assignment$/);
   if (scopeAssignmentMatch && method === 'PUT') {
@@ -10572,8 +12538,15 @@ async function handleExecutions(pathname, method, query, body, context) {
   }
   const analyzeMatch = pathname.match(/^\/executions\/([^/]+)\/cases\/([^/]+)\/ai-analysis$/);
   if (analyzeMatch && method === 'POST') {
-    await loadScopedIssue(analyzeMatch[1], project, registry, { typeKeys: ['testRun'], label: 'test run' });
-    await loadScopedIssue(analyzeMatch[2], project, registry, { typeKeys: ['testCase'], label: 'test case' });
+    const [runIssue, testCaseIssue] = await Promise.all([
+      loadScopedIssue(analyzeMatch[1], project, registry, { typeKeys: ['testRun'], label: 'test run' }),
+      loadScopedIssue(analyzeMatch[2], project, registry, { typeKeys: ['testCase'], label: 'test case' })
+    ]);
+    const [execution, testCase, testCaseSpec] = await Promise.all([
+      getIssue(runIssue.key, commonFields(registry)).then((issue) => mapExecution(issue, project, registry)),
+      getIssue(testCaseIssue.key, commonFields(registry, customKeysForType('testCase'))).then((issue) => mapTestCase(issue, project, registry)),
+      getTestCaseSpec(testCaseIssue.id)
+    ]);
     const related = (await readExecutionResults(analyzeMatch[1])).filter((result) => String(result.test_case_id) === String(analyzeMatch[2]));
     const failed = related.filter((result) => result.status === 'failed' || result.status === 'blocked');
     const summary = failed.length
@@ -10598,8 +12571,45 @@ async function handleExecutions(pathname, method, query, body, context) {
     const assisted = await assistedResponse(
       { analysis: analysisDraft },
       'execution-case-triage',
-      { execution_id: analyzeMatch[1], test_case_id: analyzeMatch[2], statuses: related.map((result) => result.status), result_count: related.length },
-      related.map((result) => `execution-result:${result.id}`),
+      {
+        execution: {
+          id: execution.id,
+          display_id: execution.display_id,
+          name: execution.name,
+          status: execution.status,
+          release: execution.release,
+          sprint: execution.sprint,
+          build: execution.build,
+          environment: execution.test_environment
+        },
+        test_case: {
+          ...aiContextRecord('test-cases', testCase),
+          steps: asArray(testCaseSpec.steps).slice(0, 100).map((step) => ({
+            id: step.id,
+            step_order: step.step_order,
+            step_type: step.step_type,
+            action: step.action,
+            expected_result: step.expected_result
+          }))
+        },
+        result_evidence: related.slice(0, 30).map((result) => ({
+          id: result.id,
+          status: result.status,
+          error: result.error || result.message ? String(result.error || result.message).slice(0, 3000) : null,
+          expected_result: result.expected_result ? String(result.expected_result).slice(0, 2000) : null,
+          actual_result: result.actual_result ? String(result.actual_result).slice(0, 2000) : null,
+          logs_excerpt: String(typeof result.logs === 'string' ? result.logs : stableJson(result.logs || '')).slice(0, 3000),
+          duration_ms: result.duration_ms ?? null,
+          attachment_count: asArray(result.attachment_ids || result.attachments).length,
+          created_at: result.created_at,
+          updated_at: result.updated_at
+        }))
+      },
+      [
+        `jira-issue:${execution.display_id || execution.id}`,
+        `jira-issue:${testCase.display_id || testCase.id}`,
+        ...related.flatMap(resultEvidenceRefs)
+      ],
       failed.length ? 0.76 : 0.9
     );
     const analysis = {
@@ -10811,11 +12821,11 @@ async function handleRelationships(pathname, method, query, body, context) {
       const requirement = await loadScopedIssue(body.requirement_id, project, registry, {
         nativeKind: 'requirements',
         fallbackNames: ['Story'],
-        label: 'requirement',
+        label: 'Story',
         fields: commonFields(registry)
       });
       const requestedCaseIds = [...new Set(asArray(body?.test_case_ids).filter(Boolean).map(String))];
-      if (requestedCaseIds.length > 100) fail(413, 'RELATIONSHIP_LIMIT_EXCEEDED', 'A single requirement update can link at most 100 test cases.');
+      if (requestedCaseIds.length > 100) fail(413, 'RELATIONSHIP_LIMIT_EXCEEDED', 'A single Story update can link at most 100 test cases.');
       const desiredCases = [];
       for (const testCaseId of requestedCaseIds) {
         desiredCases.push(await loadScopedIssue(testCaseId, project, registry, { typeKeys: ['testCase'], label: 'test case' }));
@@ -10846,7 +12856,7 @@ async function handleRelationships(pathname, method, query, body, context) {
     return requirements.flatMap((requirement) => asArray(requirement.defect_ids).map((issueId) => ({ requirement_id: requirement.id, issue_id: issueId, link_source: 'manual', created_at: nowIso() })));
   }
   if (pathname === '/requirement-defects/replace' && method === 'PUT') {
-    await loadScopedIssue(body?.requirement_id, project, registry, { nativeKind: 'requirements', fallbackNames: ['Story'], label: 'requirement' });
+    await loadScopedIssue(body?.requirement_id, project, registry, { nativeKind: 'requirements', fallbackNames: ['Story'], label: 'Story' });
     for (const issueId of asArray(body?.issue_ids)) {
       await loadScopedIssue(issueId, project, registry, { nativeKind: 'defects', fallbackNames: ['Bug'], label: 'defect' });
     }
@@ -10917,19 +12927,30 @@ function agenticLlmText(response) {
     .trim();
 }
 
-async function agenticProjectCorpus(project, registry) {
-  const [requirements, testCases, executions, knowledge] = await Promise.all([
+async function agenticProjectCorpus(project, registry, { appTypeId = null } = {}) {
+  const [requirements, testCases, executions, bugs, modules, knowledge] = await Promise.all([
     listRequirements(project, registry, { page_size: 20, projection: 'detail' }),
-    listTestCases(project, registry, { page_size: 20, projection: 'detail' }),
-    listExecutions(project, registry, { page_size: 12 }),
+    listTestCases(project, registry, { app_type_id: appTypeId || undefined, page_size: 20, projection: 'detail' }),
+    listExecutions(project, registry, { app_type_id: appTypeId || undefined, page_size: 12 }),
+    listBugs(project, registry, { page_size: 12, projection: 'detail' }),
+    getCollection(project.key, COLLECTIONS.modules, []),
     getCollection(project.key, COLLECTIONS.knowledge, [])
   ]);
   return [
-    ...requirements.map((item) => ({ source_type: 'requirement', source_id: item.display_id || item.id, title: item.title, description: item.description, status: item.status, priority: item.priority, labels: item.labels, coverage_pct: item.coverage_pct, risk_score: item.risk_score })),
-    ...testCases.map((item) => ({ source_type: 'test-case', source_id: item.display_id || item.id, title: item.title, description: item.description, status: item.status, priority: item.priority, requirement_ids: item.requirement_ids, automation_status: item.automation_status, ai_quality_score: item.ai_quality_score })),
-    ...executions.map((item) => ({ source_type: 'test-run', source_id: item.display_id || item.id, title: item.name, status: item.status, release: item.release, sprint: item.sprint, build: item.build, test_case_ids: item.test_case_ids })),
-    ...knowledge.map((item) => ({ source_type: 'knowledge', source_id: item.id, title: item.title || item.name, content: item.content || item.description || item.summary, labels: item.labels || [] }))
-  ];
+    ...requirements.map((item) => aiContextRecord('requirements', item)),
+    ...testCases.map((item) => aiContextRecord('test-cases', item)),
+    ...executions.map((item) => aiContextRecord('runs', item)),
+    ...bugs.map((item) => aiContextRecord('bugs', item)),
+    ...modules
+      .filter((item) => !appTypeId || !item?.app_type_id || String(item.app_type_id) === String(appTypeId))
+      .slice(0, AI_MODULE_CONTEXT_SOURCE_LIMIT)
+      .map((item) => aiContextRecord('modules', item)),
+    ...knowledge
+      .filter((item) => item?.is_active !== false)
+      .filter((item) => !appTypeId || !item?.app_type_id || String(item.app_type_id) === String(appTypeId))
+      .slice(0, AI_MODULE_CONTEXT_SOURCE_LIMIT)
+      .map((item) => aiContextRecord('knowledge', item))
+  ].filter(Boolean);
 }
 
 async function withAgenticRetry(operation, settings) {
@@ -11069,7 +13090,7 @@ export async function executeAgenticWorkflowRun({ projectKey, runId, retryCount 
   const workflow = foundRun.item.workflow_snapshot || (await findCollectionItem(COLLECTIONS.agenticWorkflows, foundRun.item.workflow_id, project))?.item;
   if (!workflow) throw new Error('The workflow snapshot is unavailable.');
   const { ordered, incoming } = workflowExecutionPlan(workflow);
-  const contextRecords = await agenticProjectCorpus(project, registry);
+  const contextRecords = await agenticProjectCorpus(project, registry, { appTypeId: workflow.app_type_id || null });
   const existingResults = asArray(foundRun.item.node_results);
   const resultsByNodeId = new Map(existingResults.filter((result) => result?.status === 'completed').map((result) => [String(result.node_id), result]));
   let run = await upsertCollectionItem(project.key, COLLECTIONS.agenticWorkflowRuns, {
@@ -11473,6 +13494,7 @@ async function handleUsersRoles(pathname, method, query, body, context) {
 async function handleNotifications(pathname, method, query, body, context) {
   const project = context?.qairaAuthorization?.project || await resolveProject({ query, body, context });
   const accountId = (await currentActor(context, project, 'notifications')).accountId;
+  const isMine = (item) => Boolean(item?.user_id) && String(item.user_id) === String(accountId);
   if (pathname === '/notifications/realtime-token' && method === 'GET') {
     const signed = await signRealtimeToken(
       NOTIFICATION_REALTIME_CHANNEL,
@@ -11481,24 +13503,137 @@ async function handleNotifications(pathname, method, query, body, context) {
     );
     return { token: signed.token, expires_at: signed.expiresAt };
   }
+  if (pathname === '/notifications/unread-count' && method === 'GET') {
+    const propertyKeys = await listProjectPropertyKeys(project.key);
+    return notificationUnreadSummary(propertyKeys, accountId);
+  }
   if (pathname === '/notifications' && method === 'GET') {
-    const items = await getCollection(project.key, COLLECTIONS.notifications, []);
-    return items.filter((item) => (!item.user_id || String(item.user_id) === String(accountId)) && (!query.status || item.status === query.status));
+    return listAppNotificationPage(project, accountId, query);
   }
   const readMatch = pathname.match(/^\/notifications\/([^/]+)\/read$/);
   if (readMatch && method === 'PUT') {
-    const found = await findCollectionItem(COLLECTIONS.notifications, readMatch[1], project);
-    if (!found || (found.item.user_id && String(found.item.user_id) !== String(accountId))) fail(404, 'NOTIFICATION_NOT_FOUND', 'Notification not found.');
-    await upsertCollectionItem(project.key, COLLECTIONS.notifications, { ...found.item, status: 'read', read_at: nowIso() }, 'notification');
-    return { updated: true };
+    return withNotificationMutationLock(project.key, accountId, async () => {
+      const notificationId = decodeURIComponent(readMatch[1]);
+      const propertyKeys = await listProjectPropertyKeys(project.key);
+      const entries = notificationEntriesForId(propertyKeys, accountId, notificationId);
+      const guardState = notificationGuardState(propertyKeys, safePropertyToken(accountId));
+      if (entries.some((entry) => notificationEntryIsGuarded(entry, guardState))) return { updated: false };
+      if (entries.some((entry) => entry.status === 'read')) return { updated: true };
+      if (entries.length) {
+        const result = await moveNotificationEntriesToRead(project, accountId, entries);
+        return { updated: result.count > 0 };
+      }
+      const legacy = await loadLegacyNotification(project, accountId, notificationId);
+      if (!legacy || !isMine(legacy.item)) fail(404, 'NOTIFICATION_NOT_FOUND', 'Notification not found.');
+      const legacyV2Key = notificationItemPropertyKey(
+        accountId,
+        legacy.item.status,
+        legacy.item.created_at,
+        legacy.item.preference,
+        legacy.item.id
+      );
+      const legacyEntry = legacyNotificationEntry(legacy.item, legacyV2Key);
+      if (notificationEntryIsGuarded(legacyEntry, guardState)) return { updated: false };
+      await putProjectProperty(project.key, legacyV2Key, notificationEnvelope(project, legacy.item));
+      await deleteProjectProperty(project.key, legacy.key);
+      if (legacyEntry.status === 'read') return { updated: true };
+      const result = await moveNotificationEntriesToRead(project, accountId, [legacyEntry]);
+      return { updated: result.count > 0 };
+    });
   }
   if (pathname === '/notifications/read-all' && method === 'PUT') {
-    const items = await getCollection(project.key, COLLECTIONS.notifications, []);
-    const mine = items.filter((item) => !item.user_id || String(item.user_id) === String(accountId));
-    for (const item of mine.filter((item) => item.status !== 'read')) {
-      await upsertCollectionItem(project.key, COLLECTIONS.notifications, { ...item, status: 'read', read_at: nowIso() }, 'notification');
-    }
-    return { updated: true, count: mine.length };
+    return withNotificationMutationLock(project.key, accountId, async () => {
+      const propertyKeys = await listProjectPropertyKeys(project.key);
+      const unreadEntries = scopedNotificationEntries(propertyKeys, accountId, { status: 'unread' }).entries;
+      const batch = unreadEntries.slice(0, NOTIFICATION_MARK_READ_BATCH_SIZE);
+      const result = await moveNotificationEntriesToRead(project, accountId, batch);
+      const remaining = Math.max(unreadEntries.length - result.count, 0);
+      return {
+        updated: true,
+        count: result.count,
+        remaining,
+        has_more: remaining > 0,
+        failed_count: result.failedCount
+      };
+    });
+  }
+  const deleteMatch = pathname.match(/^\/notifications\/([^/]+)$/);
+  if (deleteMatch && method === 'DELETE') {
+    return withNotificationMutationLock(project.key, accountId, async () => {
+      const notificationId = decodeURIComponent(deleteMatch[1]);
+      const propertyKeys = await listProjectPropertyKeys(project.key);
+      const entries = notificationEntriesForId(propertyKeys, accountId, notificationId);
+      const legacy = entries.length ? null : await loadLegacyNotification(project, accountId, notificationId);
+      const existingGuard = notificationGuardState(propertyKeys, safePropertyToken(accountId));
+      if (!entries.length && !legacy) {
+        if (existingGuard.deletedIdTokens.has(safePropertyToken(notificationId))) return { deleted: true, id: notificationId };
+        fail(404, 'NOTIFICATION_NOT_FOUND', 'Notification not found.');
+      }
+      if (legacy && !isMine(legacy.item)) fail(404, 'NOTIFICATION_NOT_FOUND', 'Notification not found.');
+      const deletedAt = nowIso();
+      const tombstoneKey = notificationTombstonePropertyKey(accountId, notificationId, deletedAt);
+      await putProjectProperty(project.key, tombstoneKey, {
+        schema: 'qaira.notification.v2.tombstone',
+        user_id: String(accountId),
+        notification_id: notificationId,
+        deleted_at: deletedAt
+      });
+      const targets = [...entries.map((entry) => entry.key), legacy?.key].filter(Boolean);
+      const result = await deleteNotificationKeys(project.key, targets);
+      if (result.failedKeys.length) {
+        fail(503, 'NOTIFICATION_DELETE_PARTIAL', 'The notification could not be removed from Jira storage. Retry the operation.', {
+          failedKeys: result.failedKeys.length
+        });
+      }
+      return { deleted: true, id: notificationId };
+    });
+  }
+  if (pathname === '/notifications' && method === 'DELETE') {
+    return withNotificationMutationLock(project.key, accountId, async () => {
+      // The first request deliberately uses Forge server time; continuations
+      // reuse this value so notifications arriving during cleanup are retained.
+      const suppliedBefore = optionalString(body?.before, 64) || null;
+      const before = suppliedBefore || nowIso();
+      const beforeTime = Date.parse(before);
+      if (!Number.isFinite(beforeTime)) fail(400, 'INVALID_NOTIFICATION_CUTOFF', 'Notification delete cutoff must be a valid timestamp.');
+      if (beforeTime > Date.now() + NOTIFICATION_CUTOFF_CLOCK_SKEW_MS) {
+        fail(400, 'INVALID_NOTIFICATION_CUTOFF', 'Notification delete cutoff cannot be in the future. Start the delete action again.');
+      }
+      const cutoffKey = notificationCutoffPropertyKey(accountId, before);
+      let propertyKeys;
+      if (suppliedBefore) {
+        // A continuation is accepted only when its exact per-user cutoff key
+        // was minted by the initial server-timed request. Do not let a client
+        // create or drift the authoritative deletion boundary.
+        propertyKeys = await listProjectPropertyKeysFresh(project.key);
+        if (!propertyKeys.includes(cutoffKey)) {
+          fail(409, 'INVALID_NOTIFICATION_CONTINUATION', 'Notification delete continuation is no longer valid. Start the delete action again.');
+        }
+      } else {
+        await putProjectProperty(project.key, cutoffKey, {
+          schema: 'qaira.notification.v2.cutoff',
+          user_id: String(accountId),
+          before,
+          created_at: nowIso()
+        });
+        propertyKeys = await listProjectPropertyKeysFresh(project.key);
+      }
+      const batch = notificationDeleteBatch(propertyKeys, accountId, beforeTime);
+      const result = await deleteNotificationKeys(project.key, batch.propertyKeys);
+      const removedKeySet = new Set(result.removedKeys);
+      const removedRecords = batch.selected.filter((group) =>
+        group.complete && group.entries.every((entry) => removedKeySet.has(entry.key))
+      ).length;
+      const remaining = Math.max(batch.groups.length - removedRecords, 0);
+      return {
+        deleted: remaining === 0,
+        count: removedRecords,
+        remaining,
+        has_more: remaining > 0,
+        failed_count: result.failedKeys.length,
+        before
+      };
+    });
   }
   return null;
 }
@@ -11834,10 +13969,20 @@ function encodeSyntheticTestDataPool(values) {
 
 async function generateSyntheticTestDataPreview(body, context) {
   const project = context?.qairaAuthorization?.project || await resolveProject({ body, context });
+  const registry = await getRegistry(project.key);
+  if (!registry) fail(409, 'QAIRA_NOT_CONFIGURED', `Qaira registry ${REGISTRY_KEY} is missing for ${project.key}.`);
   const prompt = optionalString(body?.prompt, 2_000) || '';
   if (prompt.length < 3) fail(400, 'TEST_DATA_PROMPT_REQUIRED', 'Describe the synthetic data you want to generate.');
   const sampleCount = clamp(Number(body?.sample_count) || 6, 2, 12);
   const fieldContext = optionalString(body?.field_context, 255) || null;
+  const appTypeId = optionalString(body?.app_type_id, 255) || null;
+  const retrievedContext = await retrieveAiModuleContext(project, registry, {
+    intent: [prompt, fieldContext].filter(Boolean).join('\n'),
+    appTypeId,
+    sources: ['data-sets', 'modules', 'knowledge'],
+    limit: 6,
+    maxChars: 6000
+  });
   const fallbackValues = fallbackSyntheticTestDataValues(prompt, sampleCount);
   const response = await assistedResponse(
     {
@@ -11847,9 +13992,17 @@ async function generateSyntheticTestDataPreview(body, context) {
     'test-data-generation-preview',
     {
       project: { id: String(project.id), key: project.key, name: project.name },
+      app_type_id: appTypeId,
       request: prompt,
       field_context: fieldContext,
       prompt_instruction: optionalString(body?.prompt_instruction, 2_000) || null,
+      related_schema_context: retrievedContext.records,
+      context_retrieval: {
+        source_counts: retrievedContext.source_counts,
+        unavailable_sources: retrievedContext.unavailable_sources,
+        bounded: true,
+        row_values_excluded: true
+      },
       generation_contract: [
         `Return exactly ${sampleCount} concise, distinct values that satisfy the user's descriptive request.`,
         'Generate fictional synthetic test data only. Never return real personal data, passwords, authentication tokens, private keys, payment card numbers, or production credentials.',
@@ -11857,7 +14010,11 @@ async function generateSyntheticTestDataPreview(body, context) {
         'Return plain values without Markdown, numbering, explanations, or placeholder braces.'
       ]
     },
-    [`jira-project:${project.key}`, fieldContext ? `test-data-field:${fieldContext}` : null].filter(Boolean),
+    [
+      `jira-project:${project.key}`,
+      fieldContext ? `test-data-field:${fieldContext}` : null,
+      ...retrievedContext.evidence_refs
+    ].filter(Boolean),
     0.76,
     {
       contextLimit: 8_000,
@@ -12173,7 +14330,7 @@ async function handleAdminHealth(query, body, context) {
   const requiredIssueTypes = ['testCase', 'testSuite', 'testPlan', 'testRun', 'automationAsset', 'objectRepositoryItem', 'testDataSet', 'qualityGate'];
   const missingIssueTypes = requiredIssueTypes.filter((key) => !registry?.issueTypes?.[key]);
   addCheck('issue-types', 'Qaira issue types', missingIssueTypes.length ? 'blocked' : 'ready', missingIssueTypes.length ? `Missing ${missingIssueTypes.join(', ')}.` : `${requiredIssueTypes.length} required issue types are mapped.`, undefined, missingIssueTypes.length ? 'Rerun the reviewed Jira setup reconciliation and inspect issue type scheme availability.' : undefined);
-  addCheck('crud-contracts', 'Jira-native CRUD contracts', 'ready', 'Scoped CRUD is active for requirements, cases, suites, plans, runs, automation assets, object repository items, property-backed test data, defects, and quality gates.');
+  addCheck('crud-contracts', 'Jira-native CRUD contracts', 'ready', 'Scoped CRUD is active for Stories, cases, suites, plans, runs, automation assets, object repository items, property-backed test data, defects, and quality gates.');
 
   const criticalFields = ['entityId', 'artifactVersion', 'testStatus', 'automationStatus', 'runStatus', 'totalCount', 'passedCount', 'failedCount'];
   const missingFields = criticalFields.filter((key) => !registry?.fields?.[key]);
@@ -12181,7 +14338,7 @@ async function handleAdminHealth(query, body, context) {
 
   const requiredLinks = ['tests', 'contains', 'plannedIn', 'executes', 'automates', 'usesObject', 'foundInRun', 'gatesRelease'];
   const missingLinks = requiredLinks.filter((semantic) => !linkTypeId(registry, semantic));
-  addCheck('links', 'Traceability links', missingLinks.length ? 'degraded' : 'ready', missingLinks.length ? `Missing semantic links: ${missingLinks.join(', ')}.` : 'Core requirement, suite, run, and defect links are configured.');
+  addCheck('links', 'Traceability links', missingLinks.length ? 'degraded' : 'ready', missingLinks.length ? `Missing semantic links: ${missingLinks.join(', ')}.` : 'Core Story, suite, run, and defect links are configured.');
 
   const propertyKeys = await listProjectPropertyKeys(project.key);
   const qairaPropertyCount = propertyKeys.filter((key) => key.startsWith('qaira.')).length;
@@ -12249,15 +14406,15 @@ async function handleQualityInsights(method, query, body, context) {
       id: 'release-evidence-missing',
       severity: 'high',
       title: 'No release-scoped evidence found',
-      explanation: `No requirement, linked test case, or test run is currently mapped to release ${query.release}.`,
+      explanation: `No Story, linked test case, or test run is currently mapped to release ${query.release}.`,
       recommended_action: 'Confirm Jira fix-version and Qaira run release mappings before making a release decision.',
       evidence: []
     } : null,
     uncoveredRequirements.length ? {
       id: 'requirement-coverage-gap',
       severity: uncoveredRequirements.some((requirement) => Number(requirement.priority || 3) === 1) ? 'high' : 'medium',
-      title: 'Requirement coverage needs review',
-      explanation: `${uncoveredRequirements.length} requirement(s) have no linked Qaira test case in Jira.`,
+      title: 'Story coverage needs review',
+      explanation: `${uncoveredRequirements.length} ${uncoveredRequirements.length === 1 ? 'Story has' : 'Stories have'} no linked Qaira test case in Jira.`,
       recommended_action: 'Review acceptance criteria, create or link tests, and obtain human approval before release sign-off.',
       evidence: uncoveredRequirements.slice(0, 20).map((requirement) => ({ id: requirement.id, display_id: requirement.display_id, title: requirement.title, priority: requirement.priority }))
     } : null,
@@ -12265,8 +14422,8 @@ async function handleQualityInsights(method, query, body, context) {
       id: 'orphan-test-traceability',
       severity: 'medium',
       title: 'Test traceability needs review',
-      explanation: `${orphanTests.length} test case(s) are not linked to a requirement.`,
-      recommended_action: 'Link each intentional test to a requirement or document its operational, regression, or compliance purpose.',
+      explanation: `${orphanTests.length} test case(s) are not linked to a Story.`,
+      recommended_action: 'Link each intentional test to a Story or document its operational, regression, or compliance purpose.',
       evidence: orphanTests.slice(0, 20).map((testCase) => ({ id: testCase.id, display_id: testCase.display_id, title: testCase.title, status: testCase.status }))
     } : null,
     manualPriorityTests.length ? {
@@ -12322,8 +14479,22 @@ async function handleQualityInsights(method, query, body, context) {
     insights,
     generated_from: ['Jira issue fields', 'Jira issue links', 'Qaira issue properties', 'Jira-native execution results'],
     preview_only: true,
-    limitations: ['Rule-based signals do not prove root cause or release readiness.', 'Only records visible to the current Jira user are assessed.', 'Release scope is derived from Jira requirement fix versions and Qaira run release values.', 'Human review and project release governance remain authoritative.']
-  }, 'portfolio-quality-insights', { project_key: project.key, release: query.release || null }, evidenceRefs, evidenceRefs.length ? 0.8 : 0.58);
+    limitations: ['Rule-based signals do not prove root cause or release readiness.', 'Only records visible to the current Jira user are assessed.', 'Release scope is derived from Jira Story fix versions and Qaira run release values.', 'Human review and project release governance remain authoritative.']
+  }, 'portfolio-quality-insights', {
+    project_key: project.key,
+    release: query.release || null,
+    authoritative_quality_snapshot: {
+      metrics: summary.metrics,
+      release_summary: summary.releaseSummary,
+      uncovered_requirement_count: uncoveredRequirements.length,
+      orphan_test_count: orphanTests.length,
+      manual_priority_test_count: manualPriorityTests.length,
+      failed_run_count: failedRuns.length,
+      open_defect_count: openDefects.length,
+      unstable_object_count: unstableObjects.length,
+      scoped_record_count: scopedRecordCount
+    }
+  }, evidenceRefs, evidenceRefs.length ? 0.8 : 0.58);
 }
 
 async function handleQualityDashboards(pathname, method, query, body, context) {
@@ -12478,7 +14649,7 @@ function buildDerivedQualityDashboardResult(project, gadget, context) {
       { label: 'Covered', value: coveredRequirements.length },
       { label: 'Coverage gap', value: requirements.length - coveredRequirements.length }
     ];
-    rows = requirements.filter((requirement) => !asArray(requirement.test_case_ids).length).map((item) => derivedDashboardRow(item, 'Requirement'));
+    rows = requirements.filter((requirement) => !asArray(requirement.test_case_ids).length).map((item) => derivedDashboardRow(item, 'Story'));
   } else if (metric === 'automationCoverage') {
     total = tests.length;
     series = [
@@ -12550,7 +14721,7 @@ function buildDerivedQualityDashboardResult(project, gadget, context) {
     series,
     rows: gadget.type === 'table' ? rows.slice(0, 50) : [],
     drilldown_target: drilldownTarget,
-    methodology: 'Derived from bounded Jira-native QAira requirements, tests, suites, runs, modules, and Bugs visible in the active project.'
+    methodology: 'Derived from bounded Jira-native QAira Stories, tests, suites, runs, modules, and Bugs visible in the active project.'
   };
 }
 
@@ -12616,6 +14787,26 @@ async function handleDashboardDesignPreview(method, query, body, context) {
   if (method !== 'POST') fail(405, 'METHOD_NOT_ALLOWED', `${method} is not supported for /analytics/dashboard-design-preview.`);
   const project = context?.qairaAuthorization?.project || await resolveProject({ query, body, context });
   const stakeholder = ['executive', 'product', 'quality', 'automation'].includes(body?.stakeholder) ? body.stakeholder : 'quality';
+  const fullContext = await loadDerivedQualityDashboardContext(project);
+  const scopedContext = body?.release
+    ? portfolioForRelease({ ...fullContext, objects: [] }, body.release)
+    : fullContext;
+  const coveredRequirements = scopedContext.requirements.filter((requirement) => asArray(requirement.test_case_ids).length);
+  const automatedTests = scopedContext.tests.filter((testCase) => testCase.automated === 'yes');
+  const openDefects = scopedContext.defects.filter((defect) => !/done|closed|resolved/i.test(String(defect.status || defect.status_category || '')));
+  const failedRuns = scopedContext.runs.filter((run) => String(run.status || '').toLowerCase() === 'failed');
+  const liveSnapshot = {
+    requirement_count: scopedContext.requirements.length,
+    requirement_coverage_pct: scopedContext.requirements.length ? Math.round((coveredRequirements.length / scopedContext.requirements.length) * 100) : 0,
+    test_case_count: scopedContext.tests.length,
+    automation_coverage_pct: scopedContext.tests.length ? Math.round((automatedTests.length / scopedContext.tests.length) * 100) : 0,
+    suite_count: scopedContext.suites.length,
+    run_count: scopedContext.runs.length,
+    failed_run_count: failedRuns.length,
+    open_defect_count: openDefects.length,
+    module_count: fullContext.modules.length,
+    bounded_query_limit_per_module: 100
+  };
   const dashboard = qualityDashboardTemplate(stakeholder, {
     release: body?.release,
     goal: body?.prompt || body?.goal,
@@ -12638,8 +14829,19 @@ async function handleDashboardDesignPreview(method, query, body, context) {
   }, 'quality-dashboard-design-preview', {
     stakeholder,
     release: body?.release || null,
-    goal: optionalString(body?.goal, 300) || null
-  }, [`jira-project:${project.key}`], 0.82);
+    goal: optionalString(body?.goal || body?.prompt, 1000) || null,
+    authoritative_quality_snapshot: liveSnapshot,
+    available_module_dimensions: fullContext.modules.slice(0, 20).map((module) => ({
+      id: module.id,
+      name: module.name,
+      test_case_count: asArray(module.test_case_ids).length
+    }))
+  }, [
+    `jira-project:${project.key}`,
+    ...coveredRequirements.slice(0, 20).map((item) => `jira-issue:${item.display_id || item.id}`),
+    ...failedRuns.slice(0, 20).map((item) => `jira-issue:${item.display_id || item.id}`),
+    ...openDefects.slice(0, 20).map((item) => `jira-issue:${item.jira_bug_key || item.display_id || item.id}`)
+  ], 0.82);
 }
 
 async function handleRichTextRephrase(method, body, context) {
@@ -12648,13 +14850,43 @@ async function handleRichTextRephrase(method, body, context) {
   if (!plainText.trim()) fail(400, 'CONTENT_REQUIRED', 'Rich-text content is required before AI can rephrase it.');
 
   const project = context?.qairaAuthorization?.project || await resolveProject({ body, context });
+  const registry = await getRegistry(project.key);
+  if (!registry) fail(409, 'QAIRA_NOT_CONFIGURED', `Qaira registry ${REGISTRY_KEY} is missing for ${project.key}.`);
   const entityType = optionalString(body?.entity_type, 80) || 'authoring record';
+  const entityId = optionalString(body?.entity_id, 255) || null;
   const entityTitle = optionalString(body?.entity_title, 255) || null;
   const fieldLabel = optionalString(body?.field_label, 120) || optionalString(body?.aria_label, 120) || 'Description';
+  const appTypeId = optionalString(body?.app_type_id, 255) || null;
+  let authoritativeEntity = null;
+  if (entityId && /test[ -]?case/i.test(entityType)) {
+    const issue = await loadScopedIssue(entityId, project, registry, {
+      typeKeys: ['testCase'],
+      label: 'test case',
+      fields: commonFields(registry, customKeysForType('testCase'))
+    });
+    authoritativeEntity = aiContextRecord('test-cases', await mapTestCase(issue, project, registry));
+  } else if (entityId && /story|requirement/i.test(entityType)) {
+    const requirement = (await requirementRecordsByIds([entityId], project, registry))[0] || null;
+    authoritativeEntity = requirement ? aiContextRecord('requirements', requirement) : null;
+  }
+  const retrievalSources = /test[ -]?case/i.test(entityType)
+    ? ['modules', 'shared-steps', 'knowledge']
+    : /story|requirement/i.test(entityType)
+      ? ['requirements', 'knowledge']
+      : ['knowledge'];
+  const retrievedContext = await retrieveAiModuleContext(project, registry, {
+    intent: [entityTitle, fieldLabel, plainText].filter(Boolean).join('\n'),
+    appTypeId,
+    sources: retrievalSources,
+    limit: 6,
+    maxChars: 7000
+  });
   const safeFallback = `<p>${htmlEscape(plainText.trim())}</p>`;
   const evidence = [
     `jira-project:${project.key}`,
-    entityTitle ? `${entityType}:${entityTitle}` : null
+    authoritativeEntity ? aiContextEvidenceRef(authoritativeEntity) : null,
+    entityTitle ? `${entityType}:${entityTitle}` : null,
+    ...retrievedContext.evidence_refs
   ].filter(Boolean);
 
   return assistedResponse(
@@ -12663,8 +14895,16 @@ async function handleRichTextRephrase(method, body, context) {
     {
       project: { id: String(project.id), key: project.key, name: project.name },
       entity_type: entityType,
+      entity_id: entityId,
       entity_title: entityTitle,
       field_label: fieldLabel,
+      authoritative_entity: authoritativeEntity,
+      related_module_context: retrievedContext.records,
+      context_retrieval: {
+        source_counts: retrievedContext.source_counts,
+        unavailable_sources: retrievedContext.unavailable_sources,
+        bounded: true
+      },
       source_text: plainText,
       source_html: optionalString(body?.content_html, 24_000) || null,
       authoring_contract: [
@@ -12910,14 +15150,14 @@ function summarizeWorkspacePortfolio(project, registry, portfolio) {
       releaseConfidenceIndex
     },
     recommendations: [
-      { title: 'Close requirement coverage gaps', detail: `${requirements.length - covered} requirement(s) do not have linked test cases.` },
+      { title: 'Close Story coverage gaps', detail: `${requirements.length - covered} ${requirements.length - covered === 1 ? 'Story does' : 'Stories do'} not have linked test cases.` },
       { title: 'Increase effective automation coverage', detail: `${tests.length - automated} test case(s) remain manual or unmapped.` },
       { title: 'Triage open defects and failed runs', detail: `${openDefects} open defect(s), ${failedRuns} failed run(s).` }
     ],
     recentRuns: runs.slice(0, 8),
     recentTests: tests.slice(0, 8),
     openBugs: openDefectItems.slice(0, 8),
-    releaseSummary: `Release confidence is ${releaseConfidenceIndex}. Requirement coverage ${coverage}%, effective automation ${automationCoverage}%, open defects ${openDefects}.`
+    releaseSummary: `Release confidence is ${releaseConfidenceIndex}. Story coverage ${coverage}%, effective automation ${automationCoverage}%, open defects ${openDefects}.`
   };
 }
 
@@ -12949,8 +15189,8 @@ export async function processRequirementImportJob({ projectKey, jobId, transacti
   });
   await updateWorkspaceTransaction(project, transactionId || running.transaction_id, {
     status: 'running',
-    title: `Importing ${running.total_rows || 0} requirements`,
-    description: 'Requirement import is running in a Forge async worker.',
+    title: `Importing ${running.total_rows || 0} ${(running.total_rows || 0) === 1 ? 'Story' : 'Stories'}`,
+    description: 'Story import is running in a Forge async worker.',
     metadata: {
       resource: 'requirements',
       total: Number(running.total_rows || 0),
@@ -12962,7 +15202,7 @@ export async function processRequirementImportJob({ projectKey, jobId, transacti
     append_event: {
       phase: 'running',
       level: 'info',
-      message: `Requirement import worker started for ${running.total_rows || 0} row(s).`,
+      message: `Story import worker started for ${running.total_rows || 0} row(s).`,
       details: { import_job_id: running.id, retry_count: Number(retryCount || 0), chunk_count: running.chunk_count || 0 }
     }
   });
@@ -12981,12 +15221,12 @@ export async function processRequirementImportJob({ projectKey, jobId, transacti
       errors: errors.slice(0, 100),
       warnings: asArray(warnings).slice(0, 100),
       completed_at: completedAt,
-      last_error: errors.length && !count ? errors[0]?.message || 'Requirement import failed.' : null
+      last_error: errors.length && !count ? errors[0]?.message || 'Story import failed.' : null
     });
     await updateWorkspaceTransaction(project, transactionId || running.transaction_id, {
       status,
-      title: `Imported ${count} requirements`,
-      description: errors.length ? `${errors.length} row(s) could not be imported.` : 'Requirement import completed.',
+      title: `Imported ${count} ${count === 1 ? 'Story' : 'Stories'}`,
+      description: errors.length ? `${errors.length} row(s) could not be imported.` : 'Story import completed.',
       metadata: {
         resource: 'requirements',
         total: rows.length,
@@ -13004,8 +15244,8 @@ export async function processRequirementImportJob({ projectKey, jobId, transacti
     await safelyCreateAppNotification(project, running.created_by, {
       type: status === 'failed' ? 'import_failed' : 'import_completed',
       preference: 'importExport',
-      title: status === 'failed' ? 'Requirement import failed' : 'Requirement import completed',
-      message: `${count} requirement(s) imported${errors.length ? `; ${errors.length} row(s) need review` : ''}.`,
+      title: status === 'failed' ? 'Story import failed' : 'Story import completed',
+      message: `${count} ${count === 1 ? 'Story' : 'Stories'} imported${errors.length ? `; ${errors.length} row(s) need review` : ''}.`,
       tone: status === 'failed' ? 'error' : errors.length ? 'warning' : 'success',
       target_url: '/testops'
     }, '/requirements/import');
@@ -13021,7 +15261,7 @@ export async function processRequirementImportJob({ projectKey, jobId, transacti
     });
     await updateWorkspaceTransaction(project, transactionId || running.transaction_id, {
       status: 'failed',
-      title: 'Requirement import failed',
+      title: 'Story import failed',
       description: message,
       metadata: {
         resource: 'requirements',
@@ -13037,7 +15277,7 @@ export async function processRequirementImportJob({ projectKey, jobId, transacti
     await safelyCreateAppNotification(project, running.created_by, {
       type: 'import_failed',
       preference: 'importExport',
-      title: 'Requirement import failed',
+      title: 'Story import failed',
       message,
       tone: 'error',
       target_url: '/testops'
@@ -13122,7 +15362,7 @@ export async function processAiRequirementGenerationJob({ projectKey, jobId, ret
   }, 'ai-req-job');
 
   try {
-    const response = await buildRequirementCreationPreview(running.input_payload || {}, {
+    const response = await buildRequirementCreationPreview(project, registry, running.input_payload || {}, {
       contextLimit: 36_000,
       maxCompletionTokens: AI_MAX_COMPLETION_TOKENS,
       repairMaxCompletionTokens: REPAIR_AI_MAX_COMPLETION_TOKENS,
@@ -13151,8 +15391,8 @@ export async function processAiRequirementGenerationJob({ projectKey, jobId, ret
     await safelyCreateAppNotification(project, completed.created_by, {
       type: 'ai_requirements_ready',
       preference: 'aiDesign',
-      title: 'AI requirement drafts ready',
-      message: `${completed.generated_requirements_count || 0} requirement draft(s) are ready for review.`,
+      title: 'AI Story drafts ready',
+      message: `${completed.generated_requirements_count || 0} ${(completed.generated_requirements_count || 0) === 1 ? 'Story draft is' : 'Story drafts are'} ready for review.`,
       tone: 'success',
       target_url: '/requirements'
     }, '/requirements/ai-create-jobs');
@@ -13169,8 +15409,8 @@ export async function processAiRequirementGenerationJob({ projectKey, jobId, ret
     await safelyCreateAppNotification(project, failed.created_by, {
       type: 'ai_requirements_failed',
       preference: 'aiDesign',
-      title: 'AI requirement generation failed',
-      message: failed.last_error || 'AI requirement generation failed. Review the job details and retry.',
+      title: 'AI Story generation failed',
+      message: failed.last_error || 'AI Story generation failed. Review the job details and retry.',
       tone: 'error',
       target_url: '/requirements'
     }, '/requirements/ai-create-jobs');
@@ -13210,7 +15450,7 @@ export async function processAiTestCaseGenerationJob({ projectKey, jobId, retryC
     });
     if (!inputPayload.app_type_id) fail(400, 'APP_TYPE_REQUIRED', 'AI test case generation job is missing an app type.');
     await requireAppType(project, inputPayload.app_type_id);
-    if (!inputPayload.requirement_ids?.length) fail(400, 'REQUIREMENTS_REQUIRED', 'AI test case generation job has no requirements.');
+    if (!inputPayload.requirement_ids?.length) fail(400, 'REQUIREMENTS_REQUIRED', 'AI test case generation job has no Stories.');
 
     const existingCandidateCases = asArray(running.candidate_cases).filter((candidate) => candidate?.title);
     let candidateCases = existingCandidateCases;

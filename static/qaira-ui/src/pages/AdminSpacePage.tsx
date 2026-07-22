@@ -211,7 +211,7 @@ export function AdminSpacePage() {
           <span>{sectionMeta.detail}</span>
           <p>{sectionMeta.description}</p>
         </div>
-        <div className="admin-space-metrics" aria-label="Administration sections">
+        <div className="admin-space-metrics metric-strip page-metric-strip" aria-label="Administration sections" role="group">
           {overviewItems.map((item) => (
             <button
               className={activeSection === item.section ? "admin-space-metric is-active" : "admin-space-metric"}

@@ -59,6 +59,18 @@ test('custom dashboards use one bounded batch request with stakeholder templates
   assert.match(customDashboardSource, /deleteSelectedDashboard/);
 });
 
+test('custom dashboards refresh independently and expose explicit new-tab drill-down controls', () => {
+  assert.match(customDashboardSource, /const refreshGadget = async/);
+  assert.match(customDashboardSource, /api\.analytics\.query\(\{ project_id: projectId, jql: gadget\.jql, gadget, limit: 100 \}\)/);
+  assert.match(customDashboardSource, /activeGadgetRefreshesRef\.current\.size >= 2/);
+  assert.match(customDashboardSource, /activeDashboardScopeRef\.current === requestScope/);
+  assert.match(customDashboardSource, /onRefresh=\{\(\) => void refreshGadget\(gadget\)\}/);
+  assert.match(customDashboardSource, /title="Refresh dashboards"[\s\S]*?<RefreshIcon size=\{20\}/);
+  assert.match(customDashboardSource, /Open \$\{gadget\.title\} drill-down in a new tab/);
+  assert.match(customDashboardSource, /window\.open\([\s\S]*?"_blank", "noopener,noreferrer"\)/);
+  assert.match(stylesSource, /\.quality-gadget-control\.quality-gadget-open/);
+});
+
 test('automation previews and analytics fail closed behind dedicated permissions and feature flags', () => {
   assert.match(accessSource, /qaira\.automation\.preview[\s\S]*automation\.preview/);
   assert.match(accessSource, /qaira\.automation\.analytics[\s\S]*automation\.analytics\.view[\s\S]*dashboard\.view/);
@@ -139,6 +151,17 @@ test('Jira owns user identity while Qaira roles remain explicitly permissioned',
   assert.match(projectSource, /memberRoleIds/);
   assert.match(projectSource, /DEFAULT_NEW_PROJECT_MEMBER_ROLE_ID/);
   assert.match(projectSource, /api\.projectMembers\.update/);
+});
+
+test('project portfolio verdicts present compact supporting evidence', () => {
+  assert.doesNotMatch(projectSource, /Monitor project health, automation maturity, execution confidence and delivery blockers from one workspace\./);
+  assert.match(projectSource, /function PortfolioMetricCard/);
+  assert.match(projectSource, /className="projects-command-evidence"/);
+  assert.match(projectSource, /riskyLatestFailed/);
+  assert.match(projectSource, /readyWithExecutionEvidence/);
+  assert.match(projectSource, /label="Risky Projects"/);
+  assert.match(projectSource, /label="Release Ready"/);
+  assert.match(stylesSource, /\.project-stat-evidence/);
 });
 
 test('Jira administrators have live-verified, system-managed Qaira memberships', () => {

@@ -50,8 +50,8 @@ export function assessRequirementAiReadiness(input: {
     score,
     scoreLabel: "AI input readiness",
     summary: hasCoverage
-      ? "The requirement has reusable coverage that a reviewer can compare with AI-assisted changes."
-      : "AI can help shape this requirement, but linked coverage is still needed for a grounded review.",
+      ? "The story has reusable coverage that a reviewer can compare with AI-assisted changes."
+      : "AI can help shape this story, but linked coverage is still needed for a grounded review.",
     signals: [
       { label: "Existing coverage", value: `${input.linkedCaseCount} linked case${input.linkedCaseCount === 1 ? "" : "s"}`, tone: hasCoverage ? "positive" : "warning" },
       { label: "Source evidence", value: `${input.externalReferenceCount} reference${input.externalReferenceCount === 1 ? "" : "s"}`, tone: hasReferences ? "positive" : "neutral" },
@@ -83,7 +83,7 @@ export function assessTestCaseReviewReadiness(input: {
     signals: [
       { label: "Human review", value: isReviewed ? "Accepted" : normalizedStatus === "pending" ? "Pending" : "Not recorded", tone: isReviewed ? "positive" : "warning" },
       { label: "Step evidence", value: `${input.completeStepCount}/${input.stepCount} complete`, tone: allStepsComplete ? "positive" : "warning" },
-      { label: "Requirement trace", value: `${input.requirementCount} linked`, tone: hasTraceability ? "positive" : "warning" }
+      { label: "Story trace", value: `${input.requirementCount} linked`, tone: hasTraceability ? "positive" : "warning" }
     ],
     gaps: input.suggestions
   };
@@ -109,7 +109,7 @@ export function assessRunEvidenceReadiness(input: {
   const gaps = [
     !total ? "Add test cases to the run before relying on an impact summary." : null,
     total && touched < total ? `${total - touched} scoped case${total - touched === 1 ? " has" : "s have"} no result evidence yet.` : null,
-    !input.linkedRequirementCount ? "Link scoped cases to requirements to explain release impact." : null,
+    !input.linkedRequirementCount ? "Link scoped cases to stories to explain release impact." : null,
     issueCount > 0 && !input.referenceCount ? "Attach bugs or external references to failing cases so the risk can be investigated." : null
   ].filter((item): item is string => Boolean(item));
 
@@ -119,11 +119,11 @@ export function assessRunEvidenceReadiness(input: {
     summary: issueCount
       ? `${issueCount} failed or blocked case${issueCount === 1 ? "" : "s"} require human triage before a release decision.`
       : touched
-        ? "The risk summary is derived from recorded results and linked requirement impact."
+        ? "The risk summary is derived from recorded results and linked story impact."
         : "The impact picture will become useful as case results and trace links are recorded.",
     signals: [
       { label: "Results recorded", value: `${touched}/${total}`, tone: total > 0 && touched === total ? "positive" : "warning" },
-      { label: "Requirement trace", value: `${input.linkedRequirementCount} linked`, tone: input.linkedRequirementCount ? "positive" : "warning" },
+      { label: "Story trace", value: `${input.linkedRequirementCount} linked`, tone: input.linkedRequirementCount ? "positive" : "warning" },
       { label: "Failure references", value: `${input.referenceCount} captured`, tone: issueCount && !input.referenceCount ? "warning" : "neutral" }
     ],
     gaps

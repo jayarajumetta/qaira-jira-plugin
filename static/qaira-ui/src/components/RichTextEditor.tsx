@@ -20,8 +20,12 @@ type RichTextEditorProps = {
   aiRephraseTitle?: string;
   aiRephraseContext?: {
     entityType?: string;
+    entityId?: string;
     entityTitle?: string;
     fieldLabel?: string;
+    appTypeId?: string;
+    requirementId?: string;
+    moduleId?: string;
   };
   "aria-label"?: string;
 };
@@ -469,8 +473,12 @@ export function RichTextEditor({
             content: plainText,
             content_html: currentHtml,
             entity_type: aiRephraseContext?.entityType || "rich-text authoring field",
+            entity_id: aiRephraseContext?.entityId,
             entity_title: aiRephraseContext?.entityTitle,
             field_label: aiRephraseContext?.fieldLabel || aiRephraseTitle.replace(/^Rephrase\s+/i, "").replace(/\s+with AI$/i, ""),
+            app_type_id: aiRephraseContext?.appTypeId,
+            requirement_id: aiRephraseContext?.requirementId,
+            module_id: aiRephraseContext?.moduleId,
             aria_label: ariaLabel
           })).content;
       const nextValue = typeof aiValue === "string" ? aiValue : "";
@@ -487,7 +495,7 @@ export function RichTextEditor({
     } finally {
       setIsRephrasing(false);
     }
-  }, [aiRephraseContext?.entityTitle, aiRephraseContext?.entityType, aiRephraseContext?.fieldLabel, aiRephraseTitle, ariaLabel, disabled, isRephrasing, onAiRephrase, onChange, projectId, value]);
+  }, [aiRephraseContext?.appTypeId, aiRephraseContext?.entityId, aiRephraseContext?.entityTitle, aiRephraseContext?.entityType, aiRephraseContext?.fieldLabel, aiRephraseContext?.moduleId, aiRephraseContext?.requirementId, aiRephraseTitle, ariaLabel, disabled, isRephrasing, onAiRephrase, onChange, projectId, value]);
 
   const controls: Array<{ group: "format" | "insert" | "list" | "ai"; label: ReactNode; title: string; action: () => void; disabled?: boolean }> = [
     { group: "format", label: <strong className="rich-text-tool-glyph">B</strong>, title: "Bold", action: () => runCommand("bold") },

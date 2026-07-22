@@ -64,7 +64,7 @@ export function AiPromptContextPanel({
         fileContext.section
       ]));
       setContextMessage([
-        requirements.length ? `${requirements.length} requirement${requirements.length === 1 ? "" : "s"}` : "",
+        requirements.length ? `${requirements.length} ${requirements.length === 1 ? "story" : "stories"}` : "",
         `${(knowledgePackage.knowledge || []).length} knowledge item${(knowledgePackage.knowledge || []).length === 1 ? "" : "s"}`,
         fileContext.section ? `file context compressed ${fileContext.totalOriginalChars.toLocaleString()}→${fileContext.totalPackedChars.toLocaleString()} chars` : "",
         fileContext.skipped.length ? `Skipped ${fileContext.skipped.length}` : ""
@@ -92,7 +92,7 @@ export function AiPromptContextPanel({
       <div className="ai-smart-context-card">
         <div>
           <strong>Smart context</strong>
-          <span>Pull selected requirements, relevant AI Knowledge, and safe text files into a size-limited prompt pack.</span>
+          <span>Pull selected stories, relevant AI Knowledge, and safe text files into a size-limited prompt pack.</span>
         </div>
         <div className="ai-smart-context-actions">
           <label className="ghost-button compact ai-context-file-button">

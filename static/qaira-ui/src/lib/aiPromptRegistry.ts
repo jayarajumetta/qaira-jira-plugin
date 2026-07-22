@@ -13,7 +13,7 @@ export const AI_PROMPT_REGISTRY: AiPromptRegistryItem[] = [
     key: "ai.case_authoring.full_case",
     label: "Case authoring",
     surface: "Manual test case AI authoring",
-    value: "Generate or improve a reusable manual test case as strict JSON, preserving requirement intent, app type context, step types, and @t test-data tokens."
+    value: "Generate or improve a reusable manual test case as strict JSON, preserving story intent, app type context, step types, and @t test-data tokens."
   },
   {
     key: "ai.case_authoring.step_rephrase",
@@ -23,21 +23,21 @@ export const AI_PROMPT_REGISTRY: AiPromptRegistryItem[] = [
   },
   {
     key: "ai.requirement.optimization",
-    label: "Requirement completion",
-    surface: "Requirement AI completion",
-    value: "Complete weak requirement details with acceptance criteria, risks, assumptions, and linked coverage guidance using available test case and knowledge context."
+    label: "Story completion",
+    surface: "Story AI completion",
+    value: "Complete weak story details with acceptance criteria, risks, assumptions, and linked coverage guidance using available test case and knowledge context."
   },
   {
     key: "ai.execution.analysis",
     label: "Execution analysis",
     surface: "Run failure analysis",
-    value: "Analyze execution evidence and logs, identify likely root causes, impacted requirements, recommended fixes, and concise release risk guidance."
+    value: "Analyze execution evidence and logs, identify likely root causes, impacted stories, recommended fixes, and concise release risk guidance."
   },
   {
     key: "ai.execution.smart_plan",
     label: "Smart execution planning",
     surface: "AI smart run planning",
-    value: "Plan an impact-based execution run from release scope, changed requirements, suite coverage, recent failures, and available case metadata."
+    value: "Plan an impact-based execution run from release scope, changed stories, suite coverage, recent failures, and available case metadata."
   },
   {
     key: "ai.automation.keyword_generation",

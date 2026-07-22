@@ -39,6 +39,7 @@ import { useDomainMetadata } from "../hooks/useDomainMetadata";
 import { useDialogFocus } from "../hooks/useDialogFocus";
 import { useFeatureFlags } from "../hooks/useFeatureFlags";
 import { api } from "../lib/api";
+import { asArray } from "../lib/collectionGuards";
 import { areFeatureFlagsEnabled } from "../lib/featureFlags";
 import { hasPermission } from "../lib/permissions";
 import {
@@ -340,7 +341,7 @@ export function DesignPage() {
     enabled: Boolean(appTypeId)
   });
   const selectedSuiteCaseIds = useMemo(
-    () => (testCasesQuery.data || [])
+    () => asArray(testCasesQuery.data)
       .filter((testCase) => selectedSuiteId && (testCase.suite_ids || []).includes(selectedSuiteId))
       .map((testCase) => testCase.id)
       .sort(),
@@ -409,18 +410,18 @@ export function DesignPage() {
   const deleteStepMutation = useMutation({ mutationFn: api.testSteps.delete });
   const createExecutionMutation = useMutation({ mutationFn: api.executions.create });
 
-  const projects = projectsQuery.data || [];
-  const users = (usersQuery.data || []) as User[];
-  const projectMembers = (projectMembersQuery.data || []) as ProjectMember[];
-  const appTypes = appTypesQuery.data || [];
-  const requirements = requirementsQuery.data || [];
-  const suites = suitesQuery.data || [];
-  const allTestCases = testCasesQuery.data || [];
-  const testCaseModules = testCaseModulesQuery.data || [];
-  const executionResults = executionResultsQuery.data || [];
-  const allTestSteps = selectedSuiteStepsQuery.data || [];
-  const suiteMappings = suiteMappingsQuery.data || [];
-  const steps = stepsQuery.data || [];
+  const projects = asArray(projectsQuery.data);
+  const users = asArray<User>(usersQuery.data);
+  const projectMembers = asArray<ProjectMember>(projectMembersQuery.data);
+  const appTypes = asArray(appTypesQuery.data);
+  const requirements = asArray(requirementsQuery.data);
+  const suites = asArray(suitesQuery.data);
+  const allTestCases = asArray(testCasesQuery.data);
+  const testCaseModules = asArray(testCaseModulesQuery.data);
+  const executionResults = asArray(executionResultsQuery.data);
+  const allTestSteps = asArray(selectedSuiteStepsQuery.data);
+  const suiteMappings = asArray(suiteMappingsQuery.data);
+  const steps = asArray(stepsQuery.data);
   const assigneeOptions = useMemo<SuiteExecutionAssigneeOption[]>(
     () => buildAssigneeOptions(projectMembers, users),
     [projectMembers, users]
@@ -592,7 +593,7 @@ export function DesignPage() {
 
   const selectedProject = projects.find((project) => String(project.id) === String(projectId)) || null;
   const selectedAppType = appTypes.find((appType) => appType.id === appTypeId) || null;
-  const sharedGroups = sharedGroupsQuery.data || [];
+  const sharedGroups = asArray(sharedGroupsQuery.data);
   const selectedSuite = suites.find((suite) => suite.id === selectedSuiteId) || null;
   const syncSuiteSearchParams = (suiteId?: string | null) => {
     const currentSuiteId = searchParams.get("suite") || "";
@@ -1811,9 +1812,9 @@ export function DesignPage() {
         )}
         detailView={(
           <TestCaseList
-            actions={
+            actions={<WorkspaceBackButton label="Back to suite tiles" onClick={closeSuiteWorkspace} />}
+            toolbarActions={
               <>
-                <WorkspaceBackButton label="Back to suite tiles" onClick={closeSuiteWorkspace} />
                 <button
                   className="ghost-button"
                   disabled={!selectedSuite || !canUpdateSuites}
@@ -2292,7 +2293,7 @@ function SuiteSidebar({
                   : !mappedCaseCount
                     ? "Signal: This suite is empty. Add reusable cases so the suite can become executable release coverage."
                     : coverageScore < 70
-                      ? "Signal: Requirement coverage is thin. Link more mapped cases to requirements to improve traceability."
+                      ? "Signal: Story coverage is thin. Link more mapped cases to stories to improve traceability."
                       : automationScore >= 70
                         ? "Signal: Strong suite candidate for scheduled regression because most mapped cases are automated."
                         : "Signal: Traceability is healthy. Automate the highest-repeat cases next to reduce manual run effort.";
@@ -2349,9 +2350,9 @@ function SuiteSidebar({
                       </div>
                       <div className="tile-card-footer">
                         <div className="test-case-readiness-grid">
-                          <div className="test-case-card-progress-row" aria-label={`${coverageScore}% requirement coverage`}>
+                          <div className="test-case-card-progress-row" aria-label={`${coverageScore}% story coverage`}>
                             <div>
-                              <span>Requirement coverage</span>
+                              <span>Story coverage</span>
                               <strong>{mappedCaseCount ? `${coverageScore}%` : "No cases"}</strong>
                             </div>
                             <div className={["test-case-card-progress-track", coverageScore < 70 ? "danger" : ""].filter(Boolean).join(" ")}>
@@ -2401,6 +2402,7 @@ function SuiteSidebar({
 
 function TestCaseList({
   actions,
+  toolbarActions,
   cases,
   activeCaseId,
   searchTerm,
@@ -2435,6 +2437,7 @@ function TestCaseList({
   onViewModeChange
 }: {
   actions?: ReactNode;
+  toolbarActions?: ReactNode;
   cases: TestCase[];
   activeCaseId: string;
   searchTerm: string;
@@ -2470,15 +2473,17 @@ function TestCaseList({
 }) {
   const [draggedCaseId, setDraggedCaseId] = useState("");
   const [selectedCaseIds, setSelectedCaseIds] = useState<string[]>([]);
+  const [expandedModuleNames, setExpandedModuleNames] = useState<string[]>([]);
   const selectedCaseIdSet = useMemo(() => new Set(selectedCaseIds), [selectedCaseIds]);
   const areAllVisibleCasesSelected = Boolean(cases.length) && cases.every((testCase) => selectedCaseIdSet.has(testCase.id));
-  const moduleSummaries = useMemo(() => Object.entries(cases.reduce<Record<string, TestCase[]>>((groups, testCase) => {
+  const moduleGroups = useMemo(() => Object.entries(cases.reduce<Record<string, TestCase[]>>((groups, testCase) => {
     const moduleName = moduleLabelByCaseId[testCase.id] || "Unassigned module";
     groups[moduleName] = groups[moduleName] || [];
     groups[moduleName].push(testCase);
     return groups;
   }, {})).map(([name, moduleCases]) => ({
     name,
+    cases: moduleCases,
     count: moduleCases.length,
     automated: moduleCases.filter((testCase) => testCase.automated === "yes").length,
     withRequirements: moduleCases.filter((testCase) => Boolean(testCase.requirement_ids?.length || testCase.requirement_id)).length
@@ -2486,7 +2491,43 @@ function TestCaseList({
 
   useEffect(() => {
     setSelectedCaseIds([]);
+    setExpandedModuleNames([]);
   }, [canUnlinkCases, selectedSuite?.id]);
+
+  const toggleModuleGroup = (moduleName: string) => {
+    setExpandedModuleNames((current) => current.includes(moduleName)
+      ? current.filter((name) => name !== moduleName)
+      : [...current, moduleName]);
+  };
+
+  const moduleTileEntries = useMemo(() => moduleGroups.flatMap((module) => [
+    { kind: "module" as const, module },
+    ...(expandedModuleNames.includes(module.name)
+      ? module.cases.map((testCase) => ({ kind: "case" as const, testCase }))
+      : [])
+  ]), [expandedModuleNames, moduleGroups]);
+
+  const renderModuleGroupHeader = (module: typeof moduleGroups[number]) => {
+    const isExpanded = expandedModuleNames.includes(module.name);
+    return (
+      <div className="suite-module-group-header">
+        <button
+          aria-expanded={isExpanded}
+          aria-label={`${isExpanded ? "Collapse" : "Expand"} ${module.name}`}
+          className="ghost-button compact module-toggle-button"
+          onClick={() => toggleModuleGroup(module.name)}
+          type="button"
+        >
+          <CollapseExpandIcon isExpanded={isExpanded} />
+        </button>
+        <span className="suite-module-group-icon"><LayersIcon /></span>
+        <span className="suite-module-group-copy">
+          <strong>{module.name}</strong>
+          <small>{module.count} cases · {module.automated} automated · {module.withRequirements} traced</small>
+        </span>
+      </div>
+    );
+  };
 
   const toggleCaseSelection = (testCaseId: string) => {
     setSelectedCaseIds((current) => (
@@ -2494,6 +2535,14 @@ function TestCaseList({
         ? current.filter((id) => id !== testCaseId)
         : [...current, testCaseId]
     ));
+  };
+
+  const toggleModuleCaseSelection = (moduleCases: TestCase[], shouldSelect: boolean) => {
+    const moduleCaseIds = new Set(moduleCases.map((testCase) => testCase.id));
+    setSelectedCaseIds((current) => shouldSelect
+      ? [...new Set([...current, ...moduleCaseIds])]
+      : current.filter((testCaseId) => !moduleCaseIds.has(testCaseId))
+    );
   };
 
   const unlinkSelectedCases = async () => {
@@ -2505,23 +2554,8 @@ function TestCaseList({
   const getRequirementTitleForCase = (testCase: TestCase) =>
     requirements
       .find((item) => (testCase.requirement_ids || [testCase.requirement_id]).includes(item.id))
-      ?.title || "No requirement linked";
-  const suiteCaseListColumns = useMemo<Array<DataTableColumn<TestCase>>>(() => [
-    ...(canUnlinkCases ? [{
-      key: "select",
-      label: "",
-      canToggle: false,
-      render: (testCase: TestCase) => (
-        <label className="checkbox-field suite-case-row-checkbox" onClick={(event) => event.stopPropagation()}>
-          <input
-            aria-label={`Select ${testCase.title}`}
-            checked={selectedCaseIdSet.has(testCase.id)}
-            onChange={() => toggleCaseSelection(testCase.id)}
-            type="checkbox"
-          />
-        </label>
-      )
-    }] : []),
+      ?.title || "No story linked";
+  const suiteCaseDataColumns = useMemo<Array<DataTableColumn<TestCase>>>(() => [
     {
       key: "id",
       label: "ID",
@@ -2532,8 +2566,10 @@ function TestCaseList({
       key: "title",
       label: "Test case",
       canToggle: false,
+      width: 360,
+      minWidth: 320,
       render: (testCase) => (
-        <div className="data-table-multiline">
+        <div className="data-table-multiline" title={testCase.title}>
           <strong>{testCase.title}</strong>
           <span className="data-table-multiline-line">{getRequirementTitleForCase(testCase)}</span>
         </div>
@@ -2605,7 +2641,56 @@ function TestCaseList({
       label: "Runs",
       render: (testCase) => (historyByCaseId[testCase.id] || []).length
     }
-  ], [canUnlinkCases, defaultCaseStatus, historyByCaseId, moduleLabelByCaseId, requirements, selectedCaseIdSet, stepCountByCaseId]);
+  ], [defaultCaseStatus, historyByCaseId, moduleLabelByCaseId, requirements, stepCountByCaseId]);
+
+  const getSuiteCaseListColumns = (module: typeof moduleGroups[number]): Array<DataTableColumn<TestCase>> => {
+    if (!canUnlinkCases) {
+      return suiteCaseDataColumns;
+    }
+
+    const areAllModuleCasesSelected = Boolean(module.cases.length)
+      && module.cases.every((testCase) => selectedCaseIdSet.has(testCase.id));
+    const areSomeModuleCasesSelected = !areAllModuleCasesSelected
+      && module.cases.some((testCase) => selectedCaseIdSet.has(testCase.id));
+
+    return [
+      {
+        key: "select",
+        label: "",
+        preferenceLabel: "Select cases",
+        canToggle: false,
+        canReorder: false,
+        canResize: false,
+        width: 36,
+        headerRender: () => (
+          <label className="data-table-header-checkbox" onClick={(event) => event.stopPropagation()}>
+            <input
+              aria-label={`${areAllModuleCasesSelected ? "Clear" : "Select"} all cases in ${module.name}`}
+              checked={areAllModuleCasesSelected}
+              onChange={(event) => toggleModuleCaseSelection(module.cases, event.target.checked)}
+              ref={(input) => {
+                if (input) {
+                  input.indeterminate = areSomeModuleCasesSelected;
+                }
+              }}
+              type="checkbox"
+            />
+          </label>
+        ),
+        render: (testCase) => (
+          <label className="checkbox-field suite-case-row-checkbox" onClick={(event) => event.stopPropagation()}>
+            <input
+              aria-label={`Select ${testCase.title}`}
+              checked={selectedCaseIdSet.has(testCase.id)}
+              onChange={() => toggleCaseSelection(testCase.id)}
+              type="checkbox"
+            />
+          </label>
+        )
+      },
+      ...suiteCaseDataColumns
+    ];
+  };
 
   return (
     <Panel
@@ -2703,22 +2788,9 @@ function TestCaseList({
               selectedCount={selectedCaseIds.length}
             />
           ) : null}
+          {toolbarActions}
           <button className="primary-button" onClick={onCreateCase} type="button"><AddIcon />New Test Case</button>
         </div>
-
-        {selectedSuite && moduleSummaries.length ? (
-          <div className="suite-module-summary-strip" aria-label="Modules represented in this suite">
-            {moduleSummaries.map((module) => (
-              <div className="suite-module-summary" key={module.name}>
-                <LayersIcon />
-                <span>
-                  <strong>{module.name}</strong>
-                  <small>{module.count} cases · {module.automated} automated · {module.withRequirements} traced</small>
-                </span>
-              </div>
-            ))}
-          </div>
-        ) : null}
 
         <TileBrowserPane className="test-case-library-scroll">
           {isLoading ? <TileCardSkeletonGrid /> : null}
@@ -2735,7 +2807,11 @@ function TestCaseList({
 
           {!isLoading && cases.length && viewMode === "tile" ? (
             <div className="tile-browser-grid">
-              {cases.map((testCase) => {
+              {moduleTileEntries.map((entry) => {
+                if (entry.kind === "module") {
+                  return <div className="suite-module-group-tile-header" key={`module-${entry.module.name}`}>{renderModuleGroupHeader(entry.module)}</div>;
+                }
+                const testCase = entry.testCase;
                 const history = (historyByCaseId[testCase.id] || []).slice(0, 10);
                 const latest = history[0];
                 const requirement = requirements.find((item) => (testCase.requirement_ids || [testCase.requirement_id]).includes(item.id));
@@ -2757,7 +2833,7 @@ function TestCaseList({
                 const aiInsight = isRiskCase
                   ? "Signal: Recent suite evidence includes failed or blocked runs. Review this case before the suite is promoted."
                   : !requirement
-                    ? "Signal: Link this case to a requirement so the suite can report traceable coverage."
+                    ? "Signal: Link this case to a story so the suite can report traceable coverage."
                     : testCase.automated !== "yes" && automationReadiness >= 70
                       ? "Signal: This suite case is a strong automation candidate because its scope and steps are ready."
                       : "Signal: This case is healthy within the suite. Keep it ordered near related validation coverage.";
@@ -2816,9 +2892,9 @@ function TestCaseList({
 	                      <div className="test-case-requirement-block">
 	                        <span className="test-case-requirement-label">
 	                          <TileCardLinkIcon />
-	                          Requirement
+	                          Story
 	                        </span>
-	                        <p>{requirement?.title || "No requirement linked"}</p>
+	                        <p>{requirement?.title || "No story linked"}</p>
 	                      </div>
 			                      <div className="tile-card-title-group test-case-card-title-group test-case-card-title-group--identity">
 		                        <strong>{testCase.title}</strong>
@@ -2871,16 +2947,28 @@ function TestCaseList({
             </div>
           ) : null}
           {!isLoading && cases.length && viewMode === "list" ? (
-            <DataTable
-              columns={suiteCaseListColumns}
-              emptyMessage="No test cases match this suite scope."
-              getRowClassName={(testCase) => (activeCaseId === testCase.id ? "is-active-row" : "")}
-              getRowKey={(testCase) => testCase.id}
-              hideToolbarCopy
-              onRowClick={(testCase) => onSelectCase(testCase.id)}
-              rows={cases}
-              storageKey="qaira:suite-cases:list-columns"
-            />
+            <div className="suite-module-groups">
+              {moduleGroups.map((module) => (
+                <section className="suite-module-group" key={module.name}>
+                  {renderModuleGroupHeader(module)}
+                  {expandedModuleNames.includes(module.name) ? (
+                    <DataTable
+                      columns={getSuiteCaseListColumns(module)}
+                      enableColumnResize
+                      enableHeaderColumnReorder
+                      enableRowSelection={false}
+                      emptyMessage="No test cases match this module scope."
+                      getRowClassName={(testCase) => (activeCaseId === testCase.id ? "is-active-row" : "")}
+                      getRowKey={(testCase) => testCase.id}
+                      hideToolbarCopy
+                      onRowClick={(testCase) => onSelectCase(testCase.id)}
+                      rows={module.cases}
+                      storageKey={`qaira:suite-cases:list-columns:${encodeURIComponent(module.name)}`}
+                    />
+                  ) : null}
+                </section>
+              ))}
+            </div>
           ) : null}
         </TileBrowserPane>
       </div>
@@ -3075,9 +3163,9 @@ function SuiteCaseEditorModal({
                       onChange={(event) => onCaseDraftChange({ ...caseDraft, priority: event.target.value || "3" })}
                     />
                   </FormField>
-                  <FormField label="Requirement">
+                  <FormField label="Story">
                     <select value={caseDraft.requirement_id} onChange={(event) => onCaseDraftChange({ ...caseDraft, requirement_id: event.target.value })}>
-                      <option value="">No requirement</option>
+                      <option value="">No story</option>
                       {requirements.map((requirement) => (
                         <option key={requirement.id} value={requirement.id}>{requirement.title}</option>
                       ))}

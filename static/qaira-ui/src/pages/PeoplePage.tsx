@@ -1,12 +1,13 @@
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useSearchParams } from "react-router-dom";
-import { AddIcon, ExportIcon } from "../components/AppIcons";
+import { AddIcon, CollapseExpandIcon, ExportIcon } from "../components/AppIcons";
 import { api } from "../lib/api";
 import { CatalogSearchFilter } from "../components/CatalogSearchFilter";
 import { CatalogSelectionControls } from "../components/CatalogSelectionControls";
 import { CatalogViewToggle } from "../components/CatalogViewToggle";
 import { DataTable, type DataTableColumn } from "../components/DataTable";
+import { DialogCloseButton } from "../components/DialogCloseButton";
 import { FormField } from "../components/FormField";
 import { InfoTooltip } from "../components/InfoTooltip";
 import { PageHeader } from "../components/PageHeader";
@@ -100,6 +101,7 @@ export function PeoplePage({
   const [userSearch, setUserSearch] = useState("");
   const [roleSearch, setRoleSearch] = useState("");
   const [createRoleDraft, setCreateRoleDraft] = useState(EMPTY_ROLE_DRAFT);
+  const roleDrawerRef = useRef<HTMLElement | null>(null);
   const selectedRolePermissions = useQuery({
     queryKey: ["roles", selectedRoleId, "permissions"],
     queryFn: () => api.roles.rolePermissions(selectedRoleId),
@@ -571,7 +573,7 @@ export function PeoplePage({
                     onClick={() => setActiveGroupKey((current) => current === group.key ? "" : group.key)}
                     type="button"
                   >
-                    <span aria-hidden="true" className="permission-group-chevron">{isExpanded ? "-" : "+"}</span>
+                    <span aria-hidden="true" className="permission-group-chevron"><CollapseExpandIcon isExpanded={isExpanded} /></span>
                     <span className="permission-group-copy">
                       <strong>{group.label}</strong>
                       <span>{selectedCount} of {groupCodes.length} selected</span>
@@ -652,6 +654,65 @@ export function PeoplePage({
     setRoleDraft(EMPTY_ROLE_DRAFT);
     syncPeopleSearchParams("roles", null, null);
   };
+
+  useEffect(() => {
+    if (!selectedRole) {
+      return;
+    }
+
+    const drawer = roleDrawerRef.current;
+    const previouslyFocusedElement = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const animationFrame = window.requestAnimationFrame(() => drawer?.focus());
+    const previousBodyOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+
+    const handleDrawerKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeRoleWorkspace();
+        return;
+      }
+
+      if (event.key !== "Tab" || !drawer) {
+        return;
+      }
+
+      const focusableElements = Array.from(drawer.querySelectorAll<HTMLElement>(
+        'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])'
+      )).filter((element) => !element.hasAttribute("hidden") && element.getClientRects().length > 0);
+
+      if (!focusableElements.length) {
+        event.preventDefault();
+        drawer.focus();
+        return;
+      }
+
+      const firstElement = focusableElements[0];
+      const lastElement = focusableElements[focusableElements.length - 1];
+      const activeElement = document.activeElement;
+
+      if (event.shiftKey && (activeElement === firstElement || activeElement === drawer)) {
+        event.preventDefault();
+        lastElement.focus();
+      } else if (!event.shiftKey && (activeElement === lastElement || !activeElement || !drawer.contains(activeElement))) {
+        event.preventDefault();
+        firstElement.focus();
+      }
+    };
+
+    document.addEventListener("keydown", handleDrawerKeyDown);
+
+    return () => {
+      window.cancelAnimationFrame(animationFrame);
+      document.removeEventListener("keydown", handleDrawerKeyDown);
+      document.body.style.overflow = previousBodyOverflow;
+      window.requestAnimationFrame(() => {
+        if (previouslyFocusedElement?.isConnected) {
+          previouslyFocusedElement.focus();
+        }
+      });
+    };
+  }, [selectedRole?.id]);
 
   const downloadJsonFile = (filename: string, value: unknown) => {
     const blob = new Blob([JSON.stringify(value, null, 2)], { type: "application/json" });
@@ -929,9 +990,8 @@ export function PeoplePage({
           isDetailOpen={Boolean(selectedUser)}
         />
       ) : (
-        <WorkspaceMasterDetail
-          className="people-roles-workspace"
-          browseView={(
+        <>
+          <div aria-hidden={selectedRole ? "true" : undefined} className="people-role-catalog">
             <Panel
               title="Roles"
               titleVariant="eyebrow"
@@ -1034,84 +1094,114 @@ export function PeoplePage({
               {!isRoleCatalogLoading && !roleItems.length ? <div className="empty-state compact">No roles defined yet.</div> : null}
               {!isRoleCatalogLoading && roleItems.length > 0 && !filteredRoleItems.length ? <div className="empty-state compact">No roles match the current search.</div> : null}
             </Panel>
-          )}
-          detailView={(
-            <Panel
-              actions={<WorkspaceBackButton label="Back to role tiles" onClick={closeRoleWorkspace} />}
-              title="Selected role"
-              subtitle={selectedRole ? "Adjust the role name in place." : "Create a role to start reusing it in memberships."}
-            >
-              {selectedRole ? (
-                <div className="detail-stack">
-                  <div className="detail-summary">
-                    <strong>{selectedRole.name}</strong>
-                    <span>{rolePermissionDraft.length} permissions selected</span>
-                  </div>
-                  {canManageRoles ? (
-                    <>
-                      <form
-                        className="form-grid"
-                        onSubmit={(event) => {
-                          event.preventDefault();
-                          updateRole.mutate({ id: selectedRole.id, input: { name: roleDraft.name, permission_codes: rolePermissionDraft } });
-                        }}
-                      >
-                        <FormField label="Role name">
-                          <input
-                            disabled={selectedRole.id === "jira-admin"}
-                            name="name"
-                            value={roleDraft.name}
-                            onChange={(event) => setRoleDraft({ name: event.target.value })}
-                          />
-                        </FormField>
-                        <div className="action-row">
-                          <button className="primary-button" disabled={updateRole.isPending || selectedRole.id === "jira-admin"} type="submit">
-                            {updateRole.isPending ? "Saving…" : "Save role"}
-                          </button>
-                          <button className="ghost-button danger" disabled={Boolean(selectedRole.system) || deleteRole.isPending || updateRole.isPending} onClick={() => void confirmDeleteRole(selectedRole)} type="button">
-                            Delete role
-                          </button>
-                        </div>
-                      </form>
+          </div>
 
-                      <div className="role-permission-editor role-permission-editor--edit people-role-existing-permissions">
+          {selectedRole ? (
+            <div className="people-role-drawer-backdrop" onClick={closeRoleWorkspace} role="presentation">
+              <aside
+                aria-describedby="role-details-description"
+                aria-labelledby="role-details-title"
+                aria-modal="true"
+                className="people-role-drawer"
+                onClick={(event) => event.stopPropagation()}
+                ref={roleDrawerRef}
+                role="dialog"
+                tabIndex={-1}
+              >
+                <header className="people-role-drawer-header">
+                  <div className="people-role-drawer-heading">
+                    <p className="dialog-context-label">Role details</p>
+                    <h2 className="dialog-title" id="role-details-title">{selectedRole.name}</h2>
+                    <p id="role-details-description">Review assignments, rename the role, and tune its project permissions.</p>
+                  </div>
+                  <DialogCloseButton label={`Close ${selectedRole.name} role details`} onClick={closeRoleWorkspace} />
+                </header>
+
+                <div className="people-role-drawer-body">
+                  <div className="people-role-drawer-summary" aria-label="Role summary">
+                    <div>
+                      <span>Assigned users</span>
+                      <strong>{userCountByRoleName[selectedRole.name] || 0}</strong>
+                    </div>
+                    <div>
+                      <span>Permissions</span>
+                      <strong>{selectedRolePermissions.isLoading ? "…" : rolePermissionDraft.length}</strong>
+                    </div>
+                    <div>
+                      <span>Management</span>
+                      <strong>{selectedRole.system ? "System" : canManageRoles ? "Editable" : "Read only"}</strong>
+                    </div>
+                  </div>
+
+                  {canManageRoles ? (
+                    <div className="detail-stack people-role-drawer-content">
+                      <section className="people-role-drawer-section" aria-labelledby="role-identity-title">
                         <div className="detail-summary">
-                          <strong>Permissions</strong>
-                          <span>Bind feature access and CRUD actions to this role. Changes apply anywhere this role is assigned.</span>
+                          <strong id="role-identity-title">Role identity</strong>
+                          <span>Use a concise name that is meaningful wherever project access is assigned.</span>
                         </div>
-                        {permissions.isLoading || selectedRolePermissions.isLoading ? <TileCardSkeletonGrid /> : renderPermissionMatrix(rolePermissionDraft, "edit")}
-                        <div className="action-row">
-                          <button
-                            className="primary-button"
-                            disabled={selectedRole.id === "jira-admin" || replaceRolePermissions.isPending || updateRole.isPending || selectedRolePermissions.isLoading}
-                            onClick={() => replaceRolePermissions.mutate({ id: selectedRole.id, permissionCodes: rolePermissionDraft })}
-                            type="button"
-                          >
-                            {replaceRolePermissions.isPending ? "Saving permissions…" : "Save permissions"}
-                          </button>
-                          <button
-                            className="ghost-button"
-                            disabled={selectedRole.id === "jira-admin" || replaceRolePermissions.isPending || selectedRolePermissions.isLoading}
-                            onClick={() => setRolePermissionDraft((selectedRolePermissions.data || []).map((permission) => permission.code))}
-                            type="button"
-                          >
-                            Reset
-                          </button>
+                        <form
+                          className="form-grid"
+                          onSubmit={(event) => {
+                            event.preventDefault();
+                            updateRole.mutate({ id: selectedRole.id, input: { name: roleDraft.name, permission_codes: rolePermissionDraft } });
+                          }}
+                        >
+                          <FormField label="Role name">
+                            <input
+                              disabled={selectedRole.id === "jira-admin"}
+                              name="name"
+                              value={roleDraft.name}
+                              onChange={(event) => setRoleDraft({ name: event.target.value })}
+                            />
+                          </FormField>
+                          <div className="action-row">
+                            <button className="primary-button" disabled={updateRole.isPending || selectedRole.id === "jira-admin"} type="submit">
+                              {updateRole.isPending ? "Saving…" : "Save role"}
+                            </button>
+                            <button className="ghost-button danger" disabled={Boolean(selectedRole.system) || deleteRole.isPending || updateRole.isPending} onClick={() => void confirmDeleteRole(selectedRole)} type="button">
+                              Delete role
+                            </button>
+                          </div>
+                        </form>
+                      </section>
+
+                      <section className="people-role-drawer-section people-role-drawer-permissions" aria-labelledby="role-permissions-title">
+                        <div className="role-permission-editor role-permission-editor--edit people-role-existing-permissions">
+                          <div className="detail-summary">
+                            <strong id="role-permissions-title">Permissions</strong>
+                            <span>Bind feature access and CRUD actions to this role. Changes apply anywhere this role is assigned.</span>
+                          </div>
+                          {permissions.isLoading || selectedRolePermissions.isLoading ? <TileCardSkeletonGrid /> : renderPermissionMatrix(rolePermissionDraft, "edit")}
+                          <div className="action-row people-role-drawer-save-row">
+                            <button
+                              className="primary-button"
+                              disabled={selectedRole.id === "jira-admin" || replaceRolePermissions.isPending || updateRole.isPending || selectedRolePermissions.isLoading}
+                              onClick={() => replaceRolePermissions.mutate({ id: selectedRole.id, permissionCodes: rolePermissionDraft })}
+                              type="button"
+                            >
+                              {replaceRolePermissions.isPending ? "Saving permissions…" : "Save permissions"}
+                            </button>
+                            <button
+                              className="ghost-button"
+                              disabled={selectedRole.id === "jira-admin" || replaceRolePermissions.isPending || selectedRolePermissions.isLoading}
+                              onClick={() => setRolePermissionDraft((selectedRolePermissions.data || []).map((permission) => permission.code))}
+                              type="button"
+                            >
+                              Reset
+                            </button>
+                          </div>
                         </div>
-                      </div>
-                    </>
+                      </section>
+                    </div>
                   ) : (
                     <div className="empty-state compact">Read-only access. Ask an admin to change role definitions.</div>
                   )}
                 </div>
-              ) : (
-                <div className="empty-state compact">No role selected.</div>
-              )}
-            </Panel>
-          )}
-          isDetailOpen={Boolean(selectedRole)}
-          variant="split"
-        />
+              </aside>
+            </div>
+          ) : null}
+        </>
       )}
 
       {isCreateRoleModalOpen ? (

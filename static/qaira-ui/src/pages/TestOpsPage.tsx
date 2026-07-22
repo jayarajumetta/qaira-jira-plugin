@@ -168,7 +168,7 @@ function formatRecorderDisplayMode(value?: string | null) {
 }
 
 function isManualCase(testCase: TestCase) {
-  return testCase.automated !== "yes";
+  return testCase.automated === "no";
 }
 
 export function TestOpsPage({ initialView = "batch-process" }: { initialView?: TestOpsView } = {}) {
@@ -231,7 +231,7 @@ export function TestOpsPage({ initialView = "batch-process" }: { initialView?: T
   });
   const testCasesQuery = useQuery({
     queryKey: ["test-cases", "automation-builder", appTypeId],
-    queryFn: () => api.testCases.list({ app_type_id: appTypeId }),
+    queryFn: () => api.testCases.list({ app_type_id: appTypeId, projection: "summary" }),
     enabled: Boolean(appTypeId && session && view === "automation-builder")
   });
   const learningCacheQuery = useQuery({
@@ -288,6 +288,10 @@ export function TestOpsPage({ initialView = "batch-process" }: { initialView?: T
   }, [appTypeId, appTypes, appTypesQuery.isPending, projectId, setAppTypeId]);
 
   const manualCases = useMemo(() => testCases.filter(isManualCase), [testCases]);
+  const unknownAutomationCases = useMemo(
+    () => testCases.filter((testCase) => testCase.automated !== "yes" && testCase.automated !== "no"),
+    [testCases]
+  );
   const batchTransactions = useMemo(
     () => (transactionsQuery.data || []).filter(isBatchProcessTransaction),
     [transactionsQuery.data]
@@ -593,9 +597,17 @@ export function TestOpsPage({ initialView = "batch-process" }: { initialView?: T
         throw new Error("Select an app type first.");
       }
 
+      const manualCaseIds = new Set(manualCases.map((testCase) => testCase.id));
+      const requestedCaseIds = selectedCaseIds.length
+        ? selectedCaseIds.filter((testCaseId) => manualCaseIds.has(testCaseId))
+        : manualCases.map((testCase) => testCase.id);
+      if (!requestedCaseIds.length) {
+        throw new Error("No verified manual cases are available. Open cases with an unknown execution type before queueing automation.");
+      }
+
       return api.testCases.buildAutomationBatch({
         app_type_id: appTypeId,
-        test_case_ids: selectedCaseIds,
+        test_case_ids: requestedCaseIds,
         start_url: startUrl || undefined,
         additional_context: builderContext || undefined
       });
@@ -752,6 +764,11 @@ export function TestOpsPage({ initialView = "batch-process" }: { initialView?: T
             {!testCasesQuery.isLoading && appTypeId && !manualCases.length ? (
               <div className="empty-state compact">No manual cases are waiting for automation in this app type.</div>
             ) : null}
+            {!testCasesQuery.isLoading && unknownAutomationCases.length ? (
+              <div className="inline-message">
+                {unknownAutomationCases.length} legacy case{unknownAutomationCases.length === 1 ? " has" : "s have"} an unknown execution type and {unknownAutomationCases.length === 1 ? "is" : "are"} excluded until opened and saved.
+              </div>
+            ) : null}
             {manualCases.length ? (
               <div className="testops-case-picker">
                 {manualCases.map((testCase) => {
@@ -855,7 +872,7 @@ export function TestOpsPage({ initialView = "batch-process" }: { initialView?: T
                 </button>
 	                <button
 	                  className="ghost-button"
-	                  disabled={!canBuildAutomation || !canUseAutomationAi || !appTypeId || buildBatchAutomation.isPending}
+	                  disabled={!canBuildAutomation || !canUseAutomationAi || !appTypeId || !manualCases.length || buildBatchAutomation.isPending}
 	                  onClick={() => buildBatchAutomation.mutate()}
 	                  type="button"
                 >

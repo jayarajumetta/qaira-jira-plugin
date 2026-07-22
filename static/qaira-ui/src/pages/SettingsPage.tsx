@@ -3,7 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import { useAuth } from "../auth/AuthContext";
 import { useFeatureFlags } from "../hooks/useFeatureFlags";
 import { useLocalization } from "../context/LocalizationContext";
-import { AddIcon, CopyIcon, SaveIcon, TrashIcon } from "../components/AppIcons";
+import { AddIcon, CollapseExpandIcon, CopyIcon, SaveIcon, TrashIcon } from "../components/AppIcons";
 import { LoadingState } from "../components/LoadingState";
 import { PageHeader } from "../components/PageHeader";
 import { Panel } from "../components/Panel";
@@ -43,7 +43,7 @@ import {
 const DEFAULT_API_KEY_SCOPE_OPTIONS: ApiKeyScopeOption[] = [
   { value: "user", label: "User access", description: "Default. Uses your current user permissions." },
   { value: "read", label: "Read only", description: "GET and HEAD requests only." },
-  { value: "design", label: "Design", description: "Requirements, test cases, suites, steps, and data." },
+  { value: "design", label: "Design", description: "Stories, test cases, suites, steps, and data." },
   { value: "automation", label: "Automation", description: "Automation build, object repository, recorder, and workflows." },
   { value: "runs", label: "Runs", description: "Executions, results, schedules, reports, and bugs." },
   { value: "environment", label: "Environment", description: "Environments, configurations, app types, and data sets." },
@@ -459,7 +459,7 @@ export function SettingsPage({ embedded = false }: { embedded?: boolean } = {}) 
               <span className="eyebrow">{eyebrow}</span>
               <strong>{title}</strong>
             </span>
-            <span aria-hidden="true" className="settings-section-toggle-icon">{isExpanded ? "-" : "+"}</span>
+            <span aria-hidden="true" className="settings-section-toggle-icon"><CollapseExpandIcon isExpanded={isExpanded} /></span>
           </button>
           {options.actions ? <div className="settings-section-actions">{options.actions}</div> : null}
         </div>
@@ -723,7 +723,7 @@ export function SettingsPage({ embedded = false }: { embedded?: boolean } = {}) 
 	        ), { adminOnly: true }) : null}
 
         {renderSettingsSection("aiPromptMapping", "AI", "Prompt key mapping", (
-          <Panel title="AI prompt registry" subtitle={canUseAutomationWorkspace ? "Central keys for AI prompt surfaces used by requirement, test design, automation, execution, and test data flows." : "Central keys for enabled AI requirement, test design, execution, and test data surfaces."}>
+          <Panel title="AI prompt registry" subtitle={canUseAutomationWorkspace ? "Central keys for AI prompt surfaces used by story, test design, automation, execution, and test data flows." : "Central keys for enabled AI story, test design, execution, and test data surfaces."}>
             <div className="settings-prompt-grid">
               {visibleAiPromptRegistry.map((prompt) => (
                 <article className="settings-prompt-card" key={prompt.key}>
@@ -796,7 +796,7 @@ export function SettingsPage({ embedded = false }: { embedded?: boolean } = {}) 
                 ["aiDesign", "AI design previews and accepted generated cases"],
                 ["aiAutomation", "AI automation build and recorder events"],
                 ["importExport", "Import, export, backup, and sync jobs"],
-                ["requirementChanges", "Requirement creation, completion, and coverage changes"],
+                ["requirementChanges", "Story creation, completion, and coverage changes"],
                 ["testCaseChanges", "Test case, suite, and shared step changes"],
                 ["integrationChanges", "Integration activation, import, and credential changes"],
                 ["userRoleChanges", "User, role, and permission changes"],

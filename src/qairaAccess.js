@@ -32,19 +32,19 @@ export const PERMISSION_GROUPS = [
   },
   {
     key: 'requirements',
-    label: 'Requirements',
+    label: 'Stories',
     permissions: [
-      read('requirement.view', 'View Jira requirements.'),
-      write('requirement.create', 'Create Jira requirements.'),
-      write('requirement.update', 'Update Jira requirements.'),
-      manage('requirement.delete', 'Delete Jira requirements.'),
-      write('requirement.import', 'Import requirement records.'),
-      read('requirement.export', 'Export requirement records.'),
-      write('requirement.ai', 'Generate requirement and test-design previews.'),
-      read('requirement_iteration.view', 'View requirement iterations.'),
-      write('requirement_iteration.create', 'Create requirement iterations.'),
-      write('requirement_iteration.update', 'Update requirement iterations.'),
-      manage('requirement_iteration.delete', 'Delete requirement iterations.')
+      read('requirement.view', 'View Jira Stories.'),
+      write('requirement.create', 'Create Jira Stories.'),
+      write('requirement.update', 'Update Jira Stories.'),
+      manage('requirement.delete', 'Delete Jira Stories.'),
+      write('requirement.import', 'Import Story records.'),
+      read('requirement.export', 'Export Story records.'),
+      write('requirement.ai', 'Generate Story and test-design previews.'),
+      read('requirement_iteration.view', 'View Jira Sprints in the Stories workspace.'),
+      write('requirement_iteration.create', 'Create Jira Sprints in the Stories workspace.'),
+      write('requirement_iteration.update', 'Update Jira Sprints in the Stories workspace.'),
+      manage('requirement_iteration.delete', 'Delete Jira Sprints in the Stories workspace.')
     ]
   },
   {
@@ -128,7 +128,7 @@ export const PERMISSION_GROUPS = [
       write('schedule.update', 'Update execution schedules.'),
       manage('schedule.delete', 'Delete execution schedules.'),
       write('schedule.run', 'Start scheduled runs.'),
-      write('attachment.create', 'Attach evidence to Jira requirements, bugs, tests, and runs.'),
+      write('attachment.create', 'Attach evidence to Jira Stories, bugs, tests, and runs.'),
       read('attachment.view', 'View Jira-native evidence attachments.'),
       manage('attachment.delete', 'Delete Jira-native evidence attachments.')
     ]
@@ -153,7 +153,7 @@ export const PERMISSION_GROUPS = [
     label: 'Operations',
     permissions: [
       read('notification.view', 'View notifications.'),
-      write('notification.manage', 'Update notification state.'),
+      write('notification.manage', 'Mark read and delete personal notifications.'),
       read('transaction.view', 'View workspace transaction history.'),
       read('transaction.artifact.download', 'Download transaction artifacts.'),
       read('ops.view', 'View operational telemetry.'),
@@ -206,11 +206,11 @@ export const FEATURE_GROUPS = [
   {
     key: 'manual',
     label: 'Manual test management',
-    description: 'Requirements, cases, reusable steps, suites, runs, bugs, environments, and test data.',
+    description: 'Stories, cases, reusable steps, suites, runs, bugs, environments, and test data.',
     features: [
       {
         key: 'qaira.manual.requirements',
-        label: 'Requirements',
+        label: 'Stories',
         routes: ['/requirements'],
         permissions: [
           'requirement.view', 'requirement.create', 'requirement.update', 'requirement.delete',
@@ -318,7 +318,7 @@ export const FEATURE_GROUPS = [
     label: 'AI and agentic workflows',
     description: 'Human-reviewed AI design, knowledge, and workflow capabilities.',
     features: [
-      { key: 'qaira.ai.requirement_design', label: 'Requirement design assistance', routes: ['/requirements'], permissions: ['requirement.ai'] },
+      { key: 'qaira.ai.requirement_design', label: 'Story design assistance', routes: ['/requirements'], permissions: ['requirement.ai'] },
       { key: 'qaira.ai.test_authoring', label: 'Test authoring assistance', routes: ['/test-cases'], permissions: ['testcase.ai'] },
       { key: 'qaira.ai.test_data_generation', label: 'Synthetic test data generation', routes: ['/test-data'], permissions: ['data.ai'] },
       { key: 'qaira.ai.content_rephrase', label: 'Rich-text AI rephrase', routes: ['/requirements', '/test-cases', '/design', '/issues', '/automation', '/shared-steps', '/test-environments', '/test-data'], permissions: ['content.ai'] },
@@ -419,7 +419,8 @@ export function permissionForRequest(pathname, method = 'GET') {
   if (pathname === '/test-data-sets/ai-generate-preview') return 'data.ai';
   if (pathname === '/executions/smart-plan-preview') return 'run.ai';
   if (pathname === '/requirements/ai-create-jobs' || /^\/requirements\/ai-create-jobs\/[^/]+$/.test(pathname)) return 'requirement.ai';
-  if (pathname === '/feedback/ai-draft-preview') return 'feedback.manage';
+  if (pathname === '/feedback/ai-draft-preview' || pathname === '/feedback/ai-triage-preview') return 'feedback.manage';
+  if (pathname === '/feedback/export') return 'feedback.view';
   if (pathname === '/feedback/create-metadata') return 'feedback.manage';
   if (/^\/feedback\/[^/]+\/edit-metadata$/.test(pathname)) return 'feedback.manage';
   if (pathname === '/requirements/import') return 'requirement.import';
@@ -452,6 +453,7 @@ export function permissionForRequest(pathname, method = 'GET') {
   if (/^\/executions\/[^/]+\/cases\/[^/]+\/ai-analysis$/.test(pathname)) return 'run.ai';
   if (/^\/executions\/[^/]+\/ai-failure-clusters$/.test(pathname)) return 'run.ai';
   if (/^\/requirements\/[^/]+\/ai-impact-preview$/.test(pathname)) return 'requirement.ai';
+  if (pathname === '/requirements/ai-gherkin-preview') return 'requirement.ai';
   if (/^\/requirements\/[^/]+\/(?:design-test-cases-preview|(?:ai-)?optimize-preview|generate-test-cases)$/.test(pathname)) return 'requirement.ai';
   if (/^\/requirements\/[^/]+\/design-test-cases-accept$/.test(pathname)) return 'testcase.create';
   if (/^\/test-cases\/[^/]+\/ai-impact-preview$/.test(pathname)) return 'testcase.ai';

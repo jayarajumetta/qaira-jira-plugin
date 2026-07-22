@@ -12,6 +12,7 @@ export const queryKeys = {
   projects: () => ["projects"] as const,
   appTypes: (projectId: string) => ["app-types", projectId] as const,
   requirements: (projectId = "") => ["requirements", projectId] as const,
+  requirementsPages: (projectId = "") => ["requirements", projectId, "pages"] as const,
   roles: (projectId = "") => ["roles", projectId] as const,
   settings: {
     apiKeys: () => ["settings", "api-keys"] as const,

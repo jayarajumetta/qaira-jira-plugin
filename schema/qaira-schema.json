@@ -361,7 +361,7 @@
     },
     {
       "key": "requirementCoverageState",
-      "name": "Qaira Requirement Coverage State",
+      "name": "Qaira Story Coverage State",
       "alias": "select",
       "issueTypeKeys": [
         "testCase"
@@ -371,7 +371,7 @@
         "Unlinked",
         "Not Applicable"
       ],
-      "description": "Whether the test is linked to a Jira requirement."
+      "description": "Whether the test is linked to a Jira Story."
     },
     {
       "key": "stepsCount",
@@ -792,7 +792,7 @@
       "issueTypeKeys": [
         "testSuite"
       ],
-      "description": "Suite requirement coverage percentage."
+      "description": "Percentage of suite Stories covered by tests."
     },
     {
       "key": "suiteHealth",
@@ -943,23 +943,23 @@
     },
     {
       "key": "requirementCount",
-      "name": "Qaira Requirement Count",
+      "name": "Qaira Story Count",
       "alias": "number",
       "issueTypeKeys": [
         "testPlan",
         "qualityGate"
       ],
-      "description": "Requirement count in scope."
+      "description": "Story count in scope."
     },
     {
       "key": "coveredRequirementCount",
-      "name": "Qaira Covered Requirement Count",
+      "name": "Qaira Covered Story Count",
       "alias": "number",
       "issueTypeKeys": [
         "testPlan",
         "qualityGate"
       ],
-      "description": "Covered requirement count."
+      "description": "Covered Story count."
     },
     {
       "key": "currentCoveragePct",
@@ -973,13 +973,13 @@
     },
     {
       "key": "criticalRequirementCoveragePct",
-      "name": "Qaira Critical Requirement Coverage %",
+      "name": "Qaira Critical Story Coverage %",
       "alias": "number",
       "issueTypeKeys": [
         "testPlan",
         "qualityGate"
       ],
-      "description": "Critical requirement coverage percentage."
+      "description": "Critical Story coverage percentage."
     },
     {
       "key": "manualScopeCount",
@@ -2074,7 +2074,7 @@
       "issueTypeKeys": [
         "requirements"
       ],
-      "description": "Requirement-level coverage percentage rollup."
+      "description": "Story-level coverage percentage rollup."
     },
     {
       "key": "reqTestCount",
@@ -2105,7 +2105,7 @@
     },
     {
       "key": "reqLastRunStatus",
-      "name": "Qaira Requirement Last Run Status",
+      "name": "Qaira Story Last Run Status",
       "alias": "select",
       "issueTypeKeys": [
         "requirements"
@@ -2119,7 +2119,7 @@
         "Flaky",
         "Unknown"
       ],
-      "description": "Latest linked-test status for requirement."
+      "description": "Latest linked-test status for the Story."
     },
     {
       "key": "reqLastTestedDate",
@@ -2141,7 +2141,7 @@
     },
     {
       "key": "reqStaleTestCount",
-      "name": "Qaira Requirement Stale Test Count",
+      "name": "Qaira Story Stale Test Count",
       "alias": "number",
       "issueTypeKeys": [
         "requirements"
@@ -2150,12 +2150,12 @@
     },
     {
       "key": "reqRiskScore",
-      "name": "Qaira Requirement Risk Score",
+      "name": "Qaira Story Risk Score",
       "alias": "number",
       "issueTypeKeys": [
         "requirements"
       ],
-      "description": "Requirement risk score."
+      "description": "Story risk score."
     },
     {
       "key": "reqAiCoverageSummary",
@@ -2164,11 +2164,13 @@
       "issueTypeKeys": [
         "requirements"
       ],
-      "description": "AI coverage summary on requirement issues."
+      "description": "AI coverage summary on Story issues."
     }
   ],
   "issueProperties": {
+    "requirement": "qaira.requirement.v1",
     "testCase": "qaira.testCaseSpec.v1",
+    "testCaseSummary": "qaira.testCaseSummary.v1",
     "testCaseVersion": "qaira.testCaseVersion.v1",
     "suite": "qaira.suiteDefinition.v1",
     "plan": "qaira.planScope.v1",
@@ -2183,12 +2185,12 @@
     {
       "key": "releaseConfidence",
       "name": "Release Confidence Index",
-      "formula": "100 - 0.25*UncoveredCriticalRequirementPct - 0.20*FailedCriticalTestPct - 0.15*OpenBlockerCriticalDefectScore - 0.10*StaleCriticalTestPct - 0.10*FlakyCriticalTestPct - 0.10*AutomationGapPct - 0.05*LocatorInstabilityPct - 0.05*ExecutionSlippagePct"
+      "formula": "100 - 0.25*UncoveredCriticalStoryPct - 0.20*FailedCriticalTestPct - 0.15*OpenBlockerCriticalDefectScore - 0.10*StaleCriticalTestPct - 0.10*FlakyCriticalTestPct - 0.10*AutomationGapPct - 0.05*LocatorInstabilityPct - 0.05*ExecutionSlippagePct"
     },
     {
       "key": "requirementCoverage",
-      "name": "Requirement Coverage %",
-      "formula": "Covered requirements / testable requirements * 100"
+      "name": "Story Coverage %",
+      "formula": "Covered Stories / testable Stories * 100"
     },
     {
       "key": "effectiveAutomationCoverage",
@@ -2208,11 +2210,11 @@
     {
       "key": "qaDebt",
       "name": "QA Debt Index",
-      "formula": "Weighted stale tests + duplicate tests + flaky tests + unautomated critical tests + unstable locators + uncovered requirements + unreviewed AI suggestions"
+      "formula": "Weighted stale tests + duplicate tests + flaky tests + unautomated critical tests + unstable locators + uncovered Stories + unreviewed AI suggestions"
     }
   ],
   "agents": [
-    "Requirement Quality Agent",
+    "Story Quality Agent",
     "Test Design Agent",
     "Smart Planning Agent",
     "Coverage Agent",

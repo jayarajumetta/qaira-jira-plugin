@@ -23,7 +23,7 @@ const supportChannels = [
 const playbooks = [
   "Workspace access and onboarding",
   "Project setup checklist",
-  "Requirement to test-case design flow",
+  "Story to test-case design flow",
   "Run incident triage guide",
   "Integrations and API key rotation"
 ];
@@ -68,7 +68,7 @@ export function SupportPage() {
             <div className="stack-item">
               <div>
                 <strong>Authoring services</strong>
-                <span>Requirements, suites, and reusable test-case workflows are operating normally.</span>
+                <span>Stories, suites, and reusable test-case workflows are operating normally.</span>
               </div>
               <span className="status-badge completed">Healthy</span>
             </div>

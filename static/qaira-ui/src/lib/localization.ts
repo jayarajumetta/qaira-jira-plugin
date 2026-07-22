@@ -20,7 +20,7 @@ export const DEFAULT_LOCALIZATION_STRINGS: LocalizationStrings = {
   "nav.settings": "Settings",
   "nav.reportIssue": "Bugs",
   "nav.feedback": "Bugs",
-  "workspace.requirements": "Requirements",
+  "workspace.requirements": "Stories",
   "workspace.testCases": "Test Cases",
   "workspace.sharedSteps": "Shared Steps",
   "workspace.testSuites": "Test Suites",
@@ -36,7 +36,7 @@ export const DEFAULT_LOCALIZATION_STRINGS: LocalizationStrings = {
   "page.overview": "Overview",
   "page.projects": "Projects",
   "page.adminSpace": "Admin Space",
-  "page.requirements": "Requirements",
+  "page.requirements": "Stories",
   "page.testCases": "Test Cases",
   "page.sharedSteps": "Shared Step Groups",
   "page.design": "Test Suites",
@@ -82,7 +82,18 @@ export const DEFAULT_LOCALIZATION_STRINGS: LocalizationStrings = {
 
 export const LOCALIZATION_STORAGE_KEY = "qaira.localization";
 
+const migrateLegacyStoryLabels = (overrides?: LocalizationStrings | null): LocalizationStrings => {
+  const migrated = { ...(overrides || {}) };
+
+  (["workspace.requirements", "page.requirements"] as const).forEach((key) => {
+    if (migrated[key] === "Requirement") migrated[key] = "Story";
+    if (migrated[key] === "Requirements") migrated[key] = "Stories";
+  });
+
+  return migrated;
+};
+
 export const mergeLocalizationStrings = (overrides?: LocalizationStrings | null): LocalizationStrings => ({
   ...DEFAULT_LOCALIZATION_STRINGS,
-  ...(overrides || {})
+  ...migrateLegacyStoryLabels(overrides)
 });

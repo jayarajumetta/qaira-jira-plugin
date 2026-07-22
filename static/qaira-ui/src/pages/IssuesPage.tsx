@@ -1,8 +1,9 @@
-import { FormEvent, useDeferredValue, useEffect, useMemo, useState } from "react";
+import { FormEvent, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
 import { ClearSelectionIcon, ExportIcon, SearchIcon, SelectAllIcon, SparkIcon } from "../components/AppIcons";
+import { AiInsightPreviewDialog, type AiPreviewFinding } from "../components/AiInsightPreviewDialog";
 import { AiPromptContextPanel } from "../components/AiPromptContextPanel";
 import { CatalogSelectionControls } from "../components/CatalogSelectionControls";
 import { CatalogSearchFilter } from "../components/CatalogSearchFilter";
@@ -32,9 +33,15 @@ import { areFeatureFlagsEnabled } from "../lib/featureFlags";
 import { safeBugReportReturnRoute } from "../lib/bugReportNavigation";
 import { hasPermission } from "../lib/permissions";
 import { getJiraBrowseUrl } from "../lib/jiraBrowseUrl";
+import { asArray } from "../lib/collectionGuards";
+import { downloadCsvRecords } from "../lib/csvExport";
 import { readDefaultCatalogViewMode } from "../lib/viewPreferences";
 import { useWorkspaceData } from "../hooks/useWorkspaceData";
 import type { AiBugDraftPreview, AiDesignImageInput, Issue, Requirement, TestCase } from "../types";
+
+const MAX_AI_BUG_TRIAGE_ITEMS = 10;
+const BULK_BUG_DELETE_BATCH_SIZE = 20;
+const BUG_EXPORT_BATCH_SIZE = 100;
 
 type IssueDraft = {
   title: string;
@@ -220,24 +227,6 @@ const buildIssuePayload = (draft: IssueDraft, userId: string) => ({
   additional_fields: draft.additional_fields
 });
 
-const csvEscape = (value: unknown) => {
-  const text = String(value ?? "").replace(/\r?\n/g, " ").trim();
-  return /[",\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
-};
-
-const downloadCsv = (filename: string, rows: string[][]) => {
-  const csv = rows.map((row) => row.map(csvEscape).join(",")).join("\n");
-  const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-  link.href = url;
-  link.download = filename;
-  document.body.appendChild(link);
-  link.click();
-  link.remove();
-  URL.revokeObjectURL(url);
-};
-
 type ImpactPickerOption = {
   id: string;
   displayId?: string | null;
@@ -348,9 +337,10 @@ export function IssuesPage() {
   const canViewAttachments = hasPermission(session, "attachment.view");
   const canCreateAttachments = hasPermission(session, "attachment.create");
   const canDeleteAttachments = hasPermission(session, "attachment.delete");
+  const canManageBugs = hasPermission(session, "feedback.manage");
   const { confirmDelete, confirmationDialog } = useDeleteConfirmation();
   const domainMetadataQuery = useDomainMetadata();
-  const canUseAiBugTriage = hasPermission(session, "feedback.manage")
+  const canUseAiBugTriage = canManageBugs
     && areFeatureFlagsEnabled(featureFlagsQuery.data, ["qaira.ai.bug_triage"]);
   const [searchParams, setSearchParams] = useSearchParams();
   const bugReturnTo = safeBugReportReturnRoute(searchParams.get("returnTo"));
@@ -358,16 +348,20 @@ export function IssuesPage() {
   const issueMetadata = domainMetadataQuery.data?.issues || domainMetadataQuery.data?.feedback;
   const defaultIssueStatus = issueMetadata?.default_status || "To Do";
   const issueStatusOptions = issueMetadata?.statuses?.length ? issueMetadata.statuses : DEFAULT_ISSUE_STATUS_OPTIONS;
-  const jiraSprints = domainMetadataQuery.data?.jira?.sprints || [];
-  const jiraVersions = (domainMetadataQuery.data?.jira?.versions || []).filter((version) => !version.archived);
+  const jiraSprints = asArray(domainMetadataQuery.data?.jira?.sprints);
+  const jiraVersions = asArray(domainMetadataQuery.data?.jira?.versions).filter((version) => !version.archived);
   const emptyDraft = useMemo(() => createEmptyIssueDraft(defaultIssueStatus), [defaultIssueStatus]);
   const [selectedIssueId, setSelectedIssueId] = useState("");
   const [isCreating, setIsCreating] = useState(false);
   const [draft, setDraft] = useState<IssueDraft>(() => createEmptyIssueDraft());
+  const seededIssueDraftKeyRef = useRef("");
   const [message, setMessage] = useState("");
   const [messageTone, setMessageTone] = useState<"success" | "error">("success");
   const [catalogViewMode, setCatalogViewMode] = useState<"tile" | "list">(() => readDefaultCatalogViewMode());
   const [selectedActionIssueIds, setSelectedActionIssueIds] = useState<string[]>([]);
+  const [isDeletingSelectedIssues, setIsDeletingSelectedIssues] = useState(false);
+  const [isExportingIssues, setIsExportingIssues] = useState(false);
+  const [isAiBugTriageOpen, setIsAiBugTriageOpen] = useState(false);
   const [issueSearch, setIssueSearch] = useState("");
   const deferredIssueSearch = useDeferredValue(issueSearch);
   const [isAiBugDraftOpen, setIsAiBugDraftOpen] = useState(false);
@@ -424,13 +418,13 @@ export function IssuesPage() {
     staleTime: 60_000
   });
 
-  const items = issues.data || [];
-  const userItems = users.data || [];
-  const executionItems = executions.data || [];
-  const testCaseItems = testCases.data || [];
-  const testSuiteItems = testSuites.data || [];
-  const testCaseModuleItems = testCaseModulesQuery.data || [];
-  const requirementItems = requirements.data || [];
+  const items = asArray<Issue>(issues.data);
+  const userItems = asArray(users.data);
+  const executionItems = asArray(executions.data);
+  const testCaseItems = asArray<TestCase>(testCases.data);
+  const testSuiteItems = asArray(testSuites.data);
+  const testCaseModuleItems = asArray(testCaseModulesQuery.data);
+  const requirementItems = asArray<Requirement>(requirements.data);
   const executionById = useMemo(() => new Map(executionItems.map((execution) => [execution.id, execution])), [executionItems]);
   const testCaseById = useMemo(() => new Map(testCaseItems.map((testCase) => [testCase.id, testCase])), [testCaseItems]);
   const requirementIdsFromTestCases = (testCaseIds: string[]) =>
@@ -493,7 +487,7 @@ export function IssuesPage() {
         title: testCase.title,
         meta: [
           testCase.status || "Draft",
-          (testCase.requirement_ids || []).length || testCase.requirement_id ? `${(testCase.requirement_ids || []).length || 1} requirement${((testCase.requirement_ids || []).length || 1) === 1 ? "" : "s"}` : "No requirement"
+          (testCase.requirement_ids || []).length || testCase.requirement_id ? `${(testCase.requirement_ids || []).length || 1} ${((testCase.requirement_ids || []).length || 1) === 1 ? "story" : "stories"}` : "No story"
         ].filter(Boolean).join(" · ")
       })),
     [testCaseItems]
@@ -584,7 +578,38 @@ export function IssuesPage() {
     );
   }, [assigneeLabelById, deferredIssueSearch, items, runLabelById]);
   const visibleIssueIds = useMemo(() => filteredItems.map((item) => item.id), [filteredItems]);
-  const areAllFilteredIssuesSelected = visibleIssueIds.length > 0 && visibleIssueIds.every((id) => selectedActionIssueIds.includes(id));
+  const selectedActionIssueIdSet = useMemo(() => new Set(selectedActionIssueIds), [selectedActionIssueIds]);
+  const selectedActionIssues = useMemo(
+    () => items.filter((item) => selectedActionIssueIdSet.has(item.id)),
+    [items, selectedActionIssueIdSet]
+  );
+  const areAllFilteredIssuesSelected = visibleIssueIds.length > 0 && visibleIssueIds.every((id) => selectedActionIssueIdSet.has(id));
+  const areSomeFilteredIssuesSelected = visibleIssueIds.some((id) => selectedActionIssueIdSet.has(id)) && !areAllFilteredIssuesSelected;
+  const setAllVisibleIssuesSelected = (selected: boolean) => {
+    const visibleIds = new Set(visibleIssueIds);
+    setSelectedActionIssueIds((current) => selected
+      ? [...new Set([...current, ...visibleIssueIds])]
+      : current.filter((id) => !visibleIds.has(id)));
+  };
+  const toggleIssueSelection = (issueId: string, selected: boolean) => {
+    setSelectedActionIssueIds((current) => selected
+      ? [...new Set([...current, issueId])]
+      : current.filter((id) => id !== issueId));
+  };
+
+  useEffect(() => {
+    setSelectedActionIssueIds([]);
+    setIsAiBugTriageOpen(false);
+  }, [projectId]);
+
+  useEffect(() => {
+    if (issues.isLoading) return;
+    const availableIds = new Set(items.map((item) => item.id));
+    setSelectedActionIssueIds((current) => {
+      const next = current.filter((id) => availableIds.has(id));
+      return next.length === current.length ? current : next;
+    });
+  }, [issues.isLoading, items]);
   const statusCategoryByName = useMemo(
     () => new Map(issueStatusOptions.map((option) => [option.value.toLowerCase(), String(option.category_key || option.category_name || "").toLowerCase()])),
     [issueStatusOptions]
@@ -643,6 +668,39 @@ export function IssuesPage() {
     setIsCreating(false);
   };
   const issueListColumns = useMemo<Array<DataTableColumn<Issue>>>(() => [
+    {
+      key: "select",
+      label: "Select Bugs",
+      canToggle: false,
+      canReorder: false,
+      canResize: false,
+      width: 36,
+      minWidth: 36,
+      headerRender: () => (
+        <label className="data-table-header-checkbox" onClick={(event) => event.stopPropagation()}>
+          <input
+            aria-label={areAllFilteredIssuesSelected ? "Clear all visible Bugs" : "Select all visible Bugs"}
+            checked={areAllFilteredIssuesSelected}
+            disabled={!visibleIssueIds.length}
+            onChange={(event) => setAllVisibleIssuesSelected(event.target.checked)}
+            ref={(element) => {
+              if (element) element.indeterminate = areSomeFilteredIssuesSelected;
+            }}
+            type="checkbox"
+          />
+        </label>
+      ),
+      render: (item) => (
+        <label className="data-table-row-checkbox">
+          <input
+            aria-label={`Select Bug ${item.jira_bug_key || item.id}: ${item.title}`}
+            checked={selectedActionIssueIdSet.has(item.id)}
+            onChange={(event) => toggleIssueSelection(item.id, event.target.checked)}
+            type="checkbox"
+          />
+        </label>
+      )
+    },
     {
       key: "id",
       label: "ID",
@@ -749,32 +807,64 @@ export function IssuesPage() {
       sortValue: (item) => item.user_name || item.user_email || item.user_id || "",
       render: (item) => item.user_name || item.user_email || item.user_id || "Unknown"
     },
-  ], [assigneeLabelById, defaultIssueStatus, runLabelById]);
+  ], [
+    areAllFilteredIssuesSelected,
+    areSomeFilteredIssuesSelected,
+    assigneeLabelById,
+    defaultIssueStatus,
+    runLabelById,
+    selectedActionIssueIdSet,
+    visibleIssueIds
+  ]);
 
-  const handleExportIssuesCsv = () => {
-    const selectedItems = filteredItems.filter((item) => selectedActionIssueIds.includes(item.id));
-    if (!selectedItems.length) return;
-    downloadCsv("bugs.csv", [
-      ["ID", "Bug Title", "Description", "Status", "Jira Bug Key", "Severity", "Priority", "Linked Test Run", "Environment", "Build", "Assignee", "Reporter", "Steps To Reproduce", "Expected Result", "Actual Result", "Root Cause"],
-      ...selectedItems.map((item) => [
-        item.id,
-        item.title,
-        richTextToPlainText(item.message),
-        formatTileCardLabel(item.status, "Open"),
-        item.jira_bug_key || "",
-        formatTileCardLabel(item.severity, "Not set"),
-        formatTileCardLabel(item.priority, "Not set"),
-        runLabelById.get(item.linked_test_run_id || "") || item.linked_test_run_id || "",
-        item.environment || "",
-        item.build || "",
-        item.assignee_name || item.assignee_email || assigneeLabelById.get(item.assignee_id || "") || "Unassigned",
-        item.user_name || item.user_email || item.user_id || "Unknown",
-        richTextToPlainText(item.steps_to_reproduce),
-        richTextToPlainText(item.expected_result),
-        richTextToPlainText(item.actual_result),
-        richTextToPlainText(item.root_cause)
-      ])
-    ]);
+  const handleExportIssuesCsv = async () => {
+    if (!projectId || !selectedActionIssues.length || isExportingIssues) return;
+    setIsExportingIssues(true);
+    setMessage("");
+    try {
+      const exportedItems: Issue[] = [];
+      const selectedIssueIds = selectedActionIssues.map((item) => item.id);
+      for (let offset = 0; offset < selectedIssueIds.length; offset += BUG_EXPORT_BATCH_SIZE) {
+        const response = await api.issues.export({
+          project_id: projectId,
+          issue_ids: selectedIssueIds.slice(offset, offset + BUG_EXPORT_BATCH_SIZE)
+        });
+        exportedItems.push(...asArray<Issue>(response.bugs));
+      }
+      const exportedById = new Map(exportedItems.map((item) => [item.id, item]));
+      const selectedItems = selectedIssueIds.map((id) => exportedById.get(id)).filter((item): item is Issue => Boolean(item));
+      if (selectedItems.length !== selectedIssueIds.length) {
+        throw new Error("Some selected Bugs changed or became unavailable. Refresh the list and retry the export.");
+      }
+      downloadCsvRecords(
+        `qaira-bugs-${new Date().toISOString().slice(0, 10)}.csv`,
+        selectedItems.map((item) => ({
+          ID: item.id,
+          "Bug Title": item.title,
+          Description: richTextToPlainText(item.message),
+          Status: formatTileCardLabel(item.status, "Open"),
+          "Jira Bug Key": item.jira_bug_key || "",
+          Severity: formatTileCardLabel(item.severity, "Not set"),
+          Priority: formatTileCardLabel(item.priority, "Not set"),
+          "Linked Test Run": runLabelById.get(item.linked_test_run_id || "") || item.linked_test_run_id || "",
+          Environment: item.environment || "",
+          Build: item.build || "",
+          Assignee: item.assignee_name || item.assignee_email || assigneeLabelById.get(item.assignee_id || "") || "Unassigned",
+          Reporter: item.user_name || item.user_email || item.user_id || "Unknown",
+          "Steps To Reproduce": richTextToPlainText(item.steps_to_reproduce),
+          "Expected Result": richTextToPlainText(item.expected_result),
+          "Actual Result": richTextToPlainText(item.actual_result),
+          "Root Cause": richTextToPlainText(item.root_cause)
+        }))
+      );
+      setMessageTone("success");
+      setMessage(`Exported ${selectedItems.length} selected Bug${selectedItems.length === 1 ? "" : "s"} with current Jira details.`);
+    } catch (error) {
+      setMessageTone("error");
+      setMessage(error instanceof Error ? error.message : "Unable to export the selected Bugs.");
+    } finally {
+      setIsExportingIssues(false);
+    }
   };
 
   useEffect(() => {
@@ -823,15 +913,25 @@ export function IssuesPage() {
 
   useEffect(() => {
     if (isCreating) {
+      seededIssueDraftKeyRef.current = "";
       return;
     }
 
     if (!selectedIssueId) {
+      seededIssueDraftKeyRef.current = "";
       setDraft(emptyDraft);
       return;
     }
 
     if (selectedItem) {
+      const draftSeedKey = [
+        selectedItem.id,
+        selectedItem.revision ?? "no-revision",
+        selectedItem.updated_at || "",
+        selectedIssueQuery.data?.id === selectedItem.id ? "detail" : "summary"
+      ].join(":");
+      if (seededIssueDraftKeyRef.current === draftSeedKey) return;
+      seededIssueDraftKeyRef.current = draftSeedKey;
       setDraft({
         title: selectedItem.title,
         message: selectedItem.message,
@@ -901,6 +1001,23 @@ export function IssuesPage() {
   };
 
   const previewAiBugDraft = useMutation({ mutationFn: api.issues.previewAiDraft });
+  const previewAiBugTriage = useMutation({ mutationFn: api.issues.previewAiTriage });
+  const aiBugTriageFindings = useMemo<AiPreviewFinding[]>(
+    () => asArray(previewAiBugTriage.data?.triage).map((recommendation) => ({
+      id: recommendation.issue_id,
+      title: `${recommendation.display_id} · ${recommendation.category}`,
+      severity: ["Highest", "High"].includes(recommendation.recommended_priority)
+        ? "high"
+        : recommendation.recommended_priority === "Medium"
+          ? "medium"
+          : "low",
+      description: recommendation.explanation,
+      action: asArray(recommendation.review_actions).join(" "),
+      meta: `${recommendation.title} · Current ${recommendation.current_priority} · Recommended ${recommendation.recommended_priority}`,
+      evidence: asArray(recommendation.signals)
+    })),
+    [previewAiBugTriage.data]
+  );
 
   const openManualBugReport = () => {
     syncIssueSearchParams(null);
@@ -923,6 +1040,19 @@ export function IssuesPage() {
     setAiLinkedRequirementIds(parseQueryIdList(searchParams.get("linked_requirement_ids"), searchParams.get("requirement")));
     setHasAppliedAiBugContextDefaults(false);
     setIsAiBugDraftOpen(true);
+  };
+
+  const openSelectedBugTriage = () => {
+    const selectedIssueIds = selectedActionIssues.map((item) => item.id);
+    if (!projectId || !selectedIssueIds.length || !canUseAiBugTriage) return;
+    if (selectedIssueIds.length > MAX_AI_BUG_TRIAGE_ITEMS) {
+      setMessageTone("error");
+      setMessage(`Select no more than ${MAX_AI_BUG_TRIAGE_ITEMS} Bugs for one AI triage preview. This keeps Jira reads and AI usage bounded.`);
+      return;
+    }
+    previewAiBugTriage.reset();
+    setIsAiBugTriageOpen(true);
+    previewAiBugTriage.mutate({ project_id: projectId, issue_ids: selectedIssueIds });
   };
 
   useEffect(() => {
@@ -1067,9 +1197,10 @@ export function IssuesPage() {
 
   const deleteIssue = useMutation({
     mutationFn: api.issues.delete,
-    onSuccess: async () => {
+    onSuccess: async (_response, deletedIssueId) => {
       setMessageTone("success");
       setMessage("Bug deleted.");
+      setSelectedActionIssueIds((current) => current.filter((id) => id !== deletedIssueId));
       syncIssueSearchParams(null);
       setSelectedIssueId("");
       setDraft(emptyDraft);
@@ -1081,6 +1212,53 @@ export function IssuesPage() {
       setMessage(error instanceof Error ? error.message : "Unable to delete bug");
     }
   });
+
+  const handleDeleteSelectedIssues = async () => {
+    const selectedIssueIds = selectedActionIssues.map((item) => item.id);
+    if (!projectId || !canManageBugs || !selectedIssueIds.length || isDeletingSelectedIssues) return;
+
+    const confirmed = await confirmDelete({
+      message: `Delete ${selectedIssueIds.length} selected Bug${selectedIssueIds.length === 1 ? "" : "s"} from Jira? Historical test-run snapshots stay preserved, but the selected Jira Bugs and their live links will be removed.`
+    });
+    if (!confirmed) return;
+
+    setIsDeletingSelectedIssues(true);
+    setMessage("");
+    const deletedIds: string[] = [];
+    const failures: string[] = [];
+    let failedIssueCount = 0;
+    try {
+      for (let offset = 0; offset < selectedIssueIds.length; offset += BULK_BUG_DELETE_BATCH_SIZE) {
+        const batch = selectedIssueIds.slice(offset, offset + BULK_BUG_DELETE_BATCH_SIZE);
+        try {
+          const result = await api.issues.bulkDelete({ project_id: projectId, issue_ids: batch });
+          deletedIds.push(...asArray(result.deleted_ids));
+          failedIssueCount += Number(result.failed || 0);
+          failures.push(...asArray(result.failures).map((failure) => `${failure.display_id}: ${failure.message}`));
+        } catch (error) {
+          failedIssueCount += batch.length;
+          failures.push(error instanceof Error ? error.message : `Unable to delete ${batch.length} selected Bugs.`);
+        }
+      }
+
+      const deletedIdSet = new Set(deletedIds);
+      setSelectedActionIssueIds((current) => current.filter((id) => !deletedIdSet.has(id)));
+      if (deletedIdSet.has(selectedIssueId)) {
+        syncIssueSearchParams(null);
+        setSelectedIssueId("");
+        setDraft(emptyDraft);
+        setIsCreating(false);
+      }
+      if (deletedIds.length) await refresh();
+
+      setMessageTone(failures.length ? "error" : "success");
+      setMessage(failures.length
+        ? `${deletedIds.length} Bug${deletedIds.length === 1 ? "" : "s"} deleted; ${failedIssueCount} could not be deleted. ${failures[0]}`
+        : `${deletedIds.length} Bug${deletedIds.length === 1 ? "" : "s"} deleted.`);
+    } finally {
+      setIsDeletingSelectedIssues(false);
+    }
+  };
 
   const handleSave = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -1134,6 +1312,22 @@ export function IssuesPage() {
   return (
     <div className="page-content">
       {confirmationDialog}
+      <AiInsightPreviewDialog
+        assuranceTitle="Evidence-grounded Bug triage"
+        emptyMessage="No classification recommendation was returned for the selected Bugs."
+        error={previewAiBugTriage.error instanceof Error ? previewAiBugTriage.error.message : null}
+        eyebrow="Bugs · AI review"
+        findings={aiBugTriageFindings}
+        limitations={asArray(previewAiBugTriage.data?.limitations)}
+        loading={previewAiBugTriage.isPending}
+        onClose={() => setIsAiBugTriageOpen(false)}
+        open={isAiBugTriageOpen}
+        recommendedActions={asArray(previewAiBugTriage.data?.review_sequence)}
+        response={previewAiBugTriage.data}
+        subtitle={`Review categories and priority recommendations for up to ${MAX_AI_BUG_TRIAGE_ITEMS} selected project Bugs. Nothing is updated automatically.`}
+        summary={previewAiBugTriage.data?.summary || "Qaira compares the selected Jira Bug fields and traceability signals, then explains each recommendation for human review."}
+        title="Classify and prioritize Bugs"
+      />
       {isAiBugDraftOpen ? (
         <div className="modal-backdrop modal-backdrop--scroll" onClick={closeAiBugReport} role="presentation">
           <div
@@ -1227,11 +1421,11 @@ export function IssuesPage() {
                     />
                     <ImpactCheckboxPicker
                       disabled={previewAiBugDraft.isPending}
-                      emptyText="No requirements are available for this project."
+                      emptyText="No stories are available for this project."
                       items={requirementImpactOptions}
-                      label="Impacted Requirements"
+                      label="Impacted Stories"
                       onChange={setAiLinkedRequirementIds}
-                      placeholder="Search requirements"
+                      placeholder="Search stories"
                       selectedIds={aiLinkedRequirementIds}
                     />
                   </div>
@@ -1264,7 +1458,7 @@ export function IssuesPage() {
                       <div><span>Severity</span><strong>{aiDraftPreview.draft.severity}</strong></div>
                       <div><span>Priority</span><strong>{aiDraftPreview.draft.priority}</strong></div>
                       <div><span>Run</span><strong>{aiDraftPreview.draft.linked_test_run_id ? runLabelById.get(aiDraftPreview.draft.linked_test_run_id) || aiDraftPreview.draft.linked_test_run_id : "Not linked"}</strong></div>
-                      <div><span>Impact</span><strong>{aiDraftPreview.draft.linked_test_case_ids.length} cases · {aiDraftPreview.draft.linked_requirement_ids.length} requirements</strong></div>
+                      <div><span>Impact</span><strong>{aiDraftPreview.draft.linked_test_case_ids.length} cases · {aiDraftPreview.draft.linked_requirement_ids.length} stories</strong></div>
                     </div>
                     <p>{aiDraftPreview.draft.rationale}</p>
                     <div className="action-row">
@@ -1286,7 +1480,7 @@ export function IssuesPage() {
           meta={[
             { label: "Bugs", value: items.length },
             { label: "Open", value: openIssueCount },
-            { label: "Selected", value: "None" }
+            { label: "Selected", value: selectedActionIssues.length || "None" }
           ]}
         />
       ) : null}
@@ -1295,7 +1489,7 @@ export function IssuesPage() {
 
       <WorkspaceMasterDetail
         browseView={(
-          <Panel title="Bugs" titleVariant="eyebrow" subtitle="Open one bug at a time from a card-first queue with severity, priority, Jira, and run context visible.">
+          <Panel title="Bugs" titleVariant="eyebrow" subtitle="Review, select, export, triage, or safely remove project Bugs in tile or list view.">
             <div className="design-list-toolbar issue-catalog-toolbar">
               <CatalogSearchFilter
                 activeFilterCount={issueSearch.trim() ? 1 : 0}
@@ -1318,19 +1512,44 @@ export function IssuesPage() {
               <CatalogSelectionControls
                 allSelected={areAllFilteredIssuesSelected}
                 canSelectAll={Boolean(visibleIssueIds.length)}
+                deleteAction={canManageBugs ? {
+                  disabled: isDeletingSelectedIssues || isExportingIssues,
+                  label: isDeletingSelectedIssues ? "Deleting…" : `Delete ${selectedActionIssues.length || ""}`.trim(),
+                  onClick: () => void handleDeleteSelectedIssues()
+                } : undefined}
                 onClear={() => setSelectedActionIssueIds([])}
-                onSelectAll={() => setSelectedActionIssueIds((current) => Array.from(new Set([...current, ...visibleIssueIds])))}
-                selectedCount={selectedActionIssueIds.length}
+                onSelectAll={() => setAllVisibleIssuesSelected(true)}
+                selectedCount={selectedActionIssues.length}
               />
               <ReportBugSplitActionButton
                 canUseAi={canUseAiBugTriage}
                 onReportBug={openManualBugReport}
                 onReportBugWithAi={openAiBugReport}
               />
-              {selectedActionIssueIds.length ? (
-                <button className="ghost-button catalog-selection-button" onClick={handleExportIssuesCsv} type="button">
-                  <ExportIcon />
-                  <span>Export bugs</span>
+              <button
+                className="ghost-button catalog-selection-button"
+                disabled={!selectedActionIssues.length || isDeletingSelectedIssues || isExportingIssues}
+                onClick={() => void handleExportIssuesCsv()}
+                title={selectedActionIssues.length ? `Export ${selectedActionIssues.length} selected Bugs as CSV` : "Select Bugs to export"}
+                type="button"
+              >
+                <ExportIcon />
+                <span>{isExportingIssues ? "Exporting…" : `Export${selectedActionIssues.length ? ` ${selectedActionIssues.length}` : ""}`}</span>
+              </button>
+              {canUseAiBugTriage ? (
+                <button
+                  className="ghost-button catalog-selection-button"
+                  disabled={!selectedActionIssues.length || previewAiBugTriage.isPending || isDeletingSelectedIssues || isExportingIssues}
+                  onClick={openSelectedBugTriage}
+                  title={selectedActionIssues.length > MAX_AI_BUG_TRIAGE_ITEMS
+                    ? `Select up to ${MAX_AI_BUG_TRIAGE_ITEMS} Bugs to keep Jira reads and AI usage bounded`
+                    : selectedActionIssues.length
+                      ? "Classify selected Bugs and recommend priority in a read-only review"
+                      : "Select Bugs for AI classification and priority review"}
+                  type="button"
+                >
+                  <SparkIcon />
+                  <span>AI triage</span>
                 </button>
               ) : null}
               <CatalogViewToggle onChange={setCatalogViewMode} value={catalogViewMode} />
@@ -1347,23 +1566,31 @@ export function IssuesPage() {
                 const issueStatus = formatTileCardLabel(item.status, "Open");
 
                 return (
-                  <button
+                  <article
+                    aria-label={`Open Bug ${item.jira_bug_key || item.id}: ${item.title}`}
                     key={item.id}
-                    className={selectedIssueId === item.id ? "record-card tile-card is-active" : "record-card tile-card"}
+                    className={[
+                      "record-card tile-card",
+                      selectedIssueId === item.id ? "is-active" : "",
+                      selectedActionIssueIdSet.has(item.id) ? "is-selected" : ""
+                    ].filter(Boolean).join(" ")}
                     onClick={() => openIssueWorkspace(item.id)}
-                    type="button"
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter" || event.key === " ") {
+                        event.preventDefault();
+                        openIssueWorkspace(item.id);
+                      }
+                    }}
+                    role="button"
+                    tabIndex={0}
                   >
                     <div className="tile-card-main">
-                      <div className="tile-card-select-row" onClick={(event) => event.stopPropagation()}>
+                      <div className="tile-card-select-row" onClick={(event) => event.stopPropagation()} onKeyDown={(event) => event.stopPropagation()}>
                         <label className="checkbox-field">
                           <input
-                            aria-label={`Select ${item.title}`}
-                            checked={selectedActionIssueIds.includes(item.id)}
-                            onChange={() =>
-                              setSelectedActionIssueIds((current) =>
-                                current.includes(item.id) ? current.filter((id) => id !== item.id) : [...current, item.id]
-                              )
-                            }
+                            aria-label={`Select Bug ${item.jira_bug_key || item.id}: ${item.title}`}
+                            checked={selectedActionIssueIdSet.has(item.id)}
+                            onChange={(event) => toggleIssueSelection(item.id, event.target.checked)}
                             type="checkbox"
                           />
                           <span className="sr-only">Select bug</span>
@@ -1392,7 +1619,7 @@ export function IssuesPage() {
                         <span className="count-pill">{item.assignee_name || item.assignee_email || assigneeLabelById.get(item.assignee_id || "") || "Unassigned"}</span>
                       </div>
                     </div>
-                  </button>
+                  </article>
                 );
               })}
             </div>
@@ -1403,6 +1630,7 @@ export function IssuesPage() {
                 columns={issueListColumns}
                 enableColumnResize
                 enableHeaderColumnReorder
+                enableRowSelection={false}
                 emptyMessage="No bugs match the current search."
                 getRowClassName={(item) => (selectedIssueId === item.id ? "is-active-row" : "")}
                 getRowKey={(item) => item.id}
@@ -1519,11 +1747,11 @@ export function IssuesPage() {
                       selectedIds={draft.linked_test_case_ids}
                     />
                     <ImpactCheckboxPicker
-                      emptyText="No requirements are available for this project."
+                      emptyText="No stories are available for this project."
                       items={requirementImpactOptions}
-                      label="Impacted Requirements"
+                      label="Impacted Stories"
                       onChange={updateDraftLinkedRequirements}
-                      placeholder="Search requirements"
+                      placeholder="Search stories"
                       selectedIds={draft.linked_requirement_ids}
                     />
                   </div>
@@ -1642,17 +1870,18 @@ export function IssuesPage() {
                         ? "Checking Jira fields…"
                         : isCreating ? "Save bug" : "Update bug"}
                   </button>
-                  {!isCreating && selectedItem ? (
+                  {!isCreating && selectedItem && canManageBugs ? (
                     <button
                       className="ghost-button danger"
+                      disabled={deleteIssue.isPending}
                       onClick={async () => {
-                        if (await confirmDelete({ message: `Delete bug "${selectedItem.title}"?` })) {
+                        if (await confirmDelete({ message: `Delete Bug "${selectedItem.title}" from Jira? Historical test-run snapshots stay preserved, but this Jira Bug and its live links will be removed.` })) {
                           void deleteIssue.mutateAsync(selectedItem.id);
                         }
                       }}
                       type="button"
                     >
-                      Delete bug
+                      {deleteIssue.isPending ? "Deleting…" : "Delete Bug"}
                     </button>
                   ) : null}
                 </div>

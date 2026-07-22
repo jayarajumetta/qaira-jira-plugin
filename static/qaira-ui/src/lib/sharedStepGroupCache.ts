@@ -1,4 +1,5 @@
 import type { QueryClient } from "@tanstack/react-query";
+import { asArray } from "./collectionGuards";
 import type { SharedStepGroup } from "../types";
 
 function compareSharedGroups(left: SharedStepGroup, right: SharedStepGroup) {
@@ -18,7 +19,7 @@ export function upsertSharedStepGroupInCache(queryClient: QueryClient, appTypeId
   }
 
   queryClient.setQueryData<SharedStepGroup[]>(["shared-step-groups", appTypeId], (current = []) =>
-    [...current.filter((item) => item.id !== group.id), group].sort(compareSharedGroups)
+    [...asArray(current).filter((item) => item.id !== group.id), group].sort(compareSharedGroups)
   );
 }
 
@@ -28,6 +29,6 @@ export function removeSharedStepGroupFromCache(queryClient: QueryClient, appType
   }
 
   queryClient.setQueryData<SharedStepGroup[]>(["shared-step-groups", appTypeId], (current = []) =>
-    current.filter((item) => item.id !== groupId)
+    asArray(current).filter((item) => item.id !== groupId)
   );
 }

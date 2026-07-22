@@ -49,7 +49,7 @@ const compressFileTextForPrompt = (value: string, limit: number) => {
     .slice(0, 18);
   const sampled = [
     text.slice(0, Math.floor(limit * 0.36)),
-    importantLines.length ? `Key requirement-like lines:\n${importantLines.join("\n")}` : "",
+    importantLines.length ? `Key story-like lines:\n${importantLines.join("\n")}` : "",
     text.slice(Math.max(0, text.length - Math.floor(limit * 0.28)))
   ].filter(Boolean).join("\n...\n");
 
@@ -63,7 +63,7 @@ export const buildRequirementContextSection = (requirements: Requirement[]) => {
 
   const useDescriptions = requirements.length <= 12;
   const lines = requirements.map((requirement, index) => {
-    const label = requirement.display_id || requirement.id || `REQ-${index + 1}`;
+    const label = requirement.display_id || requirement.id || `STORY-${index + 1}`;
     const title = compactText(requirement.title);
 
     if (!useDescriptions) {
@@ -78,7 +78,7 @@ export const buildRequirementContextSection = (requirements: Requirement[]) => {
   });
 
   return trimToBudget([
-    `Selected requirements (${requirements.length}; ${useDescriptions ? "titles and descriptions" : "titles only to stay within context limits"}):`,
+    `Selected stories (${requirements.length}; ${useDescriptions ? "titles and descriptions" : "titles only to stay within context limits"}):`,
     ...lines
   ].join("\n"), REQUIREMENT_CONTEXT_LIMIT);
 };

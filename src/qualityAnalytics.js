@@ -173,8 +173,8 @@ export function qualityDashboardMetricLabel(metric) {
     averageAgeDays: 'average age in days',
     averageResolutionDays: 'average resolution time in days',
     releaseConfidence: 'release confidence index',
-    requirementCoverage: 'percent of requirements linked to tests',
-    coverageGaps: 'requirements without linked tests',
+    requirementCoverage: 'percent of Stories linked to tests',
+    coverageGaps: 'Stories without linked tests',
     automationCoverage: 'percent of test cases automated',
     openDefects: 'open Jira bugs in QAira scope',
     failedRuns: 'failed test runs',
@@ -246,7 +246,7 @@ const DASHBOARD_TEMPLATES = {
   },
   product: {
     name: 'Product quality and coverage',
-    description: 'Requirement flow, product risk, defect pressure, ownership gaps, and release distribution.',
+    description: 'Story flow, product risk, defect pressure, ownership gaps, and release distribution.',
     layout: 'three-column',
     gadgets: [
       { title: 'Open product scope', type: 'metric', jql: 'issuetype in (Story, Epic) AND resolution = Unresolved', metric: 'count' },
@@ -261,11 +261,11 @@ const DASHBOARD_TEMPLATES = {
   },
   quality: {
     name: 'Quality engineering command center',
-    description: 'Release confidence, traceability, automation, defect trend, QA throughput, real execution cycle time, modules, and requirement flow.',
+    description: 'Release confidence, traceability, automation, defect trend, QA throughput, real execution cycle time, modules, and Story flow.',
     layout: 'three-column',
     gadgets: [
       { title: 'Release confidence', type: 'metric', data_source: 'qaira', jql: '', metric: 'releaseConfidence', accent: 'blue' },
-      { title: 'Requirement traceability', type: 'metric', data_source: 'qaira', jql: '', metric: 'requirementCoverage', accent: 'green' },
+      { title: 'Story traceability', type: 'metric', data_source: 'qaira', jql: '', metric: 'requirementCoverage', accent: 'green' },
       { title: 'Effective automation', type: 'metric', data_source: 'qaira', jql: '', metric: 'automationCoverage', accent: 'purple' },
       { title: 'Open test defects', type: 'metric', data_source: 'qaira', jql: '', metric: 'openDefects', accent: 'red' },
       { title: 'Execution cycle time', type: 'metric', data_source: 'qaira', jql: '', metric: 'executionCycleHours', accent: 'teal' },
@@ -273,7 +273,7 @@ const DASHBOARD_TEMPLATES = {
       { title: 'Bug creation trend', type: 'line', jql: 'issuetype = Bug AND created >= -90d', group_by: 'createdMonth', accent: 'red' },
       { title: 'QA closure by owner', type: 'bar', jql: 'issuetype in (Bug, "Qaira Test Case", "Qaira Test Run") AND resolved >= -30d', group_by: 'assignee', metric: 'resolved30d', accent: 'blue' },
       { title: 'Test distribution by module', type: 'bar', data_source: 'qaira', jql: '', group_by: 'module', metric: 'moduleCaseCount', accent: 'purple' },
-      { title: 'Requirement flow', type: 'donut', jql: 'issuetype in (Story, Epic)', group_by: 'statusCategory', accent: 'blue' },
+      { title: 'Story flow', type: 'donut', jql: 'issuetype in (Story, Epic)', group_by: 'statusCategory', accent: 'blue' },
       { title: 'Execution workflow', type: 'stacked-bar', data_source: 'qaira', jql: '', group_by: 'status', metric: 'testRuns', accent: 'teal' },
       { title: 'Critical work requiring action', type: 'table', jql: 'issuetype in (Bug, Story, "Qaira Test Case", "Qaira Test Run") AND resolution = Unresolved AND priority in (Highest, High) ORDER BY priority DESC, updated ASC', group_by: 'priority', accent: 'orange' }
     ]

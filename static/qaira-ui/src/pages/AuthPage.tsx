@@ -77,7 +77,7 @@ const authFeatureSlides = [
   {
     eyebrow: "AI quality command",
     title: "Ship better software with AI-led quality intelligence.",
-    description: "Connect requirements, test design, automation, execution health and release risks in one focused workspace.",
+    description: "Connect stories, test design, automation, execution health and release risks in one focused workspace.",
     badge: "Release Health",
     score: 92,
     status: "Ready for release",
@@ -88,7 +88,7 @@ const authFeatureSlides = [
       { value: "AI", label: "Risk insights included" }
     ],
     bars: [
-      { label: "Requirement coverage", value: 96 },
+      { label: "Story coverage", value: 96 },
       { label: "Automation coverage", value: 82 },
       { label: "Latest pass rate", value: 94 }
     ],
@@ -96,7 +96,7 @@ const authFeatureSlides = [
   },
   {
     eyebrow: "AI test case generation",
-    title: "Convert requirements into test coverage your teams can trust.",
+    title: "Convert stories into test coverage your teams can trust.",
     description: "QAira turns business rules and acceptance criteria into review-ready test cases, reducing missed scenarios before sprint work reaches execution.",
     badge: "Coverage Design",
     score: 88,
@@ -105,10 +105,10 @@ const authFeatureSlides = [
     metrics: [
       { value: "70%", label: "Less authoring effort" },
       { value: "2x", label: "More scenario depth" },
-      { value: "0", label: "Lost requirement links" }
+      { value: "0", label: "Lost story links" }
     ],
     bars: [
-      { label: "Requirement traceability", value: 95 },
+      { label: "Story traceability", value: 95 },
       { label: "Scenario completeness", value: 88 },
       { label: "Review readiness", value: 84 }
     ],
@@ -774,7 +774,7 @@ export function AuthPage({ initialMode = "login" }: { initialMode?: Extract<Form
               </div>
             </div>
 
-            <div className="auth-hero-metrics" aria-label="QAira quality metrics">
+            <div className="auth-hero-metrics metric-strip page-metric-strip" aria-label="QAira quality metrics" role="group">
               {activeFeature.metrics.map((metric) => (
                 <article key={`${activeFeature.eyebrow}-${metric.label}`}>
                   <strong>{metric.value}</strong>

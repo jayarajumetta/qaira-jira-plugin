@@ -3,7 +3,8 @@ import {
   RouterProvider,
   createHashRouter,
   useLocation,
-  useNavigate
+  useNavigate,
+  useRouteError
 } from "react-router-dom";
 import { Suspense, lazy, useEffect, useRef } from "react";
 import { QueryClient, QueryClientProvider, hashKey } from "@tanstack/react-query";
@@ -71,7 +72,7 @@ const PAGE_TITLES: Record<string, { key?: string; fallback: string }> = {
   "/projects": { key: "page.projects", fallback: "Projects" },
   "/integrations": { key: "page.integrations", fallback: "Integrations" },
   "/design": { key: "page.design", fallback: "Test Design" },
-  "/requirements": { key: "page.requirements", fallback: "Requirements" },
+  "/requirements": { key: "page.requirements", fallback: "Stories" },
   "/issues": { key: "page.issues", fallback: "Bugs" },
   "/feedback": { key: "page.issues", fallback: "Bugs" },
   "/support": { key: "page.support", fallback: "Support" },
@@ -170,10 +171,25 @@ function ProtectedLayout() {
   );
 }
 
+function RouteErrorState() {
+  const error = useRouteError();
+  return (
+    <div className="splash-screen">
+      <AppErrorState
+        error={error}
+        fallbackMessage="This workspace view could not be completed safely. Retry to reload its Jira data and interface state."
+        onRetry={() => window.location.reload()}
+        title="This view needs to be reloaded"
+      />
+    </div>
+  );
+}
+
 const router = createHashRouter([
   {
     path: "/",
     element: <ProtectedLayout />,
+    errorElement: <RouteErrorState />,
     children: [
       { index: true, element: <OverviewPage /> },
       { path: "admin-space", element: <AdminSpacePage /> },

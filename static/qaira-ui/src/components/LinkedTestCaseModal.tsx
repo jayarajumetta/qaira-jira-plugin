@@ -61,38 +61,48 @@ export function LinkedTestCaseModal({
     history: false
   });
   const [isParameterDialogOpen, setIsParameterDialogOpen] = useState(false);
-  const [parameterValues, setParameterValues] = useState<Record<string, string>>(() =>
-    combineStepParameterValues(
-      normalizeCaseParameterPreviewValues(testCase.parameter_values),
-      normalizeSuiteParameterPreviewValues(selectedSuite?.parameter_values)
-    )
-  );
+  const [parameterValues, setParameterValues] = useState<Record<string, string>>({});
   const [codePreviewState, setCodePreviewState] = useState<{ title: string; subtitle: string; code: string } | null>(null);
 
+  const testCaseDetailQuery = useQuery({
+    queryKey: ["linked-test-case-modal-detail", testCase.id],
+    queryFn: () => api.testCases.get(testCase.id),
+    enabled: Boolean(testCase.id),
+    initialData: testCase.detail_complete === true ? testCase : undefined,
+    staleTime: 30_000
+  });
+  const canonicalTestCase = testCaseDetailQuery.data?.detail_complete === true
+    ? testCaseDetailQuery.data
+    : testCase.detail_complete === true ? testCase : null;
+  const resolvedTestCase = canonicalTestCase || testCase;
+  const isTestCaseDetailLoading = Boolean(
+    !canonicalTestCase && (testCaseDetailQuery.isPending || testCaseDetailQuery.isFetching)
+  );
+  const isTestCaseDetailUnavailable = Boolean(!canonicalTestCase && testCaseDetailQuery.isError);
   const stepsQuery = useQuery({
     queryKey: ["linked-test-case-modal-steps", testCase.id],
     queryFn: () => api.testSteps.list({ test_case_id: testCase.id }),
     enabled: Boolean(testCase.id)
   });
   const historyQuery = useQuery({
-    queryKey: ["linked-test-case-modal-history", testCase.id, testCase.app_type_id || ""],
-    queryFn: () => api.executionResults.list({ test_case_id: testCase.id, app_type_id: testCase.app_type_id || undefined }),
+    queryKey: ["linked-test-case-modal-history", testCase.id, resolvedTestCase.app_type_id || ""],
+    queryFn: () => api.executionResults.list({ test_case_id: testCase.id, app_type_id: resolvedTestCase.app_type_id || undefined }),
     enabled: Boolean(testCase.id)
   });
 
   const linkedRequirementTitles = useMemo(
     () =>
       requirements
-        .filter((requirement) => (testCase.requirement_ids || [testCase.requirement_id]).filter(Boolean).includes(requirement.id))
+        .filter((requirement) => (resolvedTestCase.requirement_ids || [resolvedTestCase.requirement_id]).filter(Boolean).includes(requirement.id))
         .map((requirement) => requirement.title),
-    [requirements, testCase.requirement_id, testCase.requirement_ids]
+    [requirements, resolvedTestCase.requirement_id, resolvedTestCase.requirement_ids]
   );
   const linkedSuiteTitles = useMemo(
     () =>
       suites
-        .filter((suite) => (testCase.suite_ids || [testCase.suite_id]).filter(Boolean).includes(suite.id))
+        .filter((suite) => (resolvedTestCase.suite_ids || [resolvedTestCase.suite_id]).filter(Boolean).includes(suite.id))
         .map((suite) => suite.name),
-    [suites, testCase.suite_id, testCase.suite_ids]
+    [resolvedTestCase.suite_id, resolvedTestCase.suite_ids, suites]
   );
   const steps = stepsQuery.data || [];
   const history = historyQuery.data || [];
@@ -138,13 +148,31 @@ export function LinkedTestCaseModal({
     });
     setIsParameterDialogOpen(false);
     setCodePreviewState(null);
+  }, [selectedSuite?.id, testCase.id]);
+
+  useEffect(() => {
+    if (!canonicalTestCase) {
+      setParameterValues({});
+      setIsParameterDialogOpen(false);
+      return;
+    }
+
     setParameterValues(
       combineStepParameterValues(
-        normalizeCaseParameterPreviewValues(testCase.parameter_values),
+        normalizeCaseParameterPreviewValues(canonicalTestCase.parameter_values),
         normalizeSuiteParameterPreviewValues(selectedSuite?.parameter_values)
       )
     );
-  }, [selectedSuite?.id, selectedSuite?.parameter_values, testCase.id, testCase.parameter_values]);
+  }, [
+    canonicalTestCase?.id,
+    canonicalTestCase?.parameter_values,
+    canonicalTestCase?.revision,
+    canonicalTestCase?.updated_at,
+    selectedSuite?.id,
+    selectedSuite?.parameter_values,
+    selectedSuite?.revision,
+    selectedSuite?.updated_at
+  ]);
 
   useEffect(() => {
     setParameterValues((current) => {
@@ -164,7 +192,7 @@ export function LinkedTestCaseModal({
     <>
       <div className="modal-backdrop modal-backdrop--scroll" onClick={onClose} role="presentation">
         <div
-          aria-label={`Test case workspace for ${testCase.title}`}
+          aria-label={`Test case workspace for ${resolvedTestCase.title}`}
           aria-modal="true"
           className="modal-card suite-test-case-editor-modal linked-test-case-modal linked-test-case-workspace-modal"
           onClick={(event) => event.stopPropagation()}
@@ -178,9 +206,21 @@ export function LinkedTestCaseModal({
                 <Panel
                   actions={(
                     <div className="panel-head-actions-row">
-                      <button className="ghost-button" onClick={() => setIsParameterDialogOpen(true)} type="button">
+                      <button
+                        className="ghost-button"
+                        disabled={!canonicalTestCase}
+                        onClick={() => canonicalTestCase && setIsParameterDialogOpen(true)}
+                        title={isTestCaseDetailLoading ? "Loading complete test data" : isTestCaseDetailUnavailable ? "Complete test data could not be loaded" : "Preview test data"}
+                        type="button"
+                      >
                         <LinkedTestCaseParameterIcon />
-                        <span>{detectedParameters.length ? `Test data · ${detectedParameters.length}` : "Test data"}</span>
+                        <span>
+                          {isTestCaseDetailLoading
+                            ? "Loading test data…"
+                            : isTestCaseDetailUnavailable
+                              ? "Test data unavailable"
+                              : detectedParameters.length ? `Test data · ${detectedParameters.length}` : "Test data"}
+                        </span>
                       </button>
                       <DialogCloseButton label="Close test case workspace" onClick={onClose} />
                     </div>
@@ -189,21 +229,33 @@ export function LinkedTestCaseModal({
                   subtitle="Switch between case details and step editing without losing the selected context."
                 >
                   <div className="detail-stack">
+                    {isTestCaseDetailLoading ? (
+                      <LoadingState
+                        description="Retrieving canonical metadata before test data preview is enabled."
+                        label="Loading complete test case details"
+                      />
+                    ) : null}
+                    {isTestCaseDetailUnavailable ? (
+                      <div className="empty-state compact" role="alert">
+                        <div>Complete test case details could not be loaded safely.</div>
+                        <button className="ghost-button compact" onClick={() => void testCaseDetailQuery.refetch()} type="button">Retry details</button>
+                      </div>
+                    ) : null}
                     <div className="editor-accordion">
                       <LinkedTestCaseSection
-                        countLabel={testCase.status || "draft"}
+                        countLabel={resolvedTestCase.status || "draft"}
                         isExpanded={expandedSections.details}
                         onToggle={() => setExpandedSections((current) => ({ ...current, details: !current.details }))}
-                        summary={testCase.title || "Untitled test case"}
+                        summary={resolvedTestCase.title || "Untitled test case"}
                         title="Selected test case"
                       >
                         <div className="stack-list">
                           <div className="stack-item">
                             <div>
                               <strong>Status</strong>
-                              <span>{testCase.status || "draft"}</span>
+                              <span>{resolvedTestCase.status || "draft"}</span>
                             </div>
-                            <StatusBadge value={testCase.status || "draft"} />
+                            <StatusBadge value={resolvedTestCase.status || "draft"} />
                           </div>
                           <div className="stack-item">
                             <div>
@@ -214,13 +266,13 @@ export function LinkedTestCaseModal({
                           <div className="stack-item">
                             <div>
                               <strong>Description</strong>
-                              <RichTextContent value={testCase.description} fallback="No description available for this reusable test case." />
+                              <RichTextContent value={resolvedTestCase.description} fallback="No description available for this reusable test case." />
                             </div>
                           </div>
                           <div className="stack-item">
                             <div>
                               <strong>Priority</strong>
-                              <span>{`P${testCase.priority ?? 3}`}</span>
+                              <span>{`P${resolvedTestCase.priority ?? 3}`}</span>
                             </div>
                           </div>
                           <div className="stack-item">
@@ -231,8 +283,8 @@ export function LinkedTestCaseModal({
                           </div>
                           <div className="stack-item">
                             <div>
-                              <strong>Requirements</strong>
-                              <span>{linkedRequirementTitles.length ? linkedRequirementTitles.join(" · ") : "No linked requirement."}</span>
+                              <strong>Stories</strong>
+                              <span>{linkedRequirementTitles.length ? linkedRequirementTitles.join(" · ") : "No linked story."}</span>
                             </div>
                           </div>
                         </div>
@@ -241,9 +293,9 @@ export function LinkedTestCaseModal({
                       <LinkedTestCaseSection
                         actions={(
                           <button className="ghost-button" disabled={!steps.length} onClick={() => setCodePreviewState({
-                            title: `${testCase.title || "Test case"} automation`,
+                            title: `${resolvedTestCase.title || "Test case"} automation`,
                             subtitle: "This consolidated view is read-only. Edit automation from the original test case workspace.",
-                            code: buildCaseAutomationCode(testCase.title || "Test case", steps)
+                            code: buildCaseAutomationCode(resolvedTestCase.title || "Test case", steps)
                           })} type="button">
                             <AutomationCodeIcon />
                             <span>Automation code</span>
@@ -318,7 +370,7 @@ export function LinkedTestCaseModal({
         </div>
       </div>
 
-      {isParameterDialogOpen ? (
+      {isParameterDialogOpen && canonicalTestCase ? (
         <StepParameterDialog
           headerContent={parameterDialogHeaderContent}
           onChange={(name, value) =>

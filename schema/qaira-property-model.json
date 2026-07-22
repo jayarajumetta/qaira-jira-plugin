@@ -9,7 +9,9 @@
     "propertyValueBytes": 32768
   },
   "issueProperties": {
+    "requirement": "qaira.requirement.v1",
     "testCase": "qaira.testCaseSpec.v1",
+    "testCaseSummary": "qaira.testCaseSummary.v1",
     "testCaseVersion": "qaira.testCaseVersion.v1",
     "suite": "qaira.suiteDefinition.v1",
     "plan": "qaira.planScope.v1",
@@ -275,7 +277,7 @@
       "storage": "native",
       "canonicalKey": "jira:configured-requirement-issue",
       "runtimeStatus": "active",
-      "rationale": "Requirements reuse configured Jira Story or custom native issue types."
+      "rationale": "Story records use the configured Jira Story or another native issue type."
     },
     {
       "table": "feedback",
@@ -291,7 +293,7 @@
       "storage": "link",
       "canonicalKey": "qaira_impacts_qa",
       "runtimeStatus": "active",
-      "rationale": "Requirement-to-defect traceability is represented by Qaira Impacts QA links."
+      "rationale": "Story-to-defect traceability is represented by Qaira Impacts QA links."
     },
     {
       "table": "integrations",
@@ -331,7 +333,7 @@
       "storage": "link",
       "canonicalKey": "qaira_tests",
       "runtimeStatus": "active",
-      "rationale": "Requirement coverage is represented by Qaira Tests issue links."
+      "rationale": "Story coverage is represented by Qaira Tests issue links."
     },
     {
       "table": "suite_test_cases",

@@ -338,7 +338,10 @@ test('locator improvement separates preview from human-confirmed apply', () => {
 
   assert.match(preview, /method === 'POST'/);
   assert.match(preview, /applied:\s*false/);
-  assert.match(preview, /aiProvenance\s*\(/);
+  assert.match(preview, /assistedResponse\s*\(/);
+  assert.match(preview, /'locator-improvement-preview'/);
+  assert.match(preview, /authoritative_entry:/);
+  assert.match(preview, /const suggestedStrategy = entry\.locator_kind \|\| 'css'/);
   noJiraMutation(preview, 'locator improvement preview');
 
   assert.match(apply, /method === 'PUT'/);
